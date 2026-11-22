@@ -3,22 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
+import { createApiApp } from './src/server/app.ts';
 import { IS_PRODUCTION, SERVER_PORT } from './src/server/config/constants.ts';
-import { getDb } from './src/server/db/sqlite.ts';
-import { securityHeadersMiddleware } from './src/server/middleware/securityHeaders.ts';
-import { adminRouter } from './src/server/routes/adminRoutes.ts';
-import { publicBookingRouter } from './src/server/routes/publicBookingRoutes.ts';
 
 async function startServer() {
-  getDb();
-
-  const app = express();
-  app.disable('x-powered-by');
-  app.use(securityHeadersMiddleware);
-  app.use(express.json({ limit: '100kb' }));
-
-  app.use('/api', publicBookingRouter);
-  app.use('/api/admin', adminRouter);
+  const app = createApiApp();
 
   if (!IS_PRODUCTION) {
     const vite = await createViteServer({

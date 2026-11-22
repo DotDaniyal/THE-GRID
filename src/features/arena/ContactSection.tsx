@@ -217,10 +217,10 @@ export function ContactSection() {
                     onChange={(e) => setTopic(e.target.value)}
                     className="w-full min-h-[44px] px-3.5 py-2 text-sm text-white bg-[#070A14] border border-white/15 rounded-md focus:outline-none focus:border-[#c4d835]"
                   >
-                    <option value="Court Booking">Court Booking</option>
-                    <option value="FC Rovers Academy">FC Rovers Academy</option>
-                    <option value="Tournaments & Bulk Slots">Tournaments &amp; Bulk Slots</option>
-                    <option value="General Inquiry">General Inquiry</option>
+                    <option value="Court Booking" className="bg-[#070A14] text-white">Court Booking</option>
+                    <option value="FC Rovers Academy" className="bg-[#070A14] text-white">FC Rovers Academy</option>
+                    <option value="Tournaments & Bulk Slots" className="bg-[#070A14] text-white">Tournaments &amp; Bulk Slots</option>
+                    <option value="General Inquiry" className="bg-[#070A14] text-white">General Inquiry</option>
                   </select>
                 </div>
 

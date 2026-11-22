@@ -284,7 +284,7 @@ export function BookingDetailsPage({
                 className="w-full min-h-[46px] px-3.5 py-2.5 text-sm text-white bg-[#0B1338]/90 border border-white/20 rounded-lg focus:outline-none focus:border-[#c4d835]"
               >
                 {COUNTRY_CODES.map((c) => (
-                  <option key={c.code} value={c.code}>
+                  <option key={c.code} value={c.code} className="bg-[#0B1338] text-white">
                     {c.label}
                   </option>
                 ))}

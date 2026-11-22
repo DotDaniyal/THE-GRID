@@ -189,3 +189,20 @@ Reorganized the flat codebase into a clean, domain-driven modular architecture w
 - **Automated Test Suite & Documentation**:
   - Added `/tests/unit/bookingDomain.test.ts` and `/tests/integration/apiBookingFlow.test.ts`, wired `"test": "tsx --test tests/unit/*.test.ts"` in `package.json`, and created `/README.md`.
 
+---
+
+## 23. Vercel Production Deployment Fixes & End-to-End Browser Verification (2026-11-22)
+Resolved root causes preventing intro animations, `/booking` calendar/slots, and `/admin` dashboard from working on Vercel production deployments:
+- **Hero Intro Sequence Fix (`src/features/arena/HeroSection.tsx`)**:
+  - Fixed a React `useEffect` dependency loop (`[introPhase, onIntroComplete]`) that cancelled the `logo`/`ready` timers and looped infinitely between `'lights'` and `'ball'`. Replaced persistent `sessionStorage` suppression with an in-memory per-load guard so fresh loads and page reloads execute the full `dark -> lights -> ball -> logo -> ready` sequence cleanly.
+- **Vercel Serverless & SPA Routing (`vercel.json`, `api/index.ts`, `src/server/app.ts`)**:
+  - Added `vercel.json` routing `/api/(.*)` to `/api/index.ts` and rewriting SPA client paths (`/`, `/booking`, `/booking/details`, `/admin`) to `/index.html` while preserving static assets (`/assets/`, `/brand/`, `/gallery/`, `/src/assets/`, `robots.txt`, `sitemap.xml`).
+  - Extracted `createApiApp()` in `src/server/app.ts` with `app.set('trust proxy', 1)` (preserving per-client IP rate limiting behind reverse proxies) shared by both standalone `server.ts` and Vercel Serverless `api/index.ts`.
+  - Pinned `"engines": { "node": "22.x" }` in `package.json` for native `node:sqlite` support on Vercel.
+- **Serverless Storage & Deterministic Admin Session Key (`src/server/db/sqlite.ts`, `src/server/middleware/auth.ts`)**:
+  - Added `SQLITE_DB_PATH` support and automatic `/tmp/thegrid-data/thegrid.db` writable fallback when `VERCEL === '1'` or workspace root is read-only.
+  - Updated `getSessionSecret()` to use `SESSION_SECRET`, else derive deterministically from `ADMIN_PASSCODE`, else persist in SQLite `app_meta`, preventing cross-invocation `401` session drops in serverless environments.
+- **Booking & Browser Polish**:
+  - Fixed `overflow-x-clip` on `BookingSlotPage.tsx` so sticky `BookingSummaryCard` sticks on desktop, guarded against expired `sessionStorage` booking dates, added `initial={false}` + month sync on `BookingDateCalendar.tsx`, used `formatToParts` in `src/utils/date.ts`, added readable dark `<option>` styling, and fixed Schema.org image URLs in `index.html`.
+- **Verification Results**:
+  - `npm test` (6/6 unit tests), `esbuild api/index.ts` bundle check, `VERCEL=1` serverless handler simulation, `tests/integration/apiBookingFlow.test.ts` (4/4 live API tests), and headless Chromium CDP E2E tests (`NODE_ENV=production` across desktop `1440x900` & mobile `390x844`) all passed with zero console or network errors.

@@ -1,11 +1,21 @@
 export function getKarachiTodayStr(now: Date = new Date()): string {
-  const formatter = new Intl.DateTimeFormat('en-CA', {
+  const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Karachi',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
   });
-  return formatter.format(now);
+  const parts = formatter.formatToParts(now);
+  const map: Record<string, string> = {};
+  for (const part of parts) {
+    if (part.type !== 'literal') {
+      map[part.type] = part.value;
+    }
+  }
+  const y = map.year ?? '2026';
+  const m = map.month ?? '01';
+  const d = map.day ?? '01';
+  return `${y}-${m}-${d}`;
 }
 
 export function addDaysToIsoDate(isoDate: string, days: number): string {

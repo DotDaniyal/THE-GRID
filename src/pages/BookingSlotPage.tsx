@@ -22,8 +22,10 @@ export function BookingSlotPage({
   onSelectionChange,
   onContinueToDetails,
 }: BookingSlotPageProps) {
-  const [selectedDate, setSelectedDate] = useState<string>(
-    () => selection?.bookingDate || karachiToday
+  const [selectedDate, setSelectedDate] = useState<string>(() =>
+    selection?.bookingDate && selection.bookingDate >= karachiToday
+      ? selection.bookingDate
+      : karachiToday
   );
 
   const { slots, loading, error, refreshSlots } = useSlotAvailability(selectedDate);
@@ -50,7 +52,7 @@ export function BookingSlotPage({
   };
 
   return (
-    <div className="relative min-h-screen pt-24 pb-20 bg-[#0C153B] overflow-hidden">
+    <div className="relative min-h-screen pt-24 pb-20 bg-[#0C153B] overflow-x-clip">
       <div aria-hidden="true" className="fixed inset-0 z-0 pointer-events-none">
         <img
           src="/gallery/turf.jpeg"

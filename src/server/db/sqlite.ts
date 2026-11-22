@@ -1,9 +1,58 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const DB_PATH = path.join(DATA_DIR, 'thegrid.db');
+function ensureWritableDbPath(targetFile: string): string | null {
+  try {
+    const resolved = path.resolve(targetFile);
+    const dir = path.dirname(resolved);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.accessSync(dir, fs.constants.W_OK);
+    if (fs.existsSync(resolved)) {
+      fs.accessSync(resolved, fs.constants.W_OK);
+    }
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
+function resolveDbPath(): string {
+  const customPath = process.env.SQLITE_DB_PATH?.trim();
+  const vercelTmpDir = path.join(os.tmpdir(), 'thegrid-data');
+
+  if (customPath) {
+    const resolved = path.resolve(customPath);
+    const pointsIntoReadOnlyVercelRoot =
+      process.env.VERCEL === '1' && resolved.startsWith(process.cwd());
+    if (!pointsIntoReadOnlyVercelRoot) {
+      const writableCustom = ensureWritableDbPath(customPath);
+      if (writableCustom) {
+        return writableCustom;
+      }
+    }
+    // If SQLITE_DB_PATH points to a read-only mount (e.g. ./database.sqlite on Vercel),
+    // safely fall back to writable /tmp while preserving the configured filename.
+    const tmpFallback = ensureWritableDbPath(
+      path.join(vercelTmpDir, path.basename(customPath) || 'database.sqlite')
+    );
+    if (tmpFallback) return tmpFallback;
+  }
+
+  // On Vercel serverless runtimes, process.cwd() (/var/task) is read-only.
+  if (process.env.VERCEL !== '1') {
+    const writableLocal = ensureWritableDbPath(
+      path.join(process.cwd(), 'data', 'thegrid.db')
+    );
+    if (writableLocal) {
+      return writableLocal;
+    }
+  }
+
+  fs.mkdirSync(vercelTmpDir, { recursive: true });
+  return path.join(vercelTmpDir, 'thegrid.db');
+}
 
 export interface OperatingHourRow {
   start_time: string;
@@ -63,9 +112,13 @@ let dbInstance: DatabaseSync | null = null;
 export function getDb(): DatabaseSync {
   if (dbInstance) return dbInstance;
 
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const db = new DatabaseSync(DB_PATH);
-  db.exec('PRAGMA journal_mode = WAL;');
+  const dbPath = resolveDbPath();
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec('PRAGMA journal_mode = WAL;');
+  } catch {
+    db.exec('PRAGMA journal_mode = DELETE;');
+  }
   db.exec('PRAGMA foreign_keys = ON;');
 
   db.exec(`
@@ -115,6 +168,11 @@ export function getDb(): DatabaseSync {
       message TEXT NOT NULL,
       is_read INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS app_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
   `);
 

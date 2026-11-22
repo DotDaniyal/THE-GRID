@@ -2,12 +2,51 @@ import crypto from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { getDb } from '../db/sqlite.ts';
 
-const RUNTIME_SESSION_SECRET =
-  process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 16
-    ? process.env.SESSION_SECRET
-    : crypto.randomBytes(32).toString('hex');
-
 const TOKEN_TTL_MS = 1000 * 60 * 60 * 12;
+let cachedFallbackSecret: string | null = null;
+
+function getSessionSecret(): string {
+  const envSecret = process.env.SESSION_SECRET?.trim();
+  if (envSecret && envSecret.length >= 16) {
+    return envSecret;
+  }
+
+  const envPass = process.env.ADMIN_PASSCODE?.trim();
+  if (envPass && envPass.length > 0) {
+    return crypto
+      .createHmac('sha256', 'thegrid-admin-session-key-v1')
+      .update(envPass)
+      .digest('hex');
+  }
+
+  if (cachedFallbackSecret) {
+    return cachedFallbackSecret;
+  }
+
+  try {
+    const db = getDb();
+    const row = db
+      .prepare("SELECT value FROM app_meta WHERE key = 'session_secret'")
+      .get() as { value: string } | undefined;
+    if (row?.value) {
+      cachedFallbackSecret = row.value;
+      return row.value;
+    }
+
+    const generated = crypto.randomBytes(32).toString('hex');
+    db.prepare(
+      "INSERT OR IGNORE INTO app_meta (key, value) VALUES ('session_secret', ?)"
+    ).run(generated);
+    const stored = db
+      .prepare("SELECT value FROM app_meta WHERE key = 'session_secret'")
+      .get() as { value: string } | undefined;
+    cachedFallbackSecret = stored?.value || generated;
+    return cachedFallbackSecret;
+  } catch {
+    cachedFallbackSecret = crypto.randomBytes(32).toString('hex');
+    return cachedFallbackSecret;
+  }
+}
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -74,7 +113,7 @@ export function issueAdminToken(): { token: string; expiresAt: number } {
     'utf8'
   ).toString('base64url');
   const sig = crypto
-    .createHmac('sha256', RUNTIME_SESSION_SECRET)
+    .createHmac('sha256', getSessionSecret())
     .update(payload)
     .digest('base64url');
   return { token: `${payload}.${sig}`, expiresAt };
@@ -87,7 +126,7 @@ export function verifyAdminToken(token: string): boolean {
   if (!payload || !sig) return false;
 
   const expectedSig = crypto
-    .createHmac('sha256', RUNTIME_SESSION_SECRET)
+    .createHmac('sha256', getSessionSecret())
     .update(payload)
     .digest('base64url');
 

@@ -93,9 +93,16 @@ Official web platform and live hourly court booking system for **THE GRID by FC 
 Configure secrets via environment variables or hosting secrets panel (see `/.env.example`):
 
 - `PORT` (optional, defaults to `3000`)
-- `ADMIN_PASSCODE` (optional preset passcode for `/admin`; if omitted, first visit prompts one-time setup)
-- `SESSION_SECRET` (recommended 16+ characters in production so admin sessions persist across restarts)
+- `ADMIN_PASSCODE` (recommended preset passcode for `/admin` across Vercel / serverless deployments; if omitted on persistent Node servers, first visit prompts one-time setup)
+- `SESSION_SECRET` (recommended 16+ characters in production for admin Bearer token signing)
+- `SQLITE_DB_PATH` (optional custom writable path; defaults to `./data/thegrid.db`, automatically falling back to `/tmp/thegrid-data/thegrid.db` on Vercel)
 - `NODE_ENV` (`development` or `production`)
+
+## Vercel Deployment Architecture
+
+- `vercel.json`: Routes `/api/*` to the Express Serverless Function (`api/index.ts`) and rewrites SPA client routes (`/`, `/booking`, `/booking/details`, `/admin`) to `/index.html` while preserving static assets.
+- `api/index.ts`: Exports the shared Express API app (`src/server/app.ts`) for Vercel Node `22.x` (`engines.node` in `package.json`).
+- **Important Serverless Storage Note**: When running on stateless Vercel Serverless Functions without an external database, SQLite automatically writes to `/tmp/thegrid-data/thegrid.db`, which is ephemeral across cold starts. For permanent multi-instance persistence across serverless cold starts, host `npm start` on a Node 22 server with persistent volume storage at `./data/thegrid.db` or attach a persistent external database.
 
 ## Single-Court Booking & Operations
 

@@ -13,55 +13,58 @@ interface HeroSectionProps {
   onIntroComplete: () => void;
 }
 
-const INTRO_SESSION_KEY = 'thegrid_homepage_intro_played_v1';
+let introPlayedThisLoad = false;
 
 export function HeroSection({ onBookNow, onIntroComplete }: HeroSectionProps) {
   const prefersReducedMotion = Boolean(useReducedMotion());
   const containerRef = useRef<HTMLElement | null>(null);
   const logoZoneRef = useRef<HTMLDivElement | null>(null);
+  const onIntroCompleteRef = useRef(onIntroComplete);
+  onIntroCompleteRef.current = onIntroComplete;
+  const timersRef = useRef<number[]>([]);
 
   const [introPhase, setIntroPhase] = useState<IntroPhase>(() => {
     if (typeof window === 'undefined') return 'ready';
     const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-    const seen = window.sessionStorage?.getItem(INTRO_SESSION_KEY);
-    return reduced || seen ? 'ready' : 'dark';
+    return reduced || introPlayedThisLoad ? 'ready' : 'dark';
   });
 
   useEffect(() => {
-    if (introPhase === 'ready') {
-      onIntroComplete();
+    if (prefersReducedMotion || introPlayedThisLoad) {
+      setIntroPhase('ready');
+      onIntroCompleteRef.current();
       return;
     }
 
-    const t1 = window.setTimeout(() => setIntroPhase('lights'), 180);
-    const t2 = window.setTimeout(() => setIntroPhase('ball'), 520);
-    const t3 = window.setTimeout(() => setIntroPhase('logo'), 860);
-    const t4 = window.setTimeout(() => {
-      setIntroPhase('ready');
-      try {
-        window.sessionStorage?.setItem(INTRO_SESSION_KEY, '1');
-      } catch {
-        // Ignore storage errors in restricted contexts
+    const clearAllTimers = () => {
+      for (const id of timersRef.current) {
+        window.clearTimeout(id);
       }
-      onIntroComplete();
-    }, 1650);
-
-    return () => {
-      window.clearTimeout(t1);
-      window.clearTimeout(t2);
-      window.clearTimeout(t3);
-      window.clearTimeout(t4);
+      timersRef.current = [];
     };
-  }, [introPhase, onIntroComplete]);
+
+    timersRef.current = [
+      window.setTimeout(() => setIntroPhase('lights'), 160),
+      window.setTimeout(() => setIntroPhase('ball'), 480),
+      window.setTimeout(() => setIntroPhase('logo'), 820),
+      window.setTimeout(() => {
+        introPlayedThisLoad = true;
+        setIntroPhase('ready');
+        onIntroCompleteRef.current();
+      }, 1550),
+    ];
+
+    return clearAllTimers;
+  }, [prefersReducedMotion]);
 
   const handleSkipIntro = () => {
-    setIntroPhase('ready');
-    try {
-      window.sessionStorage?.setItem(INTRO_SESSION_KEY, '1');
-    } catch {
-      // Ignore storage errors
+    for (const id of timersRef.current) {
+      window.clearTimeout(id);
     }
-    onIntroComplete();
+    timersRef.current = [];
+    introPlayedThisLoad = true;
+    setIntroPhase('ready');
+    onIntroCompleteRef.current();
   };
 
   const lightsOn = introPhase !== 'dark';

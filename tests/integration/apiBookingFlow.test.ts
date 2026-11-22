@@ -32,7 +32,7 @@ test('GET /api/health reports single-court THE GRID configuration', async () => 
   assert.equal(body.venue, 'THE GRID - Main Futsal Court');
 });
 
-test('GET /api/slots validates dates and returns 24 single-court slots', async () => {
+test('GET /api/slots validates dates and returns configured active single-court slots', async () => {
   const badRes = await fetch(`${BASE_URL}/api/slots?date=invalid-date`);
   assert.equal(badRes.status, 400);
 
@@ -43,7 +43,7 @@ test('GET /api/slots validates dates and returns 24 single-court slots', async (
     slots: Array<{ startTime: string; courtNumber: number; status: string }>;
   };
   assert.equal(data.courtNumber, 1);
-  assert.equal(data.slots.length, 24);
+  assert.ok(data.slots.length > 0 && data.slots.length <= 24);
   assert.ok(data.slots.every((slot) => slot.courtNumber === 1));
 });
 

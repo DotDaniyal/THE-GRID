@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ChevronLeft, ChevronRight, CalendarDays } from 'lucide-react';
 import { addDaysToIsoDate, formatReadableDate } from '@/src/utils/date';
@@ -21,6 +21,14 @@ export function BookingDateCalendar({
 
   const [viewYear, setViewYear] = useState(selY || todayY);
   const [viewMonth, setViewMonth] = useState(selM || todayM);
+
+  useEffect(() => {
+    const [y, m] = selectedDate.split('-').map(Number);
+    if (y && m) {
+      setViewYear(y);
+      setViewMonth(m);
+    }
+  }, [selectedDate]);
 
   const isAtMinMonth = viewYear < todayY || (viewYear === todayY && viewMonth <= todayM);
   const tomorrowStr = useMemo(() => addDaysToIsoDate(karachiToday, 1), [karachiToday]);
@@ -152,7 +160,7 @@ export function BookingDateCalendar({
         ))}
       </div>
 
-      <AnimatePresence mode="wait">
+      <AnimatePresence mode="wait" initial={false}>
         <motion.div
           key={`${viewYear}-${viewMonth}`}
           initial={{ opacity: 0, y: 4 }}
