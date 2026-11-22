@@ -1,20 +1,46 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
-import {
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test, { after } from 'node:test';
+
+const TEMP_DB_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'thegrid-unit-'));
+process.env.SQLITE_DB_PATH = path.join(TEMP_DB_DIR, 'unit.sqlite');
+
+const {
+  createAdminSession,
   hashPassword,
-  issueAdminToken,
-  verifyAdminToken,
+  issueMfaChallengeToken,
+  validateAdminUsername,
+  validateStrongPassword,
+  verifyAdminSessionToken,
+  verifyMfaChallengeToken,
   verifyPassword,
-} from '../../src/server/middleware/auth.ts';
-import { normalizePhone } from '../../src/server/utils/phone.ts';
-import {
+} = await import('../../src/server/middleware/auth.ts');
+const {
+  checkAuthLockout,
+  clearAuthFailures,
+  recordAuthFailure,
+} = await import('../../src/server/middleware/rateLimit.ts');
+const { normalizePhone } = await import('../../src/server/utils/phone.ts');
+const {
   isSlotPassedInKarachi,
   isValidIsoDate,
-  type KarachiNow,
-} from '../../src/server/utils/time.ts';
-import { buildWhatsAppBookingMessage } from '../../src/services/integrations/whatsapp';
-import { addDaysToIsoDate, formatReadableDate } from '../../src/utils/date';
-import { validateCustomerDetails } from '../../src/utils/validation';
+} = await import('../../src/server/utils/time.ts');
+const { generateTotpCode, generateTotpSecret, verifyTotpCode } = await import(
+  '../../src/server/utils/totp.ts'
+);
+const { buildWhatsAppBookingMessage } = await import('../../src/services/integrations/whatsapp');
+const { addDaysToIsoDate, formatReadableDate } = await import('../../src/utils/date');
+const { validateCustomerDetails } = await import('../../src/utils/validation');
+
+after(() => {
+  try {
+    fs.rmSync(TEMP_DB_DIR, { recursive: true, force: true });
+  } catch {
+    // Ignore cleanup errors on exit
+  }
+});
 
 test('isValidIsoDate validates real calendar dates and rejects malformed or impossible dates', () => {
   assert.equal(isValidIsoDate('2026-11-22'), true);
@@ -25,7 +51,7 @@ test('isValidIsoDate validates real calendar dates and rejects malformed or impo
 });
 
 test('isSlotPassedInKarachi accurately evaluates past, current-day, overnight, and future slots', () => {
-  const fixedNow: KarachiNow = {
+  const fixedNow = {
     dateStr: '2026-11-22',
     hours: 18,
     minutes: 30,
@@ -55,14 +81,56 @@ test('normalizePhone standardizes Pakistani +92 formats and rejects invalid numb
   });
 });
 
-test('password hashing and admin HMAC bearer tokens round-trip securely', () => {
+test('strong password, username, session verification, and TOTP MFA round-trip securely', () => {
+  assert.equal(validateAdminUsername('admin@thegrid.pk'), null);
+  assert.ok(validateAdminUsername('a'));
+  assert.equal(validateStrongPassword('RoversGrid2026!'), null);
+  assert.ok(validateStrongPassword('weakpass'));
+
   const hash = hashPassword('RoversGrid2026!');
   assert.equal(verifyPassword('RoversGrid2026!', hash), true);
   assert.equal(verifyPassword('wrong-password', hash), false);
 
-  const session = issueAdminToken();
-  assert.equal(verifyAdminToken(session.token), true);
-  assert.equal(verifyAdminToken(`${session.token}tampered`), false);
+  const session = createAdminSession({
+    adminUserId: null,
+    username: 'qa-admin@thegrid.pk',
+    displayName: 'QA Admin',
+    role: 'ADMIN',
+  });
+  const verified = verifyAdminSessionToken(session.token);
+  assert.ok(verified);
+  assert.equal(verified?.username, 'qa-admin@thegrid.pk');
+  assert.equal(verifyAdminSessionToken(`${session.token}tampered`), null);
+
+  const challenge = issueMfaChallengeToken(42);
+  assert.equal(verifyMfaChallengeToken(challenge), 42);
+  assert.equal(verifyMfaChallengeToken(`${challenge}x`), null);
+
+  const secret = generateTotpSecret();
+  const code = generateTotpCode(secret);
+  assert.equal(verifyTotpCode(secret, code), true);
+  assert.equal(verifyTotpCode(secret, '000000') && code !== '000000', false);
+});
+
+test('progressive auth lockout activates after repeated failures and clears cleanly', () => {
+  const ip = '198.51.100.44';
+  clearAuthFailures(ip);
+  const now = 1_700_000_000_000;
+
+  for (let i = 1; i <= 4; i++) {
+    const res = recordAuthFailure(ip, now + i * 1000);
+    assert.equal(res.locked, false);
+  }
+  const fifth = recordAuthFailure(ip, now + 5000);
+  assert.equal(fifth.locked, true);
+  assert.equal(fifth.retryAfterSeconds, 60);
+
+  const status = checkAuthLockout(ip, now + 10_000);
+  assert.equal(status.locked, true);
+  assert.ok(status.retryAfterSeconds > 50);
+
+  clearAuthFailures(ip);
+  assert.equal(checkAuthLockout(ip, now + 10_000).locked, false);
 });
 
 test('validateCustomerDetails checks required name, email, and Pakistani mobile rules', () => {

@@ -528,8 +528,21 @@ export function InteractiveFootballCanvas({
         drawMatchBall(s.x, s.y, s.radius, s.lift, s.rotX, s.rotY, s.rotZ);
       }
 
-      rafId = requestAnimationFrame(tick);
+      if (!reducedMotion || s.isDragging || Math.hypot(s.vx, s.vy) > 0.1) {
+        rafId = requestAnimationFrame(tick);
+      }
     };
+
+    if (reducedMotion) {
+      const s = stateRef.current;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, s.width, s.height);
+      if (introPhase !== 'dark' && introPhase !== 'lights') {
+        drawMatchBall(s.restX, s.restY, s.radius, 0, s.rotX, s.rotY, s.rotZ);
+      }
+      return;
+    }
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);

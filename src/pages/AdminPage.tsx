@@ -1,18 +1,20 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Bell, LogOut, RefreshCw } from 'lucide-react';
+import { Bell, LogOut, RefreshCw, Shield } from 'lucide-react';
 import { AdminBookingsList } from '@/src/features/admin/AdminBookingsList';
 import { AdminLoginCard } from '@/src/features/admin/AdminLoginCard';
+import { AdminSecurityPanel } from '@/src/features/admin/AdminSecurityPanel';
 import { OperatingHoursEditor } from '@/src/features/admin/OperatingHoursEditor';
 import {
-  authenticateAdmin,
   fetchAdminDashboard,
   getAdminAuthStatus,
+  logoutAdmin,
   markNotificationsRead,
   saveOperatingHours,
   updateBookingStatus,
 } from '@/src/services/api/adminApi';
 import { ApiRequestError } from '@/src/services/api/client';
 import type {
+  AdminAccountSummary,
   AdminBookingRow,
   AdminNotification,
   BookingStatus,
@@ -22,11 +24,17 @@ import type {
 export function AdminPage() {
   const [authStatusLoading, setAuthStatusLoading] = useState(true);
   const [setupRequired, setSetupRequired] = useState(false);
-  // Bearer token held strictly in React state memory (never localStorage/sessionStorage)
-  const [token, setToken] = useState<string | null>(null);
-  const [authError, setAuthError] = useState<string | null>(null);
+  const [authMode, setAuthMode] = useState<
+    'named_accounts' | 'legacy_passcode_fallback' | 'setup_required'
+  >('named_accounts');
+  const [authenticated, setAuthenticated] = useState(false);
+  const [expiresAt, setExpiresAt] = useState<number | null>(null);
+  const [currentAccount, setCurrentAccount] = useState<AdminAccountSummary | null>(null);
 
-  const [activeTab, setActiveTab] = useState<'bookings' | 'hours'>('bookings');
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authStatusMessage, setAuthStatusMessage] = useState<string | null>(null);
+
+  const [activeTab, setActiveTab] = useState<'bookings' | 'hours' | 'security'>('bookings');
   const [bookings, setBookings] = useState<AdminBookingRow[]>([]);
   const [notifications, setNotifications] = useState<AdminNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -38,66 +46,111 @@ export function AdminPage() {
   const [savingHours, setSavingHours] = useState(false);
   const [hoursMessage, setHoursMessage] = useState<string | null>(null);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const status = await getAdminAuthStatus();
-        setSetupRequired(Boolean(status.setupRequired));
-      } catch {
-        setAuthError('Unable to check admin authentication status.');
-      } finally {
-        setAuthStatusLoading(false);
+  const clearClientSession = useCallback((message?: string, isError = false) => {
+    setAuthenticated(false);
+    setExpiresAt(null);
+    setCurrentAccount(null);
+    setBookings([]);
+    setNotifications([]);
+    setUnreadCount(0);
+    setHours([]);
+    if (message) {
+      if (isError) {
+        setAuthError(message);
+        setAuthStatusMessage(null);
+      } else {
+        setAuthStatusMessage(message);
+        setAuthError(null);
       }
-    })();
+    }
   }, []);
 
-  const loadAdminData = useCallback(async (authToken: string) => {
+  const refreshAuthStatus = useCallback(async () => {
+    try {
+      const status = await getAdminAuthStatus();
+      setSetupRequired(Boolean(status.setupRequired));
+      setAuthMode(status.authMode);
+      setAuthenticated(Boolean(status.authenticated));
+      setExpiresAt(status.expiresAt);
+      setCurrentAccount(status.account);
+    } catch {
+      setAuthError('Unable to check admin authentication status.');
+    } finally {
+      setAuthStatusLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAuthStatus();
+  }, [refreshAuthStatus]);
+
+  // Enforce automatic re-authentication immediately when session expires
+  useEffect(() => {
+    if (!authenticated || !expiresAt) return;
+    const msRemaining = expiresAt - Date.now();
+    if (msRemaining <= 0) {
+      clearClientSession('Your admin session has expired. Please sign in again.', true);
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void logoutAdmin().catch(() => undefined);
+      clearClientSession('Your admin session has expired. Please sign in again.', true);
+    }, msRemaining);
+
+    return () => window.clearTimeout(timer);
+  }, [authenticated, expiresAt, clearClientSession]);
+
+  const loadAdminData = useCallback(async () => {
     setLoadingData(true);
     setDataError(null);
     try {
-      const dashboard = await fetchAdminDashboard(authToken);
+      const dashboard = await fetchAdminDashboard();
       setBookings(dashboard.bookings);
       setNotifications(dashboard.notifications);
       setUnreadCount(dashboard.unreadCount);
       setHours(dashboard.hours);
     } catch (err) {
       if (err instanceof ApiRequestError && err.status === 401) {
-        setToken(null);
-        setAuthError('Admin session expired. Please sign in again.');
+        clearClientSession('Admin session expired. Please sign in again.', true);
         return;
       }
       setDataError(err instanceof Error ? err.message : 'Unable to fetch admin data.');
     } finally {
       setLoadingData(false);
     }
-  }, []);
+  }, [clearClientSession]);
 
   useEffect(() => {
-    if (token) {
-      void loadAdminData(token);
+    if (authenticated) {
+      void loadAdminData();
     }
-  }, [token, loadAdminData]);
+  }, [authenticated, loadAdminData]);
 
-  const handleAuthenticate = async (passcode: string) => {
-    setAuthError(null);
-    const session = await authenticateAdmin(
-      setupRequired ? 'setup' : 'login',
-      passcode
-    );
-    setSetupRequired(false);
-    setToken(session.token);
+  const handleSignOut = async () => {
+    try {
+      await logoutAdmin();
+    } catch {
+      // Clear local session state even if network call fails
+    }
+    clearClientSession('You have signed out cleanly. Your session has been terminated.', false);
+    await refreshAuthStatus();
   };
 
   const handleUpdateBookingStatus = async (bookingId: string, status: BookingStatus) => {
-    if (!token) return;
+    if (!authenticated) return;
     setUpdatingId(bookingId);
     setDataError(null);
     try {
-      const updated = await updateBookingStatus(token, bookingId, status);
+      const updated = await updateBookingStatus(bookingId, status);
       setBookings((prev) =>
         prev.map((b) => (b.id === bookingId ? updated : b))
       );
     } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        clearClientSession('Admin session expired. Please sign in again.', true);
+        return;
+      }
       setDataError(err instanceof Error ? err.message : 'Status update failed.');
     } finally {
       setUpdatingId(null);
@@ -105,21 +158,31 @@ export function AdminPage() {
   };
 
   const handleMarkNotificationsRead = async () => {
-    if (!token) return;
-    await markNotificationsRead(token);
-    setUnreadCount(0);
-    setNotifications((prev) => prev.map((n) => ({ ...n, is_read: 1 })));
+    if (!authenticated) return;
+    try {
+      await markNotificationsRead();
+      setUnreadCount(0);
+      setNotifications((prev) => prev.map((n) => ({ ...n, is_read: 1 })));
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        clearClientSession('Admin session expired. Please sign in again.', true);
+      }
+    }
   };
 
   const handleSaveOperatingHours = async () => {
-    if (!token) return;
+    if (!authenticated) return;
     setSavingHours(true);
     setHoursMessage(null);
     try {
-      const updated = await saveOperatingHours(token, hours);
+      const updated = await saveOperatingHours(hours);
       setHours(updated);
       setHoursMessage('Operating hours and PKR rates saved.');
     } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        clearClientSession('Admin session expired. Please sign in again.', true);
+        return;
+      }
       setHoursMessage(err instanceof Error ? err.message : 'Save failed.');
     } finally {
       setSavingHours(false);
@@ -129,23 +192,36 @@ export function AdminPage() {
   if (authStatusLoading) {
     return (
       <div className="min-h-screen pt-28 bg-[#0C153B] flex items-center justify-center text-sm text-slate-300">
-        Verifying admin access...
+        Verifying admin session...
       </div>
     );
   }
 
-  if (!token) {
+  if (!authenticated || !currentAccount) {
     return (
       <AdminLoginCard
         setupRequired={setupRequired}
+        authMode={authMode}
         externalError={authError}
-        onAuthenticate={handleAuthenticate}
+        statusMessage={authStatusMessage}
+        onAuthenticated={(session) => {
+          setAuthError(null);
+          setAuthStatusMessage(null);
+          setSetupRequired(false);
+          setAuthMode(session.authMode);
+          setExpiresAt(session.expiresAt);
+          setCurrentAccount(session.account);
+          setAuthenticated(true);
+        }}
       />
     );
   }
 
   const pendingCount = bookings.filter((b) => b.status === 'PENDING').length;
   const confirmedCount = bookings.filter((b) => b.status === 'CONFIRMED').length;
+  const expiryLabel = expiresAt
+    ? new Date(expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : null;
 
   return (
     <div className="min-h-screen pt-24 pb-20 bg-[#0C153B] text-white">
@@ -158,22 +234,33 @@ export function AdminPage() {
             <h1 className="mt-1 font-display text-3xl sm:text-4xl font-extrabold uppercase text-white">
               Booking Request Desk
             </h1>
+            <p className="mt-1 text-xs text-slate-300">
+              Signed in as <strong className="text-white">{currentAccount.displayName}</strong>{' '}
+              ({currentAccount.username})
+              {expiryLabel && (
+                <>
+                  {' '}
+                  · Session expires at{' '}
+                  <span className="font-mono-tabular text-white">{expiryLabel}</span>
+                </>
+              )}
+            </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
             <button
               type="button"
-              onClick={() => void loadAdminData(token)}
+              onClick={() => void loadAdminData()}
               disabled={loadingData}
-              className="inline-flex items-center gap-1.5 px-4 py-2 min-h-[40px] text-xs font-semibold text-white bg-[#16235C] hover:border-[#c4d835] border border-white/15 rounded-md cursor-pointer"
+              className="inline-flex items-center gap-1.5 px-4 py-2 min-h-[40px] text-xs font-semibold text-white bg-[#16235C] hover:border-[#c4d835] border border-white/15 rounded-md cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c4d835]"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${loadingData ? 'animate-spin' : ''}`} />
               <span>Refresh</span>
             </button>
             <button
               type="button"
-              onClick={() => setToken(null)}
-              className="inline-flex items-center gap-1.5 px-4 py-2 min-h-[40px] text-xs font-semibold text-slate-200 hover:text-white bg-white/5 border border-white/15 rounded-md cursor-pointer"
+              onClick={() => void handleSignOut()}
+              className="inline-flex items-center gap-1.5 px-4 py-2 min-h-[40px] text-xs font-semibold text-slate-200 hover:text-white bg-white/5 hover:bg-white/10 border border-white/15 rounded-md cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c4d835]"
             >
               <LogOut className="w-3.5 h-3.5" />
               <span>Sign Out</span>
@@ -220,7 +307,7 @@ export function AdminPage() {
             </div>
           </div>
 
-          <div className="inline-flex p-1 rounded-lg bg-[#121D52] border border-white/15 self-start">
+          <div className="inline-flex flex-wrap p-1 rounded-lg bg-[#121D52] border border-white/15 self-start">
             <button
               type="button"
               onClick={() => setActiveTab('bookings')}
@@ -243,6 +330,18 @@ export function AdminPage() {
             >
               Operating Hours &amp; Pricing
             </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('security')}
+              className={`inline-flex items-center gap-1.5 px-4 py-2 min-h-[38px] text-xs font-semibold rounded-md cursor-pointer ${
+                activeTab === 'security'
+                  ? 'bg-[#c4d835] text-[#0E1845]'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              <Shield className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Accounts &amp; MFA</span>
+            </button>
           </div>
         </div>
 
@@ -252,19 +351,29 @@ export function AdminPage() {
           </div>
         )}
 
-        {activeTab === 'bookings' ? (
+        {activeTab === 'bookings' && (
           <AdminBookingsList
             bookings={bookings}
             updatingId={updatingId}
             onUpdateStatus={handleUpdateBookingStatus}
           />
-        ) : (
+        )}
+
+        {activeTab === 'hours' && (
           <OperatingHoursEditor
             hours={hours}
             saving={savingHours}
             message={hoursMessage}
             onChangeHours={setHours}
             onSave={handleSaveOperatingHours}
+          />
+        )}
+
+        {activeTab === 'security' && (
+          <AdminSecurityPanel
+            currentAccount={currentAccount}
+            authMode={authMode}
+            onAccountUpdated={refreshAuthStatus}
           />
         )}
       </div>

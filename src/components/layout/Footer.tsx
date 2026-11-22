@@ -135,26 +135,33 @@ export function Footer({ onBookNow, onNavigateAdmin }: FooterProps) {
             <div>
               &copy; {new Date().getFullYear()} THE GRID by FC Rovers. All rights reserved.
             </div>
-            <div className="flex items-center gap-5">
+            <div className="flex flex-wrap items-center gap-5">
               <button
                 type="button"
                 onClick={() => setLegalDoc('privacy')}
-                className="hover:text-white transition-colors cursor-pointer py-1"
+                className="hover:text-white transition-colors cursor-pointer py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c4d835] rounded"
               >
                 Privacy Policy
               </button>
               <button
                 type="button"
                 onClick={() => setLegalDoc('terms')}
-                className="hover:text-white transition-colors cursor-pointer py-1"
+                className="hover:text-white transition-colors cursor-pointer py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c4d835] rounded"
               >
                 Terms &amp; Conditions
+              </button>
+              <button
+                type="button"
+                onClick={() => setLegalDoc('cancellation')}
+                className="hover:text-white transition-colors cursor-pointer py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c4d835] rounded"
+              >
+                Cancellation Policy
               </button>
               {onNavigateAdmin && (
                 <button
                   type="button"
                   onClick={onNavigateAdmin}
-                  className="hover:text-[#c4d835] transition-colors cursor-pointer py-1"
+                  className="hover:text-[#c4d835] transition-colors cursor-pointer py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c4d835] rounded"
                 >
                   Admin
                 </button>
@@ -164,7 +171,11 @@ export function Footer({ onBookNow, onNavigateAdmin }: FooterProps) {
         </div>
       </footer>
 
-      <LegalModal legalDoc={legalDoc} onClose={() => setLegalDoc(null)} />
+      <LegalModal
+        legalDoc={legalDoc}
+        onClose={() => setLegalDoc(null)}
+        onSwitchDoc={(doc) => setLegalDoc(doc)}
+      />
     </>
   );
 }

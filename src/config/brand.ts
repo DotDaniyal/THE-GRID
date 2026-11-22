@@ -35,6 +35,9 @@ export const LOCATION = {
 
 export const PAYMENT_INFO = {
   bankName: 'Bank Al Habib',
+  accountTitle: 'THE GRID by FC Rovers (confirm exact title on WhatsApp if prompted)',
   iban: 'PK44BAHL5037008100157501',
   advancePercent: 50,
+  holdDurationMinutes: 30,
 } as const;
+

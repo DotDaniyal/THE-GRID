@@ -13,11 +13,18 @@ import { BookingSlotPage } from '@/src/pages/BookingSlotPage';
 import { HomePage } from '@/src/pages/HomePage';
 import { getKarachiTodayStr } from '@/src/utils/date';
 
+function prefersReducedMotionSync(): boolean {
+  if (typeof window === 'undefined' || !window.matchMedia) return false;
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
 export default function App() {
   const [currentPath, setCurrentPath] = useState<AppRoute>(() =>
     typeof window !== 'undefined' ? parseRoute(window.location.pathname) : '/'
   );
-  const [navVisible, setNavVisible] = useState(() => currentPath !== '/');
+  const [navVisible, setNavVisible] = useState(
+    () => currentPath !== '/' || prefersReducedMotionSync()
+  );
 
   const karachiToday = useMemo(() => getKarachiTodayStr(), []);
   const { bookingSelection, updateBookingSelection } = useBookingSelection();
@@ -26,7 +33,7 @@ export default function App() {
     const onPopState = () => {
       const next = parseRoute(window.location.pathname);
       setCurrentPath(next);
-      if (next !== '/') setNavVisible(true);
+      if (next !== '/' || prefersReducedMotionSync()) setNavVisible(true);
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
@@ -42,21 +49,23 @@ export default function App() {
       window.history.pushState({}, '', targetUrl);
     }
     setCurrentPath(path);
-    if (path !== '/') {
+    if (path !== '/' || prefersReducedMotionSync()) {
       setNavVisible(true);
     }
+
+    const scrollBehavior: ScrollBehavior = prefersReducedMotionSync() ? 'auto' : 'smooth';
 
     if (hash) {
       window.requestAnimationFrame(() => {
         window.setTimeout(() => {
           const el = document.querySelector(hash);
           if (el) {
-            el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            el.scrollIntoView({ behavior: scrollBehavior, block: 'start' });
           }
         }, 60);
       });
     } else {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      window.scrollTo({ top: 0, behavior: scrollBehavior });
     }
   }, []);
 
@@ -65,6 +74,7 @@ export default function App() {
   }, []);
 
   const handleBookNow = useCallback(() => {
+    setNavVisible(true);
     navigate('/booking');
   }, [navigate]);
 
@@ -76,6 +86,7 @@ export default function App() {
           onNavigate={navigate}
           onBookNow={handleBookNow}
           visible={navVisible}
+          onFocusReveal={handleIntroComplete}
         />
 
         {currentPath === '/' && (

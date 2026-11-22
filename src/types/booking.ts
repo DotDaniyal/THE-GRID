@@ -36,6 +36,7 @@ export interface CreateBookingPayload {
   startTime: string;
   additionalGuestsCount: number;
   participants?: SharedParticipant[];
+  policiesAccepted?: boolean;
 }
 
 export interface CreatedBooking {
@@ -96,10 +97,25 @@ export interface OperatingHourConfig {
   is_active: number;
 }
 
+export interface AdminAccountSummary {
+  id: number;
+  username: string;
+  displayName: string;
+  role: 'SUPER_ADMIN' | 'ADMIN' | 'LEGACY_SHARED';
+  mfaEnabled: boolean;
+  isActive?: boolean;
+  createdAt?: string;
+  lastLoginAt?: string | null;
+}
+
 export interface AdminAuthStatus {
-  hasEnvPasscode: boolean;
-  hasClaimedPasscode: boolean;
+  authenticated: boolean;
   setupRequired: boolean;
+  authMode: 'named_accounts' | 'legacy_passcode_fallback' | 'setup_required';
+  expiresAt: number | null;
+  account: AdminAccountSummary | null;
+  mfaMigrationRecommended: boolean;
+  sessionTtlMinutes: number;
 }
 
 export interface CountryCodeOption {

@@ -161,6 +161,12 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
       ? Math.max(0, Math.min(20, Math.floor(rawBody.additionalGuestsCount)))
       : 0;
 
+  if (rawBody.policiesAccepted === false) {
+    throw new ServiceError(
+      400,
+      'You must agree to the Terms & Conditions, Privacy Policy, and cancellation/refund policy.'
+    );
+  }
   if (customerName.length < 2 || customerName.length > 80) {
     throw new ServiceError(400, 'Full name must be between 2 and 80 characters.');
   }
