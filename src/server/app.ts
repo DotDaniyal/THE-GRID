@@ -1,4 +1,5 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
+import session from 'express-session';
 import { getDb } from './db/sqlite.ts';
 import { securityHeadersMiddleware } from './middleware/securityHeaders.ts';
 import { adminRouter } from './routes/adminRoutes.ts';
@@ -12,6 +13,19 @@ export function createApiApp(): express.Express {
   app.set('trust proxy', 1);
   app.use(securityHeadersMiddleware);
   app.use(express.json({ limit: '100kb' }));
+  app.use(
+    session({
+      secret: process.env.SESSION_SECRET || 'thegrid-secure-session-secret-change-me',
+      resave: false,
+      saveUninitialized: false,
+      cookie: {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 4 * 60 * 60 * 1000,
+      },
+    })
+  );
 
   app.use('/api', publicBookingRouter);
   app.use('/api/admin', adminRouter);

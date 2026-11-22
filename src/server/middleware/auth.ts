@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import bcrypt from 'bcryptjs';
 import type { NextFunction, Request, Response } from 'express';
 import { getDb } from '../db/sqlite.ts';
 import { verifyTotpCode } from '../utils/totp.ts';
@@ -93,20 +94,16 @@ function getSessionSecret(): string {
 }
 
 export function hashPassword(password: string): string {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
-  return `${salt}:${derived}`;
+  return bcrypt.hashSync(password, 12);
 }
 
 export function verifyPassword(password: string, storedHash: string): boolean {
-  const parts = storedHash.split(':');
-  if (parts.length !== 2) return false;
-  const [salt, hexHash] = parts;
-  if (!salt || !hexHash) return false;
-  const derived = crypto.scryptSync(password, salt, 64);
-  const storedBuf = Buffer.from(hexHash, 'hex');
-  if (derived.length !== storedBuf.length) return false;
-  return crypto.timingSafeEqual(derived, storedBuf);
+  if (!storedHash) return false;
+  try {
+    return bcrypt.compareSync(password, storedHash);
+  } catch {
+    return false;
+  }
 }
 
 export function normalizeAdminUsername(raw: string): string {

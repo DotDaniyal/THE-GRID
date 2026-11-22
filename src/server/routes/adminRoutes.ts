@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
 import { getDb } from '../db/sqlite.ts';
 import {
   authenticateAdminCredentials,
@@ -39,6 +40,14 @@ import { ServiceError } from '../services/bookingService.ts';
 import { buildOtpAuthUri, generateTotpSecret, verifyTotpCode } from '../utils/totp.ts';
 
 export const adminRouter = Router();
+
+const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts from this IP. Please try again after 15 minutes.' },
+});
 
 const GENERIC_AUTH_ERROR =
   'Invalid credentials. Please verify your sign-in details and try again.';
@@ -149,7 +158,7 @@ adminRouter.post('/setup', authRateLimit, requireSameOriginForCookieMutation, (r
   });
 });
 
-adminRouter.post('/login', authRateLimit, requireSameOriginForCookieMutation, (req, res) => {
+adminRouter.post('/login', adminLoginLimiter, authRateLimit, requireSameOriginForCookieMutation, (req, res) => {
   const ip = getRequestClientIp(req);
   const lockout = checkAuthLockout(ip);
   if (lockout.locked) {
