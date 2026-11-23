@@ -18,17 +18,13 @@ interface AdminLoginCardProps {
 
 export function AdminLoginCard({
   setupRequired,
-  authMode,
   externalError,
   statusMessage,
   onAuthenticated,
 }: AdminLoginCardProps) {
   const [username, setUsername] = useState('');
-  const [displayName, setDisplayName] = useState('');
   const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const [useLegacyMode, setUseLegacyMode] = useState(false);
 
   const [challengeToken, setChallengeToken] = useState<string | null>(null);
   const [mfaCode, setMfaCode] = useState('');
@@ -55,21 +51,11 @@ export function AdminLoginCard({
 
     if (setupRequired) {
       if (username.trim().length < 3) {
-        setLocalError('Enter your email or username (minimum 3 characters).');
+        setLocalError('Enter a username or email (minimum 3 characters).');
         return;
       }
-      if (displayName.trim().length < 2) {
-        setLocalError('Enter your full name or display name.');
-        return;
-      }
-      if (password.length < 10) {
-        setLocalError(
-          'Password must be at least 10 characters and include uppercase, lowercase, number, and symbol.'
-        );
-        return;
-      }
-      if (password !== confirmPassword) {
-        setLocalError('Passwords do not match.');
+      if (password.length < 6) {
+        setLocalError('Password must be at least 6 characters.');
         return;
       }
 
@@ -77,11 +63,9 @@ export function AdminLoginCard({
       try {
         const res = await setupPrimaryAdmin({
           username: username.trim(),
-          displayName: displayName.trim(),
           password,
         });
         setPassword('');
-        setConfirmPassword('');
         onAuthenticated({
           expiresAt: res.expiresAt,
           authMode: res.authMode,
@@ -92,7 +76,7 @@ export function AdminLoginCard({
         if (err instanceof ApiRequestError && err.status === 429 && err.retryAfterSeconds) {
           setLockoutSeconds(err.retryAfterSeconds);
         }
-        setLocalError(err instanceof Error ? err.message : 'Invalid sign-in details. Please try again.');
+        setLocalError(err instanceof Error ? err.message : 'Unable to complete setup. Please try again.');
       } finally {
         setSubmitting(false);
       }
@@ -134,15 +118,15 @@ export function AdminLoginCard({
       return;
     }
 
-    if (!password || (!useLegacyMode && authMode === 'named_accounts' && !username.trim())) {
-      setLocalError('Enter your email/username and password.');
+    if (!username.trim() || !password) {
+      setLocalError('Enter your username and password.');
       return;
     }
 
     setSubmitting(true);
     try {
       const res = await loginAdmin({
-        username: useLegacyMode ? '' : username.trim(),
+        username: username.trim(),
         password,
       });
 
@@ -162,10 +146,18 @@ export function AdminLoginCard({
         });
       }
     } catch (err) {
-      if (err instanceof ApiRequestError && err.status === 429 && err.retryAfterSeconds) {
-        setLockoutSeconds(err.retryAfterSeconds);
+      if (err instanceof ApiRequestError) {
+        if (err.status === 429 && err.retryAfterSeconds) {
+          setLockoutSeconds(err.retryAfterSeconds);
+        }
+        setLocalError(
+          err.status === 401
+            ? 'Invalid username or password. Please try again.'
+            : err.message
+        );
+      } else {
+        setLocalError(err instanceof Error ? err.message : 'Unable to sign in. Please try again.');
       }
-      setLocalError('Invalid sign-in details. Please try again.');
     } finally {
       setSubmitting(false);
     }
@@ -186,18 +178,14 @@ export function AdminLoginCard({
           )}
           <div>
             <h1 className="font-display text-2xl font-bold uppercase text-white">
-              {setupRequired
-                ? 'Primary Admin Account Setup'
-                : challengeToken
-                ? 'Two-Factor Verification'
-                : 'THE GRID Admin Desk'}
+              {challengeToken ? 'Two-Factor Verification' : 'THE GRID Admin Desk'}
             </h1>
             <p className="text-xs text-slate-300">
               {setupRequired
-                ? 'Create a named administrator account with a strong password.'
+                ? 'Set your admin username and password to access the panel.'
                 : challengeToken
                 ? 'Enter the 6-digit verification code from your authenticator app.'
-                : 'Authorized administrators only. Sessions use secure HTTP-only cookies.'}
+                : 'Sign in with your administrator username and password.'}
             </p>
           </div>
         </div>
@@ -212,88 +200,7 @@ export function AdminLoginCard({
           </div>
         )}
 
-        {setupRequired ? (
-          <>
-            <div>
-              <label htmlFor="admin-username" className="block text-xs font-semibold text-slate-200 mb-1.5">
-                Administrator email or username <span className="text-[#c4d835]">*</span>
-              </label>
-              <input
-                id="admin-username"
-                type="text"
-                autoComplete="username"
-                required
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="admin@thegrid.pk"
-                className="w-full min-h-[46px] px-3.5 py-2.5 text-sm text-white bg-[#0B1338] border border-white/20 rounded-lg focus:outline-none focus:border-[#c4d835] focus-visible:ring-2 focus-visible:ring-[#c4d835]"
-              />
-            </div>
-
-            <div>
-              <label htmlFor="admin-display" className="block text-xs font-semibold text-slate-200 mb-1.5">
-                Full Name / Display Name <span className="text-[#c4d835]">*</span>
-              </label>
-              <input
-                id="admin-display"
-                type="text"
-                autoComplete="name"
-                required
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-                placeholder="Daniyal Hayyat"
-                className="w-full min-h-[46px] px-3.5 py-2.5 text-sm text-white bg-[#0B1338] border border-white/20 rounded-lg focus:outline-none focus:border-[#c4d835] focus-visible:ring-2 focus-visible:ring-[#c4d835]"
-              />
-            </div>
-
-            <div>
-              <label htmlFor="admin-pass" className="block text-xs font-semibold text-slate-200 mb-1.5">
-                Password <span className="text-[#c4d835]">*</span>
-              </label>
-              <div className="relative">
-                <input
-                  id="admin-pass"
-                  type={showPassword ? 'text' : 'password'}
-                  autoComplete="new-password"
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  aria-describedby="admin-pass-rules"
-                  className="w-full min-h-[46px] px-3.5 py-2.5 pr-12 text-sm text-white bg-[#0B1338] border border-white/20 rounded-lg focus:outline-none focus:border-[#c4d835] focus-visible:ring-2 focus-visible:ring-[#c4d835]"
-                />
-                <button
-                  type="button"
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
-                  onClick={() => setShowPassword((prev) => !prev)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-300 hover:text-white p-1 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c4d835]"
-                >
-                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
-              </div>
-              <p id="admin-pass-rules" className="mt-1.5 text-[11px] text-slate-300 leading-relaxed">
-                Minimum 10 characters with uppercase, lowercase, number, and symbol.
-              </p>
-            </div>
-
-            <div>
-              <label
-                htmlFor="admin-pass-confirm"
-                className="block text-xs font-semibold text-slate-200 mb-1.5"
-              >
-                Confirm Password <span className="text-[#c4d835]">*</span>
-              </label>
-              <input
-                id="admin-pass-confirm"
-                type="password"
-                autoComplete="new-password"
-                required
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                className="w-full min-h-[46px] px-3.5 py-2.5 text-sm text-white bg-[#0B1338] border border-white/20 rounded-lg focus:outline-none focus:border-[#c4d835] focus-visible:ring-2 focus-visible:ring-[#c4d835]"
-              />
-            </div>
-          </>
-        ) : challengeToken ? (
+        {challengeToken ? (
           <div className="space-y-3">
             <div>
               <label htmlFor="admin-mfa" className="block text-xs font-semibold text-slate-200 mb-1.5">
@@ -321,20 +228,20 @@ export function AdminLoginCard({
               }}
               className="text-xs text-slate-300 hover:text-white underline underline-offset-4 cursor-pointer"
             >
-              Back to credentials sign-in
+              Back to sign-in
             </button>
           </div>
         ) : (
           <>
             <div>
               <label htmlFor="admin-username" className="block text-xs font-semibold text-slate-200 mb-1.5">
-                Administrator email or username <span className="text-[#c4d835]">*</span>
+                Username or Email <span className="text-[#c4d835]">*</span>
               </label>
               <input
                 id="admin-username"
                 type="text"
                 autoComplete="username"
-                required={!useLegacyMode}
+                required
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 placeholder="admin@thegrid.pk"
@@ -343,17 +250,14 @@ export function AdminLoginCard({
             </div>
 
             <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <label htmlFor="admin-pass" className="block text-xs font-semibold text-slate-200">
-                  Password <span className="text-[#c4d835]">*</span>
-                </label>
-                <span className="text-[11px] text-slate-400">Forgot password? Contact super admin</span>
-              </div>
+              <label htmlFor="admin-pass" className="block text-xs font-semibold text-slate-200 mb-1.5">
+                Password <span className="text-[#c4d835]">*</span>
+              </label>
               <div className="relative">
                 <input
                   id="admin-pass"
                   type={showPassword ? 'text' : 'password'}
-                  autoComplete="current-password"
+                  autoComplete={setupRequired ? 'new-password' : 'current-password'}
                   required
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
@@ -368,27 +272,12 @@ export function AdminLoginCard({
                   {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
               </div>
+              {setupRequired && (
+                <p className="mt-1.5 text-[11px] text-slate-300">
+                  Minimum 6 characters.
+                </p>
+              )}
             </div>
-
-            {authMode === 'legacy_passcode_fallback' && (
-              <div className="pt-1">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setUseLegacyMode((prev) => !prev);
-                    setLocalError(null);
-                  }}
-                  className="text-xs text-[#c4d835] hover:text-white underline underline-offset-4 cursor-pointer"
-                >
-                  {useLegacyMode ? 'Use named administrator account' : 'Use legacy access code'}
-                </button>
-                {useLegacyMode && (
-                  <p className="mt-1.5 text-[11px] text-amber-300 leading-relaxed">
-                    Legacy access will be retired. Use your administrator account where available.
-                  </p>
-                )}
-              </div>
-            )}
           </>
         )}
 
@@ -422,7 +311,7 @@ export function AdminLoginCard({
               : submitting
               ? 'Signing in...'
               : setupRequired
-              ? 'Create Primary Admin Account'
+              ? 'Create Admin & Sign In'
               : challengeToken
               ? 'Verify Code & Sign In'
               : 'Sign In'}

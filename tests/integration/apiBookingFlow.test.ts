@@ -251,3 +251,228 @@ test('Admin cookie auth, CSRF origin check, session revocation on logout, and fa
   assert.equal(lockoutRes.status, 429);
   assert.ok(lockoutRes.headers.get('retry-after'));
 });
+
+test('Drinks Inventory, Sales, Expenses & P&L routes are strictly admin-only and never exposed publicly', async () => {
+  // Confirm unauthenticated access is strictly blocked across all inventory routes
+  assert.equal((await fetch(`${baseUrl}/api/admin/drinks`)).status, 401);
+  assert.equal((await fetch(`${baseUrl}/api/admin/drinks/sales`)).status, 401);
+  assert.equal((await fetch(`${baseUrl}/api/admin/drinks/expenses`)).status, 401);
+  assert.equal((await fetch(`${baseUrl}/api/admin/drinks/reports`)).status, 401);
+
+  // Confirm no public drinks endpoint exists
+  assert.equal((await fetch(`${baseUrl}/api/drinks`)).status, 404);
+
+  // Sign in using the account created in the setup test
+  const loginRes = await fetch(`${baseUrl}/api/admin/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-Forwarded-For': '198.51.100.77',
+    },
+    body: JSON.stringify({
+      username: 'leadadmin@thegrid.pk',
+      password: 'RoversGrid2026!Strong',
+    }),
+  });
+  assert.equal(loginRes.status, 200);
+  const cookiePair = extractCookiePair(loginRes.headers.get('set-cookie'));
+
+  // Public court booking stays completely separate from drinks
+  const bookRes = await fetch(`${baseUrl}/api/bookings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      customerName: 'Court Only Player',
+      customerEmail: 'court@thegrid.pk',
+      countryCode: '+92',
+      customerPhone: '03215559999',
+      bookingDate: TEST_DATE,
+      startTime: '07:00',
+      bookingType: 'individual',
+      additionalGuestsCount: 0,
+      policiesAccepted: true,
+    }),
+  });
+  assert.equal(bookRes.status, 201);
+  const bookJson = (await bookRes.json()) as {
+    booking: { id: string; totalAmountPkr: number };
+  };
+  assert.equal(bookJson.booking.totalAmountPkr, 1500);
+
+  // Create inventory product
+  const createRes = await fetch(`${baseUrl}/api/admin/drinks`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookiePair,
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    body: JSON.stringify({
+      name: 'Chilled Mineral Water 1.5L',
+      category: 'water',
+      brand: 'Pure',
+      bottleSize: '1.5L',
+      purchasePricePkr: 90,
+      pricePkr: 150,
+      openingStock: 10,
+      minStockAlert: 3,
+      isActive: true,
+    }),
+  });
+  assert.equal(createRes.status, 201);
+  const createdDrink = ((await createRes.json()) as {
+    drink: { id: number; current_stock: number };
+  }).drink;
+  assert.equal(createdDrink.current_stock, 10);
+
+  // Restock +5 units -> 15
+  const adjRes = await fetch(`${baseUrl}/api/admin/drinks/${createdDrink.id}/adjust-stock`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookiePair,
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    body: JSON.stringify({ deltaQty: 5, reason: 'Crate arrival' }),
+  });
+  assert.equal(adjRes.status, 200);
+  const adjBody = (await adjRes.json()) as { drink: { current_stock: number } };
+  assert.equal(adjBody.drink.current_stock, 15);
+
+  // Record a manual sale of 4 units (Revenue = 600, COGS = 360, Profit = 240, remaining stock = 11)
+  const saleRes = await fetch(`${baseUrl}/api/admin/drinks/sales`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookiePair,
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    body: JSON.stringify({
+      drinkId: createdDrink.id,
+      quantity: 4,
+      soldAt: '2027-06-15T20:00',
+      notes: 'Counter match sale',
+    }),
+  });
+  assert.equal(saleRes.status, 201);
+  const saleBody = (await saleRes.json()) as {
+    sale: { id: number; total_sale_pkr: number; profit_pkr: number };
+  };
+  assert.equal(saleBody.sale.total_sale_pkr, 600);
+  assert.equal(saleBody.sale.profit_pkr, 240);
+
+  // Add an expense (PKR 40) -> Net Profit = 240 - 40 = 200
+  const expRes = await fetch(`${baseUrl}/api/admin/drinks/expenses`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookiePair,
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    body: JSON.stringify({
+      title: 'Ice bag',
+      amountPkr: 40,
+      expenseDate: '2027-06-15',
+    }),
+  });
+  assert.equal(expRes.status, 201);
+
+  // Check P&L analytics report
+  const repRes = await fetch(`${baseUrl}/api/admin/drinks/reports?from=2027-06-15&to=2027-06-15`, {
+    headers: { Cookie: cookiePair },
+  });
+  assert.equal(repRes.status, 200);
+  const repBody = (await repRes.json()) as {
+    kpis: {
+      totalRevenuePkr: number;
+      grossProfitPkr: number;
+      netProfitPkr: number;
+      totalItemsRemaining: number;
+    };
+  };
+  assert.equal(repBody.kpis.totalRevenuePkr, 600);
+  assert.equal(repBody.kpis.grossProfitPkr, 240);
+  assert.equal(repBody.kpis.netProfitPkr, 200);
+  assert.equal(repBody.kpis.totalItemsRemaining, 11);
+
+  // Cancel sale and confirm stock is restored back to 15
+  const cancelRes = await fetch(
+    `${baseUrl}/api/admin/drinks/sales/${saleBody.sale.id}/cancel`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookiePair,
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ reason: 'Mistyped order' }),
+    }
+  );
+  assert.equal(cancelRes.status, 200);
+
+  const listAfterCancel = await fetch(`${baseUrl}/api/admin/drinks`, {
+    headers: { Cookie: cookiePair },
+  });
+  const listJson = (await listAfterCancel.json()) as {
+    drinks: Array<{ id: number; current_stock: number }>;
+  };
+  assert.equal(
+    listJson.drinks.find((d) => d.id === createdDrink.id)?.current_stock,
+    15
+  );
+});
+
+test('Embedded iframe login emits SameSite=None Partitioned cookies and supports Bearer fallback with logout revocation', async () => {
+  const loginRes = await fetch(`${baseUrl}/api/admin/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-Forwarded-Proto': 'https',
+      'X-Forwarded-Host': 'preview.asia-east1.run.app',
+      'X-Forwarded-For': '198.51.100.88',
+      Origin: 'https://preview.asia-east1.run.app',
+    },
+    body: JSON.stringify({
+      username: 'leadadmin@thegrid.pk',
+      password: 'RoversGrid2026!Strong',
+    }),
+  });
+  assert.equal(loginRes.status, 200);
+
+  const setCookie = loginRes.headers.get('set-cookie') || '';
+  assert.match(setCookie, /HttpOnly/);
+  assert.match(setCookie, /Secure/);
+  assert.match(setCookie, /SameSite=None/);
+  assert.match(setCookie, /Partitioned/);
+
+  const body = (await loginRes.json()) as { authenticated: boolean; sessionToken?: string };
+  assert.equal(body.authenticated, true);
+  assert.ok(body.sessionToken);
+
+  // Access admin endpoint WITHOUT cookie header using Bearer fallback
+  const dashRes = await fetch(`${baseUrl}/api/admin/bookings`, {
+    headers: {
+      Authorization: `Bearer ${body.sessionToken}`,
+    },
+  });
+  assert.equal(dashRes.status, 200);
+
+  // Logout revokes the Bearer-presented session immediately
+  const logoutRes = await fetch(`${baseUrl}/api/admin/logout`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${body.sessionToken}`,
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+  });
+  assert.equal(logoutRes.status, 200);
+
+  const afterLogoutRes = await fetch(`${baseUrl}/api/admin/bookings`, {
+    headers: {
+      Authorization: `Bearer ${body.sessionToken}`,
+    },
+  });
+  assert.equal(afterLogoutRes.status, 401);
+});

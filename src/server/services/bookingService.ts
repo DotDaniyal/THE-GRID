@@ -232,6 +232,7 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
     }
   }
 
+  const totalAmountPkr = slot.price_pkr;
   const bookingId = generateBookingId(bookingDate);
   const nowIso = new Date().toISOString();
 
@@ -274,7 +275,7 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
       phoneResult.formatted,
       participantsJson,
       additionalGuestsCount,
-      slot.price_pkr,
+      totalAmountPkr,
       nowIso,
       nowIso
     );
@@ -283,7 +284,7 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
       'INSERT INTO admin_notifications (booking_id, message, is_read, created_at) VALUES (?, ?, 0, ?)'
     ).run(
       bookingId,
-      `New ${bookingType} booking request (${bookingId}) from ${customerName} for ${bookingDate} at ${slot.display_name} - PKR ${slot.price_pkr.toLocaleString()}.`,
+      `New ${bookingType} booking request (${bookingId}) from ${customerName} for ${bookingDate} at ${slot.display_name} (PKR ${totalAmountPkr.toLocaleString()}).`,
       nowIso
     );
 
@@ -323,7 +324,7 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
     countryCode,
     customerPhone: phoneResult.formatted,
     additionalGuestsCount,
-    totalAmountPkr: slot.price_pkr,
+    totalAmountPkr,
     status: 'PENDING',
     createdAt: nowIso,
   };

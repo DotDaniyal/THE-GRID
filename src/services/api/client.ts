@@ -1,3 +1,13 @@
+let inMemoryAdminSessionToken: string | null = null;
+
+export function setInMemoryAdminSessionToken(token: string | null): void {
+  inMemoryAdminSessionToken = token && token.trim() ? token.trim() : null;
+}
+
+export function clearInMemoryAdminSessionToken(): void {
+  inMemoryAdminSessionToken = null;
+}
+
 export class ApiRequestError extends Error {
   status: number;
   code?: string;
@@ -21,12 +31,23 @@ export async function apiRequest<T>(url: string, init?: RequestInit): Promise<T>
   if (!headers.has('X-Requested-With')) {
     headers.set('X-Requested-With', 'XMLHttpRequest');
   }
+  if (
+    url.startsWith('/api/admin') &&
+    inMemoryAdminSessionToken &&
+    !headers.has('Authorization')
+  ) {
+    headers.set('Authorization', `Bearer ${inMemoryAdminSessionToken}`);
+  }
 
   const res = await fetch(url, {
     credentials: 'same-origin',
     ...init,
     headers,
   });
+
+  if (res.status === 401 && url.startsWith('/api/admin')) {
+    inMemoryAdminSessionToken = null;
+  }
 
   let data: Record<string, unknown> = {};
   try {

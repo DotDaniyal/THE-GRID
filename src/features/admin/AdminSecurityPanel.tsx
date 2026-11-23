@@ -176,12 +176,7 @@ export function AdminSecurityPanel({
             </div>
           </div>
 
-          {currentAccount.role === 'LEGACY_SHARED' ? (
-            <p className="text-xs text-slate-300 leading-relaxed">
-              MFA requires an individual named administrator account. Create a named administrator
-              account on the right, sign in as that user, and enable TOTP MFA there.
-            </p>
-          ) : currentAccount.mfaEnabled ? (
+          {currentAccount.mfaEnabled ? (
             <form onSubmit={handleDisableMfa} className="space-y-3">
               <p className="text-xs text-slate-300 leading-relaxed">
                 Your account requires a 6-digit authenticator code at every sign-in. Confirm your
@@ -313,12 +308,11 @@ export function AdminSecurityPanel({
               </div>
               <div>
                 <label htmlFor="new-admin-name" className="block text-xs font-semibold text-slate-200 mb-1">
-                  Display Name
+                  Display Name (Optional)
                 </label>
                 <input
                   id="new-admin-name"
                   type="text"
-                  required
                   value={newDisplayName}
                   onChange={(e) => setNewDisplayName(e.target.value)}
                   placeholder="Court Manager"
@@ -330,7 +324,7 @@ export function AdminSecurityPanel({
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div className="sm:col-span-2">
                 <label htmlFor="new-admin-pass" className="block text-xs font-semibold text-slate-200 mb-1">
-                  Strong Password (10+ chars, upper, lower, digit, symbol)
+                  Password (min 6 characters)
                 </label>
                 <input
                   id="new-admin-pass"

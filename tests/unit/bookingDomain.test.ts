@@ -7,6 +7,7 @@ import test, { after } from 'node:test';
 const TEMP_DB_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'thegrid-unit-'));
 process.env.SQLITE_DB_PATH = path.join(TEMP_DB_DIR, 'unit.sqlite');
 
+const { getDb } = await import('../../src/server/db/sqlite.ts');
 const {
   createAdminSession,
   hashPassword,
@@ -31,6 +32,18 @@ const { generateTotpCode, generateTotpSecret, verifyTotpCode } = await import(
   '../../src/server/utils/totp.ts'
 );
 const { buildWhatsAppBookingMessage } = await import('../../src/services/integrations/whatsapp');
+const {
+  adjustDrinkStock,
+  cancelDrinkSale,
+  createDrink,
+  createDrinkExpense,
+  createDrinkSale,
+  deleteDrink,
+  getAllDrinksAdmin,
+  getDrinksAnalyticsAndReports,
+  updateDrink,
+  updateDrinkSale,
+} = await import('../../src/server/services/drinkService.ts');
 const { addDaysToIsoDate, formatReadableDate } = await import('../../src/utils/date');
 const { validateCustomerDetails } = await import('../../src/utils/validation');
 
@@ -81,18 +94,25 @@ test('normalizePhone standardizes Pakistani +92 formats and rejects invalid numb
   });
 });
 
-test('strong password, username, session verification, and TOTP MFA round-trip securely', () => {
+test('strong password, username, session verification, and TOTP MFA round-trip securely', async () => {
   assert.equal(validateAdminUsername('admin@thegrid.pk'), null);
   assert.ok(validateAdminUsername('a'));
   assert.equal(validateStrongPassword('RoversGrid2026!'), null);
-  assert.ok(validateStrongPassword('weakpass'));
+  assert.equal(validateStrongPassword('simple'), null);
+  assert.ok(validateStrongPassword('12345'));
 
-  const hash = hashPassword('RoversGrid2026!');
-  assert.equal(verifyPassword('RoversGrid2026!', hash), true);
-  assert.equal(verifyPassword('wrong-password', hash), false);
+  const hash = await hashPassword('RoversGrid2026!');
+  assert.equal(await verifyPassword('RoversGrid2026!', hash), true);
+  assert.equal(await verifyPassword('wrong-password', hash), false);
+
+  const db = getDb();
+  db.prepare(
+    `INSERT OR IGNORE INTO admin_users (id, username, display_name, role, password_hash, mfa_enabled, is_active, created_at)
+     VALUES (1, 'qa-admin@thegrid.pk', 'QA Admin', 'ADMIN', ?, 0, 1, ?)`
+  ).run(hash, new Date().toISOString());
 
   const session = createAdminSession({
-    adminUserId: null,
+    adminUserId: 1,
     username: 'qa-admin@thegrid.pk',
     displayName: 'QA Admin',
     role: 'ADMIN',
@@ -153,7 +173,7 @@ test('validateCustomerDetails checks required name, email, and Pakistani mobile 
   assert.ok(invalidErrors.customerPhone);
 });
 
-test('date helpers and WhatsApp message formatter build complete booking summary', () => {
+test('date helpers and WhatsApp message formatter build court-only booking summary without drinks', () => {
   assert.equal(addDaysToIsoDate('2026-11-30', 1), '2026-12-01');
   assert.match(formatReadableDate('2026-11-22'), /22 Nov 2026/);
 
@@ -172,13 +192,126 @@ test('date helpers and WhatsApp message formatter build complete booking summary
     countryCode: '+92',
     customerPhone: '+92 321 9876543',
     additionalGuestsCount: 4,
-    totalAmountPkr: 4000,
+    totalAmountPkr: 3600,
     status: 'PENDING',
     createdAt: '2026-11-22T12:00:00.000Z',
   });
 
   assert.match(message, /Booking ID: GRD-20261125-ABCD/);
   assert.match(message, /Booking Type: Shared/);
-  assert.match(message, /Total Amount: PKR 4,000/);
+  assert.match(message, /Total Amount: PKR 3,600/);
   assert.match(message, /Status: Pending Confirmation/);
+});
+
+test('private drinkService handles inventory, sales, edit/cancel stock restoration, expenses, and P&L without fake seeded items', () => {
+  assert.equal(getAllDrinksAdmin().length, 0);
+
+  const productA = createDrink(
+    {
+      name: 'Electrolyte Hydration 500ml',
+      category: 'hydration_drinks',
+      brand: 'SportFuel',
+      bottleSize: '500ml',
+      purchasePricePkr: 150,
+      pricePkr: 250,
+      openingStock: 20,
+      minStockAlert: 5,
+      isActive: true,
+    },
+    'qa-admin'
+  );
+  const productB = createDrink(
+    {
+      name: 'Still Water 1.5L',
+      category: 'water',
+      brand: 'PureLife',
+      bottleSize: '1.5L',
+      purchasePricePkr: 80,
+      pricePkr: 140,
+      openingStock: 10,
+      minStockAlert: 4,
+      isActive: true,
+    },
+    'qa-admin'
+  );
+
+  // Restock productA (+5 -> 25)
+  const adj = adjustDrinkStock(productA.id, { deltaQty: 5, reason: 'Crate arrival' }, 'qa-admin');
+  assert.equal(adj.drink.current_stock, 25);
+
+  // Record sale of 5 units of productA @ 250 sell / 150 cost
+  const sale = createDrinkSale(
+    {
+      drinkId: productA.id,
+      quantity: 5,
+      soldAt: '2026-11-23T19:00',
+      notes: 'Match 1',
+    },
+    'qa-admin'
+  );
+  assert.equal(sale.total_sale_pkr, 1250);
+  assert.equal(sale.total_cost_pkr, 750);
+  assert.equal(sale.profit_pkr, 500);
+  assert.equal(
+    getAllDrinksAdmin().find((d) => d.id === productA.id)?.current_stock,
+    20
+  );
+
+  // Edit sale from 5 -> 3 units (restores 2 units -> stock becomes 22)
+  const editedSale = updateDrinkSale(sale.id, { quantity: 3 }, 'qa-admin');
+  assert.equal(editedSale.total_sale_pkr, 750);
+  assert.equal(editedSale.total_cost_pkr, 450);
+  assert.equal(editedSale.profit_pkr, 300);
+  assert.equal(
+    getAllDrinksAdmin().find((d) => d.id === productA.id)?.current_stock,
+    22
+  );
+
+  // Record expense (PKR 100 transport) -> Net Profit = 300 - 100 = 200
+  createDrinkExpense(
+    {
+      title: 'Ice & Delivery',
+      amountPkr: 100,
+      expenseDate: '2026-11-23',
+    },
+    'qa-admin'
+  );
+
+  const reportBeforeCancel = getDrinksAnalyticsAndReports({
+    from: '2026-11-23',
+    to: '2026-11-23',
+  });
+  assert.equal(reportBeforeCancel.kpis.totalRevenuePkr, 750);
+  assert.equal(reportBeforeCancel.kpis.totalPurchaseCostPkr, 450);
+  assert.equal(reportBeforeCancel.kpis.grossProfitPkr, 300);
+  assert.equal(reportBeforeCancel.kpis.totalExpensesPkr, 100);
+  assert.equal(reportBeforeCancel.kpis.netProfitPkr, 200);
+  assert.equal(reportBeforeCancel.kpis.totalLossPkr, 0);
+  // Remaining inventory cost value is tracked separately: 22*150 (3300) + 10*80 (800) = 4100
+  assert.equal(reportBeforeCancel.kpis.remainingInventoryCostValuePkr, 4100);
+  assert.equal(reportBeforeCancel.soldProducts.length, 1);
+  assert.equal(reportBeforeCancel.unsoldProducts.length, 1);
+  assert.equal(reportBeforeCancel.unsoldProducts[0].id, productB.id);
+
+  // Cancel sale -> restores all 3 units back to 25; net profit drops to -100 (loss = 100 from expense)
+  const cancelled = cancelDrinkSale(sale.id, 'Entered wrong day', 'qa-admin');
+  assert.equal(cancelled.status, 'CANCELLED');
+  assert.equal(
+    getAllDrinksAdmin().find((d) => d.id === productA.id)?.current_stock,
+    25
+  );
+
+  const reportAfterCancel = getDrinksAnalyticsAndReports({
+    from: '2026-11-23',
+    to: '2026-11-23',
+  });
+  assert.equal(reportAfterCancel.kpis.totalRevenuePkr, 0);
+  assert.equal(reportAfterCancel.kpis.netProfitPkr, -100);
+  assert.equal(reportAfterCancel.kpis.totalLossPkr, 100);
+
+  // Products with sales history cannot be hard-deleted (preserves audit trail); unused product can be deleted
+  assert.throws(() => deleteDrink(productA.id), /recorded sales history/i);
+  const updatedA = updateDrink(productA.id, { isActive: false }, 'qa-admin');
+  assert.equal(updatedA.is_active, 0);
+  deleteDrink(productB.id);
 });

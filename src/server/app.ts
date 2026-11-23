@@ -12,7 +12,7 @@ export function createApiApp(): express.Express {
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
   app.use(securityHeadersMiddleware);
-  app.use(express.json({ limit: '100kb' }));
+  app.use(express.json({ limit: '1mb' }));
   app.use(
     session({
       secret: process.env.SESSION_SECRET || 'thegrid-secure-session-secret-change-me',

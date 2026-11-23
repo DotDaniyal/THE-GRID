@@ -206,7 +206,107 @@ export function getDb(): DatabaseSync {
       locked_until INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS drinks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL CHECK (category IN ('cold_drinks', 'water', 'hydration_drinks')),
+      brand TEXT NOT NULL DEFAULT '',
+      bottle_size TEXT NOT NULL DEFAULT '',
+      purchase_price_pkr INTEGER NOT NULL DEFAULT 0,
+      price_pkr INTEGER NOT NULL,
+      opening_stock INTEGER NOT NULL DEFAULT 0,
+      current_stock INTEGER NOT NULL DEFAULT 0,
+      min_stock_alert INTEGER NOT NULL DEFAULT 5,
+      description TEXT,
+      image_url TEXT,
+      is_available INTEGER NOT NULL DEFAULT 1,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_by TEXT,
+      updated_by TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS drink_stock_adjustments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      drink_id INTEGER NOT NULL REFERENCES drinks(id) ON DELETE CASCADE,
+      adjustment_type TEXT NOT NULL CHECK (adjustment_type IN ('OPENING', 'RESTOCK', 'REDUCTION', 'SALE', 'SALE_EDIT', 'SALE_CANCEL')),
+      delta_qty INTEGER NOT NULL,
+      previous_stock INTEGER NOT NULL,
+      new_stock INTEGER NOT NULL,
+      reason TEXT,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS drink_sales (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      drink_id INTEGER NOT NULL REFERENCES drinks(id),
+      product_name TEXT NOT NULL,
+      category TEXT NOT NULL,
+      quantity INTEGER NOT NULL,
+      unit_selling_price_pkr INTEGER NOT NULL,
+      total_sale_pkr INTEGER NOT NULL,
+      unit_purchase_price_pkr INTEGER NOT NULL,
+      total_cost_pkr INTEGER NOT NULL,
+      profit_pkr INTEGER NOT NULL,
+      sold_at TEXT NOT NULL,
+      sale_date TEXT NOT NULL,
+      notes TEXT,
+      status TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN ('COMPLETED', 'CANCELLED')),
+      created_by TEXT NOT NULL,
+      updated_by TEXT,
+      cancelled_by TEXT,
+      cancel_reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      cancelled_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS drink_sale_audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sale_id INTEGER NOT NULL REFERENCES drink_sales(id) ON DELETE CASCADE,
+      action TEXT NOT NULL CHECK (action IN ('CREATED', 'EDITED', 'CANCELLED')),
+      summary TEXT NOT NULL,
+      actor_username TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS drink_expenses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      amount_pkr INTEGER NOT NULL,
+      expense_date TEXT NOT NULL,
+      description TEXT,
+      created_by TEXT NOT NULL,
+      updated_by TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
+
+  // Safe schema upgrade for existing databases created before full inventory columns existed
+  const existingCols = new Set(
+    (
+      db.prepare('PRAGMA table_info(drinks)').all() as unknown as Array<{ name: string }>
+    ).map((col) => col.name)
+  );
+  const drinkMigrations: Array<[string, string]> = [
+    ['brand', "TEXT NOT NULL DEFAULT ''"],
+    ['bottle_size', "TEXT NOT NULL DEFAULT ''"],
+    ['purchase_price_pkr', 'INTEGER NOT NULL DEFAULT 0'],
+    ['opening_stock', 'INTEGER NOT NULL DEFAULT 0'],
+    ['current_stock', 'INTEGER NOT NULL DEFAULT 0'],
+    ['min_stock_alert', 'INTEGER NOT NULL DEFAULT 5'],
+    ['created_by', 'TEXT'],
+    ['updated_by', 'TEXT'],
+  ];
+  for (const [colName, colDef] of drinkMigrations) {
+    if (!existingCols.has(colName)) {
+      db.exec(`ALTER TABLE drinks ADD COLUMN ${colName} ${colDef};`);
+    }
+  }
 
   const countRow = db
     .prepare('SELECT COUNT(*) AS count FROM operating_hours')

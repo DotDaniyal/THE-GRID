@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import bcrypt from 'bcryptjs';
+import argon2 from 'argon2';
 import type { NextFunction, Request, Response } from 'express';
 import { getDb } from '../db/sqlite.ts';
 import { verifyTotpCode } from '../utils/totp.ts';
@@ -9,7 +9,7 @@ const DEFAULT_SESSION_TTL_MINUTES = 240; // 4 hours
 const MFA_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
 let cachedFallbackSecret: string | null = null;
-const DUMMY_PASSWORD_HASH = hashPassword('THEGRID-dummy-timing-guard-2026!');
+const DUMMY_PASSWORD_HASH = '$argon2id$v=19$m=65536,t=3,p=4$dummySaltySaltDataHere$dummyHashValueDataHerePlaceholder...';
 
 export interface AdminUserRow {
   id: number;
@@ -26,10 +26,10 @@ export interface AdminUserRow {
 
 export interface AdminSessionContext {
   sessionId: string;
-  adminUserId: number | null;
+  adminUserId: number;
   username: string;
   displayName: string;
-  role: 'SUPER_ADMIN' | 'ADMIN' | 'LEGACY_SHARED';
+  role: 'SUPER_ADMIN' | 'ADMIN';
   mfaEnabled: boolean;
   expiresAt: number;
 }
@@ -54,14 +54,6 @@ function getSessionSecret(): string {
   const envSecret = process.env.SESSION_SECRET?.trim();
   if (envSecret && envSecret.length >= 16) {
     return envSecret;
-  }
-
-  const envPass = process.env.ADMIN_PASSCODE?.trim();
-  if (envPass && envPass.length > 0) {
-    return crypto
-      .createHmac('sha256', 'thegrid-admin-session-key-v1')
-      .update(envPass)
-      .digest('hex');
   }
 
   if (cachedFallbackSecret) {
@@ -93,14 +85,19 @@ function getSessionSecret(): string {
   }
 }
 
-export function hashPassword(password: string): string {
-  return bcrypt.hashSync(password, 12);
+export async function hashPassword(password: string): Promise<string> {
+  return await argon2.hash(password, {
+    type: argon2.argon2id,
+    memoryCost: 65536,
+    timeCost: 3,
+    parallelism: 4,
+  });
 }
 
-export function verifyPassword(password: string, storedHash: string): boolean {
+export async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
   if (!storedHash) return false;
   try {
-    return bcrypt.compareSync(password, storedHash);
+    return await argon2.verify(storedHash, password);
   } catch {
     return false;
   }
@@ -122,29 +119,16 @@ export function validateAdminUsername(raw: string): string | null {
 }
 
 export function validateStrongPassword(password: string): string | null {
-  if (password.length < 10 || password.length > 128) {
-    return 'Password must be between 10 and 128 characters.';
-  }
-  if (!/[A-Z]/.test(password)) {
-    return 'Password must contain at least one uppercase letter.';
-  }
-  if (!/[a-z]/.test(password)) {
-    return 'Password must contain at least one lowercase letter.';
-  }
-  if (!/\d/.test(password)) {
-    return 'Password must contain at least one number.';
-  }
-  if (!/[^A-Za-z0-9\s]/.test(password)) {
-    return 'Password must contain at least one symbol (e.g. !@#$%).';
+  if (password.length < 6 || password.length > 128) {
+    return 'Password must be at least 6 characters.';
   }
   return null;
 }
 
 export function getAdminAuthOverview(): {
   setupRequired: boolean;
-  authMode: 'named_accounts' | 'legacy_passcode_fallback' | 'setup_required';
+  authMode: 'named_accounts' | 'setup_required';
   hasNamedAccounts: boolean;
-  hasLegacyPasscode: boolean;
 } {
   const db = getDb();
   const namedCount = db
@@ -152,27 +136,11 @@ export function getAdminAuthOverview(): {
     .get() as { count: number };
   const hasNamedAccounts = namedCount.count > 0;
 
-  const envPass = process.env.ADMIN_PASSCODE?.trim() ?? '';
-  const legacyClaimed = db
-    .prepare('SELECT id FROM admin_credentials WHERE id = 1')
-    .get() as { id: number } | undefined;
-  const hasLegacyPasscode = envPass.length > 0 || Boolean(legacyClaimed);
-
   if (hasNamedAccounts) {
     return {
       setupRequired: false,
       authMode: 'named_accounts',
       hasNamedAccounts: true,
-      hasLegacyPasscode,
-    };
-  }
-
-  if (hasLegacyPasscode) {
-    return {
-      setupRequired: false,
-      authMode: 'legacy_passcode_fallback',
-      hasNamedAccounts: false,
-      hasLegacyPasscode: true,
     };
   }
 
@@ -180,73 +148,35 @@ export function getAdminAuthOverview(): {
     setupRequired: true,
     authMode: 'setup_required',
     hasNamedAccounts: false,
-    hasLegacyPasscode: false,
   };
 }
 
-function constantTimeStringMatch(aStr: string, bStr: string): boolean {
-  const aHash = crypto.createHash('sha256').update(aStr).digest();
-  const bHash = crypto.createHash('sha256').update(bStr).digest();
-  return crypto.timingSafeEqual(aHash, bHash);
-}
-
-export function authenticateAdminCredentials(
+export async function authenticateAdminCredentials(
   rawUsername: string,
   secretInput: string
-):
-  | {
-      ok: true;
-      user:
-        | {
-            kind: 'named';
-            row: AdminUserRow;
-          }
-        | {
-            kind: 'legacy_shared';
-          };
-    }
-  | { ok: false } {
+): Promise<{ ok: true; user: AdminUserRow } | { ok: false }> {
   const db = getDb();
   const username = normalizeAdminUsername(rawUsername);
 
-  if (!secretInput) {
-    verifyPassword('invalid-probe', DUMMY_PASSWORD_HASH);
+  if (!username || !secretInput) {
+    await verifyPassword('invalid-probe', DUMMY_PASSWORD_HASH).catch(() => false);
     return { ok: false };
   }
 
-  if (username.length > 0) {
-    const userRow = db
-      .prepare('SELECT * FROM admin_users WHERE username = ? AND is_active = 1')
-      .get(username) as unknown as AdminUserRow | undefined;
+  const userRow = db
+    .prepare('SELECT * FROM admin_users WHERE username = ? AND is_active = 1')
+    .get(username) as unknown as AdminUserRow | undefined;
 
-    if (userRow) {
-      if (verifyPassword(secretInput, userRow.password_hash)) {
-        return { ok: true, user: { kind: 'named', row: userRow } };
-      }
-      return { ok: false };
+  if (userRow) {
+    const isValid = await verifyPassword(secretInput, userRow.password_hash);
+    if (isValid) {
+      return { ok: true, user: userRow };
     }
+    return { ok: false };
   }
 
   // Constant-time dummy work so unknown usernames have identical response timing
-  verifyPassword(secretInput, DUMMY_PASSWORD_HASH);
-
-  // Only allow legacy shared passcode fallback when no named accounts exist yet,
-  // or when env ADMIN_PASSCODE is explicitly configured and username is empty/admin.
-  const overview = getAdminAuthOverview();
-  if (!overview.hasNamedAccounts) {
-    const envPass = process.env.ADMIN_PASSCODE?.trim() ?? '';
-    if (envPass.length > 0 && constantTimeStringMatch(secretInput, envPass)) {
-      return { ok: true, user: { kind: 'legacy_shared' } };
-    }
-
-    const legacyRow = db
-      .prepare('SELECT password_hash FROM admin_credentials WHERE id = 1')
-      .get() as { password_hash: string } | undefined;
-    if (legacyRow && verifyPassword(secretInput, legacyRow.password_hash)) {
-      return { ok: true, user: { kind: 'legacy_shared' } };
-    }
-  }
-
+  await verifyPassword(secretInput, DUMMY_PASSWORD_HASH).catch(() => false);
   return { ok: false };
 }
 
@@ -310,10 +240,10 @@ export function verifyUserMfaCode(userId: number, code: string): AdminUserRow | 
 }
 
 export function createAdminSession(input: {
-  adminUserId: number | null;
+  adminUserId: number;
   username: string;
   displayName: string;
-  role: 'SUPER_ADMIN' | 'ADMIN' | 'LEGACY_SHARED';
+  role: 'SUPER_ADMIN' | 'ADMIN';
 }): { token: string; sessionId: string; expiresAt: number } {
   const db = getDb();
   const ttlMs = getSessionTtlMinutes() * 60 * 1000;
@@ -321,7 +251,6 @@ export function createAdminSession(input: {
   const sessionId = crypto.randomBytes(16).toString('hex');
   const nowIso = new Date().toISOString();
 
-  // Prune old expired sessions quietly
   db.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').run(Date.now() - 86_400_000);
 
   db.prepare(
@@ -367,10 +296,24 @@ export function parseCookies(cookieHeader: string | undefined): Record<string, s
 
 function getCookieSecurityFlags(req: Request): string {
   const forwardedProto = req.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
-  const isHttps = req.secure || forwardedProto === 'https';
+  const origin = (req.get('origin') || '').toLowerCase();
+  const referer = (req.get('referer') || '').toLowerCase();
+  const isHttps =
+    req.secure ||
+    forwardedProto === 'https' ||
+    origin.startsWith('https://') ||
+    referer.startsWith('https://');
+
   const host = (req.get('x-forwarded-host') || req.get('host') || '').toLowerCase();
+  const appUrl = (process.env.APP_URL || '').toLowerCase();
+  const secFetchSite = (req.get('sec-fetch-site') || '').toLowerCase();
   const isEmbeddedIframe =
-    isHttps && (host.includes('.run.app') || req.get('sec-fetch-dest') === 'iframe');
+    isHttps &&
+    (host.includes('.run.app') ||
+      origin.includes('.run.app') ||
+      appUrl.includes('.run.app') ||
+      req.get('sec-fetch-dest') === 'iframe' ||
+      secFetchSite === 'cross-site');
 
   if (isEmbeddedIframe) {
     return 'HttpOnly; Path=/; Secure; SameSite=None; Partitioned';
@@ -428,25 +371,21 @@ export function verifyAdminSessionToken(token: string): AdminSessionContext | nu
         admin_user_id: number | null;
         username: string;
         display_name: string;
-        role: 'SUPER_ADMIN' | 'ADMIN' | 'LEGACY_SHARED';
+        role: 'SUPER_ADMIN' | 'ADMIN';
         expires_at: number;
         revoked_at: string | null;
       }
     | undefined;
 
-  if (!sessionRow || sessionRow.revoked_at || Date.now() > sessionRow.expires_at) {
+  if (!sessionRow || sessionRow.revoked_at || Date.now() > sessionRow.expires_at || sessionRow.admin_user_id === null) {
     return null;
   }
 
-  let mfaEnabled = false;
-  if (sessionRow.admin_user_id !== null) {
-    const userRow = db
-      .prepare('SELECT mfa_enabled, is_active FROM admin_users WHERE id = ?')
-      .get(sessionRow.admin_user_id) as { mfa_enabled: number; is_active: number } | undefined;
-    if (!userRow || userRow.is_active !== 1) {
-      return null;
-    }
-    mfaEnabled = userRow.mfa_enabled === 1;
+  const userRow = db
+    .prepare('SELECT mfa_enabled, is_active FROM admin_users WHERE id = ?')
+    .get(sessionRow.admin_user_id) as { mfa_enabled: number; is_active: number } | undefined;
+  if (!userRow || userRow.is_active !== 1) {
+    return null;
   }
 
   return {
@@ -455,7 +394,7 @@ export function verifyAdminSessionToken(token: string): AdminSessionContext | nu
     username: sessionRow.username,
     displayName: sessionRow.display_name,
     role: sessionRow.role,
-    mfaEnabled,
+    mfaEnabled: userRow.mfa_enabled === 1,
     expiresAt: sessionRow.expires_at,
   };
 }
@@ -463,8 +402,20 @@ export function verifyAdminSessionToken(token: string): AdminSessionContext | nu
 export function getAdminSessionFromRequest(req: Request): AdminSessionContext | null {
   const cookies = parseCookies(req.headers.cookie);
   const cookieToken = cookies[SESSION_COOKIE_NAME];
-  if (!cookieToken) return null;
-  return verifyAdminSessionToken(cookieToken);
+  if (cookieToken) {
+    const cookieSession = verifyAdminSessionToken(cookieToken);
+    if (cookieSession) return cookieSession;
+  }
+
+  const authHeader = req.get('authorization');
+  if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
+    const bearerToken = authHeader.slice(7).trim();
+    if (bearerToken) {
+      return verifyAdminSessionToken(bearerToken);
+    }
+  }
+
+  return null;
 }
 
 export function revokeAdminSessionFromRequest(req: Request): void {
@@ -489,13 +440,26 @@ export function requireSameOriginForCookieMutation(
   }
 
   const host = (req.get('x-forwarded-host') || req.get('host') || '').toLowerCase();
+  let appUrlHost = '';
+  if (process.env.APP_URL) {
+    try {
+      appUrlHost = new URL(process.env.APP_URL).host.toLowerCase();
+    } catch {
+      appUrlHost = '';
+    }
+  }
+  const isAllowedHost = (candidateHost: string): boolean => {
+    if (!host && !appUrlHost) return true;
+    return candidateHost === host || (Boolean(appUrlHost) && candidateHost === appUrlHost);
+  };
+
   const origin = req.get('origin');
   const referer = req.get('referer');
 
   if (origin) {
     try {
       const originHost = new URL(origin).host.toLowerCase();
-      if (host && originHost !== host) {
+      if (!isAllowedHost(originHost)) {
         res.status(403).json({ error: 'Forbidden: Cross-origin request rejected.' });
         return;
       }
@@ -510,7 +474,7 @@ export function requireSameOriginForCookieMutation(
   if (referer) {
     try {
       const refHost = new URL(referer).host.toLowerCase();
-      if (host && refHost !== host) {
+      if (!isAllowedHost(refHost)) {
         res.status(403).json({ error: 'Forbidden: Cross-origin referer rejected.' });
         return;
       }

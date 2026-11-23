@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { motion } from 'motion/react';
 import { AlertCircle, ArrowLeft, CheckCircle2, Clock, Lock, ShieldCheck, User, Users } from 'lucide-react';
 import { LegalModal, type LegalDocType } from '@/src/components/modals/LegalModal';
@@ -112,6 +112,7 @@ export function BookingDetailsPage({
   const activeSelection = selection!;
   const activeCountry =
     COUNTRY_CODES.find((c) => c.code === countryCode) ?? COUNTRY_CODES[0];
+
   const totalPkr = activeSelection.slot.pricePkr;
   const advancePkr = Math.round((totalPkr * PAYMENT_INFO.advancePercent) / 100);
   const remainingPkr = totalPkr - advancePkr;
