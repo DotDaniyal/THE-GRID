@@ -315,3 +315,57 @@ test('private drinkService handles inventory, sales, edit/cancel stock restorati
   assert.equal(updatedA.is_active, 0);
   deleteDrink(productB.id);
 });
+
+test('releaseExpiredPendingBookings cancels expired 30-min pending holds while preserving fresh PENDING and CONFIRMED bookings', async () => {
+  const { collectExpiredPendingBookings } = await import(
+    '../../src/server/services/bookingService.ts'
+  );
+  const db = getDb();
+  const baseMs = 1_800_000_000_000;
+  const expiredHoldIso = new Date(baseMs - 60_000).toISOString();
+  const activeHoldIso = new Date(baseMs + 20 * 60_000).toISOString();
+  const createdOldIso = new Date(baseMs - 40 * 60_000).toISOString();
+
+  db.prepare(
+    `INSERT INTO bookings (
+      id, court_number, venue_name, booking_date, start_time, end_time,
+      duration_minutes, booking_type, customer_name, customer_email,
+      country_code, customer_phone, additional_guests_count,
+      total_amount_pkr, status, hold_expires_at, created_at, updated_at
+    ) VALUES
+      ('GRD-EXP-001', 1, 'THE GRID - Main Futsal Court', '2027-08-10', '18:00', '19:00', 60, 'individual', 'Expired Hold', 'exp@thegrid.pk', '+92', '+92 321 0000001', 0, 3600, 'PENDING', ?, ?, ?),
+      ('GRD-ACT-002', 1, 'THE GRID - Main Futsal Court', '2027-08-10', '19:00', '20:00', 60, 'individual', 'Active Hold', 'act@thegrid.pk', '+92', '+92 321 0000002', 0, 3600, 'PENDING', ?, ?, ?),
+      ('GRD-CNF-003', 1, 'THE GRID - Main Futsal Court', '2027-08-10', '20:00', '21:00', 60, 'individual', 'Confirmed Match', 'cnf@thegrid.pk', '+92', '+92 321 0000003', 0, 3600, 'CONFIRMED', ?, ?, ?)`
+  ).run(
+    expiredHoldIso,
+    createdOldIso,
+    createdOldIso,
+    activeHoldIso,
+    createdOldIso,
+    createdOldIso,
+    expiredHoldIso,
+    createdOldIso,
+    createdOldIso
+  );
+
+  const releasedEvents = collectExpiredPendingBookings(db, baseMs);
+  assert.equal(releasedEvents.length, 1);
+  assert.equal(releasedEvents[0].bookingId, 'GRD-EXP-001');
+  assert.equal(releasedEvents[0].bookingStatus, 'EXPIRED');
+
+  const rows = db
+    .prepare(
+      `SELECT id, status FROM bookings WHERE id IN ('GRD-EXP-001', 'GRD-ACT-002', 'GRD-CNF-003') ORDER BY id ASC`
+    )
+    .all() as Array<{ id: string; status: string }>;
+
+  assert.deepEqual(
+    rows.map((r) => ({ id: r.id, status: r.status })),
+    [
+      { id: 'GRD-ACT-002', status: 'PENDING' },
+      { id: 'GRD-CNF-003', status: 'CONFIRMED' },
+      { id: 'GRD-EXP-001', status: 'CANCELLED' },
+    ]
+  );
+});
+

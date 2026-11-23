@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { motion } from 'motion/react';
 import { AlertCircle, ArrowLeft, CheckCircle2, Clock, Lock, ShieldCheck, User, Users } from 'lucide-react';
 import { LegalModal, type LegalDocType } from '@/src/components/modals/LegalModal';
@@ -6,6 +6,7 @@ import { CONTACT, PAYMENT_INFO } from '@/src/config/brand';
 import { COUNTRY_CODES, SINGLE_COURT } from '@/src/config/venue';
 import { BookingConfirmationCard } from '@/src/features/booking/BookingConfirmationCard';
 import { SharedSplitPanel } from '@/src/features/booking/SharedSplitPanel';
+import { useSlotStream, type SlotStreamEvent } from '@/src/hooks/useSlotStream';
 import { submitBookingRequest } from '@/src/services/api/bookingsApi';
 import type {
   BookingSelection,
@@ -22,8 +23,38 @@ interface BookingDetailsPageProps {
   onBookingSubmitted: () => void;
 }
 
+const LAST_RECEIPT_KEY = 'thegrid_last_booking_receipt_v1';
+
 const DEFAULT_PARTICIPANTS = (): SharedParticipant[] =>
   Array.from({ length: 6 }, () => ({ name: '', phone: '' }));
+
+function readStoredReceipt(): CreatedBooking | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.sessionStorage?.getItem(LAST_RECEIPT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as CreatedBooking;
+    if (parsed?.id && parsed?.bookingDate && parsed?.startTime) {
+      return parsed;
+    }
+  } catch {
+    // Ignore malformed UI view cache
+  }
+  return null;
+}
+
+function writeStoredReceipt(receipt: CreatedBooking | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (receipt) {
+      window.sessionStorage?.setItem(LAST_RECEIPT_KEY, JSON.stringify(receipt));
+    } else {
+      window.sessionStorage?.removeItem(LAST_RECEIPT_KEY);
+    }
+  } catch {
+    // Ignore sessionStorage restrictions
+  }
+}
 
 export function BookingDetailsPage({
   selection,
@@ -45,9 +76,53 @@ export function BookingDetailsPage({
 
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [confirmedBooking, setConfirmedBooking] = useState<CreatedBooking | null>(null);
+  const [confirmedBooking, setConfirmedBooking] = useState<CreatedBooking | null>(() =>
+    selection ? null : readStoredReceipt()
+  );
 
   const policyCheckboxRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (selection) {
+      writeStoredReceipt(null);
+      setConfirmedBooking(null);
+    }
+  }, [selection]);
+
+  const handleStreamCollision = useCallback(
+    (event: SlotStreamEvent) => {
+      if (confirmedBooking || !selection) return;
+      if (
+        event.type === 'slot_changed' &&
+        event.bookingDate === selection.bookingDate &&
+        event.startTime === selection.slot.startTime
+      ) {
+        if (event.bookingStatus === 'PENDING' || event.bookingStatus === 'CONFIRMED') {
+          setSubmitError(
+            'Sorry, this slot has just been booked. Please select another available time.'
+          );
+        } else {
+          setSubmitError((prev) =>
+            prev === 'Sorry, this slot has just been booked. Please select another available time.'
+              ? null
+              : prev
+          );
+        }
+      }
+    },
+    [confirmedBooking, selection]
+  );
+
+  useSlotStream({
+    enabled: Boolean(selection && !confirmedBooking),
+    onSyncEvent: handleStreamCollision,
+  });
+
+  const handleReturnToSlots = () => {
+    writeStoredReceipt(null);
+    setConfirmedBooking(null);
+    onBackToSlots();
+  };
 
   const liveValidationErrors = useMemo(
     () =>
@@ -75,7 +150,7 @@ export function BookingDetailsPage({
           </p>
           <button
             type="button"
-            onClick={onBackToSlots}
+            onClick={handleReturnToSlots}
             className="inline-flex items-center justify-center gap-2 px-6 py-3 min-h-[46px] text-sm font-bold text-[#0E1845] bg-[#c4d835] hover:bg-[#d4e157] rounded-lg transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
           >
             <ArrowLeft className="w-4 h-4" />
@@ -102,7 +177,7 @@ export function BookingDetailsPage({
         <div className="relative z-10 max-w-3xl mx-auto px-4 sm:px-6">
           <BookingConfirmationCard
             booking={confirmedBooking}
-            onBookAnother={onBackToSlots}
+            onBookAnother={handleReturnToSlots}
           />
         </div>
       </div>
@@ -173,6 +248,7 @@ export function BookingDetailsPage({
         policiesAccepted: true,
       });
 
+      writeStoredReceipt(created);
       setConfirmedBooking(created);
       onBookingSubmitted();
     } catch (err) {

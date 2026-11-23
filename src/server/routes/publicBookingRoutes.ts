@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import { COURT_NUMBER, VENUE_NAME } from '../config/constants.ts';
+import { subscribeSlotUpdates } from '../events/bookingEvents.ts';
 import { bookingRateLimit } from '../middleware/rateLimit.ts';
 import {
   createBookingRequest,
+  getBookingLiveStatus,
   getSlotsForDate,
   ServiceError,
 } from '../services/bookingService.ts';
@@ -32,6 +34,58 @@ publicBookingRouter.get('/slots', (req, res) => {
     }
     console.error('Slot query error:', err);
     res.status(500).json({ error: 'Unable to load available slots.' });
+  }
+});
+
+publicBookingRouter.get('/slots/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-store, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const sendEvent = (eventName: string, payload: unknown) => {
+    if (res.writableEnded) return;
+    res.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  sendEvent('connected', { updatedAt: new Date().toISOString() });
+
+  const unsubscribe = subscribeSlotUpdates((evt) => {
+    sendEvent(evt.type, evt);
+  });
+
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(': heartbeat\n\n');
+    }
+  }, 25_000);
+  heartbeat.unref?.();
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+    if (!res.writableEnded) {
+      res.end();
+    }
+  });
+});
+
+publicBookingRouter.get('/bookings/:id/status', (req, res) => {
+  const bookingId = req.params.id?.trim() ?? '';
+  const statusToken =
+    typeof req.query.token === 'string' ? req.query.token.trim() : '';
+
+  try {
+    const statusRecord = getBookingLiveStatus(bookingId, statusToken);
+    res.json({ bookingStatus: statusRecord });
+  } catch (err: unknown) {
+    if (err instanceof ServiceError) {
+      res.status(err.statusCode).json({ error: err.message });
+      return;
+    }
+    console.error('Booking status check error:', err);
+    res.status(500).json({ error: 'Unable to verify booking status.' });
   }
 });
 

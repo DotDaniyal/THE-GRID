@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ArrowUpRight, Ban, Check, Search, XCircle } from 'lucide-react';
+import { ArrowUpRight, Ban, Calendar, Check, Search, X, XCircle } from 'lucide-react';
 import type { AdminBookingRow, BookingStatus } from '@/src/types/booking';
 
 interface AdminBookingsListProps {
@@ -16,29 +16,46 @@ const STATUS_FILTERS: Array<'ALL' | BookingStatus> = [
   'CANCELLED',
 ];
 
+function formatAuditTime(isoValue?: string | null): string | null {
+  if (!isoValue) return null;
+  const parsed = new Date(isoValue);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toLocaleString('en-PK', {
+    timeZone: 'Asia/Karachi',
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true,
+  });
+}
+
 export function AdminBookingsList({
   bookings,
   updatingId,
   onUpdateStatus,
 }: AdminBookingsListProps) {
   const [statusFilter, setStatusFilter] = useState<'ALL' | BookingStatus>('ALL');
+  const [dateFilter, setDateFilter] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
 
   const filteredBookings = bookings.filter((b) => {
     if (statusFilter !== 'ALL' && b.status !== statusFilter) return false;
+    if (dateFilter && b.booking_date !== dateFilter) return false;
     if (!searchQuery.trim()) return true;
     const q = searchQuery.trim().toLowerCase();
     return (
       b.id.toLowerCase().includes(q) ||
       b.customer_name.toLowerCase().includes(q) ||
       b.customer_phone.toLowerCase().includes(q) ||
+      b.customer_email.toLowerCase().includes(q) ||
       b.booking_date.includes(q)
     );
   });
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3">
         <div className="flex flex-wrap gap-1.5">
           {STATUS_FILTERS.map((st) => (
             <button
@@ -56,15 +73,38 @@ export function AdminBookingsList({
           ))}
         </div>
 
-        <div className="relative w-full sm:w-72">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search ID, name, phone, date..."
-            className="w-full min-h-[40px] pl-9 pr-3 py-2 text-xs text-white bg-[#121D52] border border-white/15 rounded-md focus:outline-none focus:border-[#c4d835]"
-          />
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+          <div className="relative flex items-center">
+            <Calendar className="w-3.5 h-3.5 text-slate-400 absolute left-3 pointer-events-none" />
+            <input
+              type="date"
+              aria-label="Filter by booking date"
+              value={dateFilter}
+              onChange={(e) => setDateFilter(e.target.value)}
+              className="min-h-[40px] pl-9 pr-3 py-2 text-xs text-white bg-[#121D52] border border-white/15 rounded-md focus:outline-none focus:border-[#c4d835] font-mono-tabular"
+            />
+            {dateFilter && (
+              <button
+                type="button"
+                aria-label="Clear date filter"
+                onClick={() => setDateFilter('')}
+                className="ml-1.5 inline-flex items-center justify-center p-2 min-h-[38px] text-xs text-slate-300 hover:text-white bg-[#121D52] border border-white/15 rounded-md cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
+          <div className="relative w-full sm:w-64">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search ID, name, phone, email..."
+              className="w-full min-h-[40px] pl-9 pr-3 py-2 text-xs text-white bg-[#121D52] border border-white/15 rounded-md focus:outline-none focus:border-[#c4d835]"
+            />
+          </div>
         </div>
       </div>
 
@@ -77,6 +117,9 @@ export function AdminBookingsList({
           {filteredBookings.map((b) => {
             const cleanDigits = b.customer_phone.replace(/[^\d]/g, '');
             const waLink = cleanDigits ? `https://wa.me/${cleanDigits}` : undefined;
+            const createdLabel = formatAuditTime(b.created_at);
+            const holdLabel = formatAuditTime(b.hold_expires_at);
+            const confirmedLabel = formatAuditTime(b.confirmed_at);
 
             return (
               <div
@@ -110,7 +153,7 @@ export function AdminBookingsList({
 
                   <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-300">
                     <span className="font-mono-tabular">
-                      {b.booking_date} · {b.start_time}-{b.end_time}
+                      {b.booking_date} · {b.start_time}-{b.end_time} ({b.duration_minutes} min)
                     </span>
                     <span className="font-mono-tabular font-semibold text-white">
                       PKR {b.total_amount_pkr.toLocaleString()}
@@ -118,6 +161,21 @@ export function AdminBookingsList({
                     <span className="capitalize">{b.booking_type}</span>
                     <span className="font-mono-tabular">{b.customer_phone}</span>
                     <span>{b.customer_email}</span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-400">
+                    {createdLabel && <span>Requested: {createdLabel} PKT</span>}
+                    {b.status === 'PENDING' && holdLabel && (
+                      <span className="text-amber-300/90">
+                        Hold expires: {holdLabel} PKT
+                      </span>
+                    )}
+                    {b.status === 'CONFIRMED' && confirmedLabel && (
+                      <span className="text-[#c4d835]/90">
+                        Confirmed: {confirmedLabel} PKT
+                        {b.confirmed_by ? ` by ${b.confirmed_by}` : ''}
+                      </span>
+                    )}
                   </div>
                 </div>
 

@@ -18,12 +18,21 @@ function prefersReducedMotionSync(): boolean {
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
+function hasSeenIntroInSession(): boolean {
+  if (typeof window === 'undefined') return true;
+  try {
+    return window.sessionStorage.getItem('thegrid_intro_seen') === '1';
+  } catch {
+    return false;
+  }
+}
+
 export default function App() {
   const [currentPath, setCurrentPath] = useState<AppRoute>(() =>
     typeof window !== 'undefined' ? parseRoute(window.location.pathname) : '/'
   );
   const [navVisible, setNavVisible] = useState(
-    () => currentPath !== '/' || prefersReducedMotionSync()
+    () => currentPath !== '/' || prefersReducedMotionSync() || hasSeenIntroInSession()
   );
 
   const karachiToday = useMemo(() => getKarachiTodayStr(), []);
@@ -33,7 +42,9 @@ export default function App() {
     const onPopState = () => {
       const next = parseRoute(window.location.pathname);
       setCurrentPath(next);
-      if (next !== '/' || prefersReducedMotionSync()) setNavVisible(true);
+      if (next !== '/' || prefersReducedMotionSync() || hasSeenIntroInSession()) {
+        setNavVisible(true);
+      }
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
@@ -49,7 +60,7 @@ export default function App() {
       window.history.pushState({}, '', targetUrl);
     }
     setCurrentPath(path);
-    if (path !== '/' || prefersReducedMotionSync()) {
+    if (path !== '/' || prefersReducedMotionSync() || hasSeenIntroInSession()) {
       setNavVisible(true);
     }
 
@@ -67,6 +78,10 @@ export default function App() {
     } else {
       window.scrollTo({ top: 0, behavior: scrollBehavior });
     }
+  }, []);
+
+  const handleIntroStart = useCallback(() => {
+    setNavVisible(false);
   }, []);
 
   const handleIntroComplete = useCallback(() => {
@@ -92,6 +107,7 @@ export default function App() {
         {currentPath === '/' && (
           <HomePage
             onBookNow={handleBookNow}
+            onIntroStart={handleIntroStart}
             onIntroComplete={handleIntroComplete}
             onNavigateAdmin={() => navigate('/admin')}
           />

@@ -1,13 +1,17 @@
 import crypto from 'node:crypto';
+import type { DatabaseSync } from 'node:sqlite';
 import {
   COURT_NUMBER,
+  PENDING_HOLD_MINUTES,
   SLOT_DURATION_MINUTES,
   VENUE_NAME,
 } from '../config/constants.ts';
 import {
   getDb,
+  type BookingRow,
   type OperatingHourRow,
 } from '../db/sqlite.ts';
+import { emitSlotUpdate, type SlotSyncEvent } from '../events/bookingEvents.ts';
 import { normalizePhone } from '../utils/phone.ts';
 import {
   getKarachiNow,
@@ -64,7 +68,19 @@ export interface CreatedBookingRecord {
   additionalGuestsCount: number;
   totalAmountPkr: number;
   status: 'PENDING';
+  holdExpiresAt: string;
+  statusToken: string;
   createdAt: string;
+}
+
+export interface BookingLiveStatus {
+  id: string;
+  status: 'PENDING' | 'CONFIRMED' | 'REJECTED' | 'CANCELLED';
+  bookingDate: string;
+  startTime: string;
+  holdExpiresAt: string | null;
+  confirmedAt: string | null;
+  updatedAt: string;
 }
 
 export function generateBookingId(bookingDate: string): string {
@@ -73,7 +89,86 @@ export function generateBookingId(bookingDate: string): string {
   return `GRD-${compactDate}-${randomCode}`;
 }
 
+/**
+ * Releases expired PENDING holds so unconfirmed reservations do not block slots indefinitely.
+ * Returns pending events to broadcast after transaction commit.
+ */
+export function collectExpiredPendingBookings(
+  db: DatabaseSync,
+  nowMs: number = Date.now()
+): SlotSyncEvent[] {
+  const nowIso = new Date(nowMs).toISOString();
+  const legacyCutoffIso = new Date(nowMs - PENDING_HOLD_MINUTES * 60_000).toISOString();
+
+  const expiredRows = db
+    .prepare(
+      `SELECT id, booking_date, start_time
+       FROM bookings
+       WHERE status = 'PENDING'
+         AND (
+           (hold_expires_at IS NOT NULL AND hold_expires_at <= ?)
+           OR (hold_expires_at IS NULL AND created_at <= ?)
+         )`
+    )
+    .all(nowIso, legacyCutoffIso) as unknown as Array<{
+    id: string;
+    booking_date: string;
+    start_time: string;
+  }>;
+
+  if (expiredRows.length === 0) {
+    return [];
+  }
+
+  db.prepare(
+    `UPDATE bookings
+     SET status = 'CANCELLED',
+         hold_expires_at = NULL,
+         admin_notes = COALESCE(admin_notes, 'Auto-released after 30-minute hold expiry'),
+         updated_at = ?
+     WHERE status = 'PENDING'
+       AND (
+         (hold_expires_at IS NOT NULL AND hold_expires_at <= ?)
+         OR (hold_expires_at IS NULL AND created_at <= ?)
+       )`
+  ).run(nowIso, nowIso, legacyCutoffIso);
+
+  return expiredRows.map((row) => ({
+    type: 'slot_changed',
+    bookingDate: row.booking_date,
+    startTime: row.start_time,
+    bookingId: row.id,
+    bookingStatus: 'EXPIRED',
+    updatedAt: nowIso,
+  }));
+}
+
+export function releaseExpiredPendingBookings(nowMs: number = Date.now()): number {
+  const db = getDb();
+  let events: SlotSyncEvent[] = [];
+
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    events = collectExpiredPendingBookings(db, nowMs);
+    db.exec('COMMIT;');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK;');
+    } catch {
+      // Ignore rollback if transaction is already closed
+    }
+    throw err;
+  }
+
+  for (const evt of events) {
+    emitSlotUpdate(evt);
+  }
+  return events.length;
+}
+
 export function getSlotsForDate(requestedDate: string): SlotsResponseData {
+  releaseExpiredPendingBookings();
+
   const karachiNow = getKarachiNow();
   const targetDate = requestedDate.trim() || karachiNow.dateStr;
 
@@ -234,10 +329,17 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
 
   const totalAmountPkr = slot.price_pkr;
   const bookingId = generateBookingId(bookingDate);
-  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const holdExpiresAt = new Date(nowMs + PENDING_HOLD_MINUTES * 60_000).toISOString();
+  const statusToken = crypto.randomBytes(16).toString('hex');
+
+  let expiredEvents: SlotSyncEvent[] = [];
 
   try {
     db.exec('BEGIN IMMEDIATE;');
+
+    expiredEvents = collectExpiredPendingBookings(db, nowMs);
 
     const existing = db
       .prepare(
@@ -249,7 +351,7 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
       db.exec('ROLLBACK;');
       throw new ServiceError(
         409,
-        'This time slot was just reserved by another player. Please select a different slot.'
+        'Sorry, this slot has just been booked. Please select another available time.'
       );
     }
 
@@ -258,8 +360,8 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
         id, court_number, venue_name, booking_date, start_time, end_time,
         duration_minutes, booking_type, customer_name, customer_email,
         country_code, customer_phone, participants_json, additional_guests_count,
-        total_amount_pkr, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)`
+        total_amount_pkr, status, hold_expires_at, status_token, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)`
     ).run(
       bookingId,
       COURT_NUMBER,
@@ -276,6 +378,8 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
       participantsJson,
       additionalGuestsCount,
       totalAmountPkr,
+      holdExpiresAt,
+      statusToken,
       nowIso,
       nowIso
     );
@@ -302,12 +406,24 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
     if (msg.includes('UNIQUE constraint failed')) {
       throw new ServiceError(
         409,
-        'This time slot was just reserved by another player. Please select a different slot.'
+        'Sorry, this slot has just been booked. Please select another available time.'
       );
     }
     console.error('Booking insert error:', err);
     throw new ServiceError(500, 'Unable to save booking request. Please try again.');
   }
+
+  for (const evt of expiredEvents) {
+    emitSlotUpdate(evt);
+  }
+  emitSlotUpdate({
+    type: 'slot_changed',
+    bookingDate,
+    startTime: slot.start_time,
+    bookingId,
+    bookingStatus: 'PENDING',
+    updatedAt: nowIso,
+  });
 
   return {
     id: bookingId,
@@ -326,6 +442,61 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
     additionalGuestsCount,
     totalAmountPkr,
     status: 'PENDING',
+    holdExpiresAt,
+    statusToken,
     createdAt: nowIso,
+  };
+}
+
+export function getBookingLiveStatus(
+  bookingId: string,
+  statusToken: string
+): BookingLiveStatus {
+  const trimmedId = bookingId.trim();
+  const trimmedToken = statusToken.trim();
+  if (!trimmedId || !trimmedToken) {
+    throw new ServiceError(400, 'Booking ID and verification token are required.');
+  }
+
+  releaseExpiredPendingBookings();
+
+  const db = getDb();
+  const row = db
+    .prepare(
+      'SELECT id, status, booking_date, start_time, hold_expires_at, confirmed_at, updated_at, status_token FROM bookings WHERE id = ?'
+    )
+    .get(trimmedId) as unknown as Pick<
+    BookingRow,
+    | 'id'
+    | 'status'
+    | 'booking_date'
+    | 'start_time'
+    | 'hold_expires_at'
+    | 'confirmed_at'
+    | 'updated_at'
+    | 'status_token'
+  > | undefined;
+
+  if (!row || !row.status_token) {
+    throw new ServiceError(404, 'Booking status record not found.');
+  }
+
+  const providedBuf = Buffer.from(trimmedToken);
+  const storedBuf = Buffer.from(row.status_token);
+  if (
+    providedBuf.length !== storedBuf.length ||
+    !crypto.timingSafeEqual(providedBuf, storedBuf)
+  ) {
+    throw new ServiceError(403, 'Invalid booking status token.');
+  }
+
+  return {
+    id: row.id,
+    status: row.status,
+    bookingDate: row.booking_date,
+    startTime: row.start_time,
+    holdExpiresAt: row.hold_expires_at,
+    confirmedAt: row.confirmed_at,
+    updatedAt: row.updated_at,
   };
 }

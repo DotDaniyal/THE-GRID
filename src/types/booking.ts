@@ -56,7 +56,20 @@ export interface CreatedBooking {
   additionalGuestsCount: number;
   totalAmountPkr: number;
   status: BookingStatus;
+  holdExpiresAt?: string | null;
+  confirmedAt?: string | null;
+  statusToken?: string;
   createdAt: string;
+}
+
+export interface BookingLiveStatus {
+  id: string;
+  status: BookingStatus;
+  bookingDate: string;
+  startTime: string;
+  holdExpiresAt: string | null;
+  confirmedAt: string | null;
+  updatedAt: string;
 }
 
 export interface AdminBookingRow {
@@ -77,6 +90,9 @@ export interface AdminBookingRow {
   total_amount_pkr: number;
   status: BookingStatus;
   admin_notes: string | null;
+  hold_expires_at?: string | null;
+  confirmed_at?: string | null;
+  confirmed_by?: string | null;
   created_at: string;
   updated_at: string;
 }

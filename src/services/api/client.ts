@@ -41,6 +41,7 @@ export async function apiRequest<T>(url: string, init?: RequestInit): Promise<T>
 
   const res = await fetch(url, {
     credentials: 'same-origin',
+    cache: 'no-store',
     ...init,
     headers,
   });

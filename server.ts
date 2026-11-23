@@ -5,9 +5,21 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { createApiApp } from './src/server/app.ts';
 import { IS_PRODUCTION, SERVER_PORT } from './src/server/config/constants.ts';
+import { releaseExpiredPendingBookings } from './src/server/services/bookingService.ts';
 
 async function startServer() {
   const app = createApiApp();
+
+  // Proactively release expired 30-minute pending holds every 30 seconds
+  releaseExpiredPendingBookings();
+  const holdSweepTimer = setInterval(() => {
+    try {
+      releaseExpiredPendingBookings();
+    } catch (err) {
+      console.error('Pending hold sweep error:', err);
+    }
+  }, 30_000);
+  holdSweepTimer.unref?.();
 
   if (!IS_PRODUCTION) {
     const vite = await createViteServer({

@@ -8,19 +8,25 @@ import { Footer } from '@/src/components/layout/Footer';
 
 interface HomePageProps {
   onBookNow: () => void;
+  onIntroStart?: () => void;
   onIntroComplete: () => void;
   onNavigateAdmin: () => void;
 }
 
 export function HomePage({
   onBookNow,
+  onIntroStart,
   onIntroComplete,
   onNavigateAdmin,
 }: HomePageProps) {
   return (
     <>
       <main>
-        <HeroSection onBookNow={onBookNow} onIntroComplete={onIntroComplete} />
+        <HeroSection
+          onBookNow={onBookNow}
+          onIntroStart={onIntroStart}
+          onIntroComplete={onIntroComplete}
+        />
         <ExploreSection />
         <GroundsSection onBookNow={onBookNow} />
         <ExperienceSection />

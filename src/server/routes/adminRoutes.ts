@@ -342,7 +342,8 @@ adminRouter.patch(
         : null;
 
     try {
-      const booking = updateAdminBookingStatus(bookingId, nextStatus, adminNotes);
+      const actor = req.adminSession?.username ?? 'admin';
+      const booking = updateAdminBookingStatus(bookingId, nextStatus, adminNotes, actor);
       res.json({ booking });
     } catch (err: unknown) {
       if (err instanceof ServiceError) {

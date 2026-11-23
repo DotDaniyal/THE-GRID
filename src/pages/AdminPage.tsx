@@ -13,6 +13,7 @@ import { AdminDrinksPanel } from '@/src/features/admin/AdminDrinksPanel';
 import { AdminLoginCard } from '@/src/features/admin/AdminLoginCard';
 import { AdminSecurityPanel } from '@/src/features/admin/AdminSecurityPanel';
 import { OperatingHoursEditor } from '@/src/features/admin/OperatingHoursEditor';
+import { useSlotStream } from '@/src/hooks/useSlotStream';
 import {
   fetchAdminDashboard,
   getAdminAuthStatus,
@@ -111,31 +112,59 @@ export function AdminPage() {
     return () => window.clearTimeout(timer);
   }, [authenticated, expiresAt, clearClientSession]);
 
-  const loadAdminData = useCallback(async () => {
-    setLoadingData(true);
-    setDataError(null);
-    try {
-      const dashboard = await fetchAdminDashboard();
-      setBookings(dashboard.bookings);
-      setNotifications(dashboard.notifications);
-      setUnreadCount(dashboard.unreadCount);
-      setHours(dashboard.hours);
-    } catch (err) {
-      if (err instanceof ApiRequestError && err.status === 401) {
-        clearClientSession('Admin session expired. Please sign in again.', true);
-        return;
+  const loadAdminData = useCallback(
+    async (options?: { silent?: boolean }) => {
+      const silent = Boolean(options?.silent);
+      if (!silent) {
+        setLoadingData(true);
+        setDataError(null);
       }
-      setDataError(err instanceof Error ? err.message : 'Unable to fetch admin data.');
-    } finally {
-      setLoadingData(false);
-    }
-  }, [clearClientSession]);
+      try {
+        const dashboard = await fetchAdminDashboard();
+        setBookings(dashboard.bookings);
+        setNotifications(dashboard.notifications);
+        setUnreadCount(dashboard.unreadCount);
+        setHours(dashboard.hours);
+        if (silent) {
+          setDataError(null);
+        }
+      } catch (err) {
+        if (err instanceof ApiRequestError && err.status === 401) {
+          clearClientSession('Admin session expired. Please sign in again.', true);
+          return;
+        }
+        if (!silent) {
+          setDataError(err instanceof Error ? err.message : 'Unable to fetch admin data.');
+        }
+      } finally {
+        if (!silent) {
+          setLoadingData(false);
+        }
+      }
+    },
+    [clearClientSession]
+  );
 
   useEffect(() => {
-    if (authenticated) {
-      void loadAdminData();
-    }
+    if (!authenticated) return;
+    void loadAdminData();
+
+    const interval = window.setInterval(() => {
+      void loadAdminData({ silent: true });
+    }, 15_000);
+
+    return () => window.clearInterval(interval);
   }, [authenticated, loadAdminData]);
+
+  const handleAdminStreamSync = useCallback(() => {
+    void loadAdminData({ silent: true });
+  }, [loadAdminData]);
+
+  useSlotStream({
+    enabled: authenticated,
+    onSyncEvent: handleAdminStreamSync,
+    onWakeOrReconnect: handleAdminStreamSync,
+  });
 
   const handleSignOut = async () => {
     try {
@@ -156,6 +185,7 @@ export function AdminPage() {
       setBookings((prev) =>
         prev.map((b) => (b.id === bookingId ? updated : b))
       );
+      void loadAdminData({ silent: true });
     } catch (err) {
       if (err instanceof ApiRequestError && err.status === 401) {
         clearClientSession('Admin session expired. Please sign in again.', true);

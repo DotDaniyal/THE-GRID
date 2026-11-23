@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
-import { MapPin } from 'lucide-react';
+import { AlertCircle, MapPin } from 'lucide-react';
 import { LOCATION } from '@/src/config/brand';
 import { SINGLE_COURT } from '@/src/config/venue';
 import { useSlotAvailability } from '@/src/hooks/useSlotAvailability';
@@ -27,20 +27,46 @@ export function BookingSlotPage({
       ? selection.bookingDate
       : karachiToday
   );
+  const [slotNotice, setSlotNotice] = useState<string | null>(null);
 
   const { slots, loading, error, refreshSlots } = useSlotAvailability(selectedDate);
 
   const selectedSlot =
     selection && selection.bookingDate === selectedDate ? selection.slot : null;
 
+  useEffect(() => {
+    if (!selection || selection.bookingDate !== selectedDate || slots.length === 0) {
+      return;
+    }
+
+    const liveSlot = slots.find((item) => item.startTime === selection.slot.startTime);
+    if (!liveSlot || !liveSlot.isAvailable) {
+      onSelectionChange(null);
+      setSlotNotice('Sorry, this slot has just been booked. Please select another available time.');
+      return;
+    }
+
+    if (
+      liveSlot.pricePkr !== selection.slot.pricePkr ||
+      liveSlot.displayName !== selection.slot.displayName
+    ) {
+      onSelectionChange({
+        bookingDate: selectedDate,
+        slot: liveSlot,
+      });
+    }
+  }, [slots, selection, selectedDate, onSelectionChange]);
+
   const handleDateChange = (nextDate: string) => {
     if (nextDate === selectedDate) return;
+    setSlotNotice(null);
     setSelectedDate(nextDate);
     onSelectionChange(null);
   };
 
   const handleSlotClick = (slot: SlotAvailability) => {
     if (!slot.isAvailable) return;
+    setSlotNotice(null);
     if (selectedSlot?.startTime === slot.startTime) {
       onSelectionChange(null);
       return;
@@ -121,6 +147,25 @@ export function BookingSlotPage({
                 onSelectDate={handleDateChange}
               />
             </motion.section>
+
+            {slotNotice && (
+              <div
+                role="alert"
+                className="rounded-lg border border-amber-400/45 bg-amber-950/35 px-4 py-3 flex items-center justify-between gap-3 text-xs sm:text-sm text-amber-200"
+              >
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-amber-300" aria-hidden="true" />
+                  <span>{slotNotice}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSlotNotice(null)}
+                  className="text-xs font-semibold text-amber-300 hover:text-white underline underline-offset-2 cursor-pointer shrink-0"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
 
             <TimeSlotGrid
               slots={slots}

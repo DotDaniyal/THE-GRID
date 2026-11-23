@@ -32,6 +32,7 @@ before(async () => {
 
 after(async () => {
   await new Promise<void>((resolve) => {
+    server?.closeAllConnections?.();
     server?.close(() => resolve());
   });
   try {
@@ -476,3 +477,241 @@ test('Embedded iframe login emits SameSite=None Partitioned cookies and supports
   });
   assert.equal(afterLogoutRes.status, 401);
 });
+
+test('Centralized real-time sync, concurrent double-booking protection, admin confirmation audit, cancellation release, and DB persistence work across devices', async () => {
+  const SYNC_DATE = '2027-09-25';
+  const SYNC_TIME = '19:00';
+
+  // Open an SSE stream simulating another connected device (Device C / Admin Desk)
+  const sseAbort = new AbortController();
+  const sseRes = await fetch(`${baseUrl}/api/slots/stream`, {
+    signal: sseAbort.signal,
+  });
+  assert.equal(sseRes.status, 200);
+  assert.match(sseRes.headers.get('content-type') || '', /text\/event-stream/);
+  assert.ok(sseRes.body);
+
+  const reader = sseRes.body.getReader();
+  try {
+    const decoder = new TextDecoder();
+    let sseBuffer = '';
+
+    const readSseUntil = async (predicate: (text: string) => boolean, timeoutMs = 4000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!predicate(sseBuffer)) {
+        if (Date.now() > deadline) {
+          throw new Error(`Timed out waiting for SSE event. Buffer:\n${sseBuffer}`);
+        }
+        const chunk = await Promise.race([
+          reader.read(),
+          new Promise<{ done: true; value: undefined }>((_, reject) =>
+            setTimeout(() => reject(new Error('SSE read timeout')), deadline - Date.now())
+          ),
+        ]);
+        if (chunk.done) break;
+        if (chunk.value) {
+          sseBuffer += decoder.decode(chunk.value, { stream: true });
+        }
+      }
+      return sseBuffer;
+    };
+
+    await readSseUntil((buf) => buf.includes('event: connected'));
+
+    // Simulate Device A and Device B clicking Submit at the exact same millisecond for 2027-09-25 19:00
+    const [race1, race2] = await Promise.all([
+      fetch(`${baseUrl}/api/bookings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          customerName: 'Device A Captain',
+          customerEmail: 'devicea@thegrid.pk',
+          countryCode: '+92',
+          customerPhone: '03211112222',
+          bookingDate: SYNC_DATE,
+          startTime: SYNC_TIME,
+          bookingType: 'individual',
+          additionalGuestsCount: 0,
+          policiesAccepted: true,
+        }),
+      }),
+      fetch(`${baseUrl}/api/bookings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          customerName: 'Device B Captain',
+          customerEmail: 'deviceb@thegrid.pk',
+          countryCode: '+92',
+          customerPhone: '03213334444',
+          bookingDate: SYNC_DATE,
+          startTime: SYNC_TIME,
+          bookingType: 'individual',
+          additionalGuestsCount: 0,
+          policiesAccepted: true,
+        }),
+      }),
+    ]);
+
+    const statuses = [race1.status, race2.status].sort((a, b) => a - b);
+    assert.deepEqual(statuses, [201, 409]);
+
+    const winnerRes = race1.status === 201 ? race1 : race2;
+    const loserRes = race1.status === 409 ? race1 : race2;
+
+    const loserBody = (await loserRes.json()) as { error: string };
+    assert.equal(
+      loserBody.error,
+      'Sorry, this slot has just been booked. Please select another available time.'
+    );
+
+    const winnerBody = (await winnerRes.json()) as {
+      booking: {
+        id: string;
+        status: string;
+        statusToken: string;
+        holdExpiresAt: string;
+      };
+    };
+    assert.equal(winnerBody.booking.status, 'PENDING');
+    assert.ok(winnerBody.booking.statusToken);
+    assert.ok(winnerBody.booking.holdExpiresAt);
+
+    // Confirm SSE pushed the slot_changed event without leaking any customer PII
+    await readSseUntil(
+      (buf) => buf.includes('event: slot_changed') && buf.includes(winnerBody.booking.id)
+    );
+    assert.equal(sseBuffer.includes('Device A Captain'), false);
+    assert.equal(sseBuffer.includes('03211112222'), false);
+
+    // Device C loads slots and sees 19:00 is BOOKED (with zero PII) and cache-control: no-store
+    const deviceCSlotsRes = await fetch(`${baseUrl}/api/slots?date=${SYNC_DATE}`);
+    assert.equal(deviceCSlotsRes.status, 200);
+    assert.match(deviceCSlotsRes.headers.get('cache-control') || '', /no-store/);
+    const deviceCSlots = (await deviceCSlotsRes.json()) as {
+      slots: Array<{ startTime: string; status: string; isAvailable: boolean; bookingStatus: string | null }>;
+    };
+    const slot19 = deviceCSlots.slots.find((s) => s.startTime === SYNC_TIME);
+    assert.ok(slot19);
+    assert.equal(slot19?.status, 'BOOKED');
+    assert.equal(slot19?.isAvailable, false);
+    assert.equal(slot19?.bookingStatus, 'PENDING');
+
+    // Device A status endpoint requires matching statusToken (403 on wrong token)
+    const badTokenRes = await fetch(
+      `${baseUrl}/api/bookings/${winnerBody.booking.id}/status?token=wrongtoken`
+    );
+    assert.equal(badTokenRes.status, 403);
+
+    // Admin Device B signs in and confirms the booking
+    const adminLogin = await fetch(`${baseUrl}/api/admin/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-Forwarded-For': '198.51.100.99',
+      },
+      body: JSON.stringify({
+        username: 'leadadmin@thegrid.pk',
+        password: 'RoversGrid2026!Strong',
+      }),
+    });
+    assert.equal(adminLogin.status, 200);
+    const adminCookie = extractCookiePair(adminLogin.headers.get('set-cookie'));
+
+    const confirmRes = await fetch(
+      `${baseUrl}/api/admin/bookings/${winnerBody.booking.id}/status`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: adminCookie,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({ status: 'CONFIRMED' }),
+      }
+    );
+    assert.equal(confirmRes.status, 200);
+    const confirmedRow = ((await confirmRes.json()) as {
+      booking: {
+        id: string;
+        status: string;
+        confirmed_at: string | null;
+        confirmed_by: string | null;
+        hold_expires_at: string | null;
+      };
+    }).booking;
+    assert.equal(confirmedRow.status, 'CONFIRMED');
+    assert.ok(confirmedRow.confirmed_at);
+    assert.equal(confirmedRow.confirmed_by, 'leadadmin@thegrid.pk');
+    assert.equal(confirmedRow.hold_expires_at, null);
+
+    // Device A status check immediately sees CONFIRMED + confirmedAt
+    const liveStatusRes = await fetch(
+      `${baseUrl}/api/bookings/${winnerBody.booking.id}/status?token=${winnerBody.booking.statusToken}`
+    );
+    assert.equal(liveStatusRes.status, 200);
+    const liveStatus = (await liveStatusRes.json()) as {
+      bookingStatus: {
+        status: string;
+        confirmedAt: string | null;
+      };
+    };
+    assert.equal(liveStatus.bookingStatus.status, 'CONFIRMED');
+    assert.ok(liveStatus.bookingStatus.confirmedAt);
+
+    // Verify persistence across a fresh Express server instance against the same central SQLite DB
+    const freshApp = createApiApp();
+    let freshServer!: http.Server;
+    let freshUrl = '';
+    await new Promise<void>((resolve) => {
+      freshServer = freshApp.listen(0, '127.0.0.1', () => {
+        const addr = freshServer.address();
+        if (addr && typeof addr === 'object') {
+          freshUrl = `http://127.0.0.1:${addr.port}`;
+        }
+        resolve();
+      });
+    });
+
+    try {
+      const freshSlotsRes = await fetch(`${freshUrl}/api/slots?date=${SYNC_DATE}`);
+      const freshSlots = (await freshSlotsRes.json()) as {
+        slots: Array<{ startTime: string; status: string; isAvailable: boolean; bookingStatus: string | null }>;
+      };
+      const persistedSlot = freshSlots.slots.find((s) => s.startTime === SYNC_TIME);
+      assert.equal(persistedSlot?.status, 'BOOKED');
+      assert.equal(persistedSlot?.bookingStatus, 'CONFIRMED');
+      assert.equal(persistedSlot?.isAvailable, false);
+    } finally {
+      freshServer.closeAllConnections?.();
+      await new Promise<void>((resolve) => freshServer.close(() => resolve()));
+    }
+
+    // Admin cancels booking -> slot returns immediately to AVAILABLE across every device
+    const cancelRes = await fetch(
+      `${baseUrl}/api/admin/bookings/${winnerBody.booking.id}/status`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: adminCookie,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({ status: 'CANCELLED' }),
+      }
+    );
+    assert.equal(cancelRes.status, 200);
+
+    const afterCancelSlotsRes = await fetch(`${baseUrl}/api/slots?date=${SYNC_DATE}`);
+    const afterCancelSlots = (await afterCancelSlotsRes.json()) as {
+      slots: Array<{ startTime: string; status: string; isAvailable: boolean }>;
+    };
+    const releasedSlot = afterCancelSlots.slots.find((s) => s.startTime === SYNC_TIME);
+    assert.equal(releasedSlot?.status, 'AVAILABLE');
+    assert.equal(releasedSlot?.isAvailable, true);
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    sseAbort.abort();
+  }
+});
+

@@ -1,12 +1,24 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { motion } from 'motion/react';
-import { ArrowLeft, ArrowUpRight, Check, CheckCircle2, Clock, Copy, ShieldCheck } from 'lucide-react';
+import {
+  AlertCircle,
+  ArrowLeft,
+  ArrowUpRight,
+  Ban,
+  Check,
+  CheckCircle2,
+  Clock,
+  Copy,
+  ShieldCheck,
+} from 'lucide-react';
 import { CONTACT, PAYMENT_INFO } from '@/src/config/brand';
+import { useSlotStream, type SlotStreamEvent } from '@/src/hooks/useSlotStream';
+import { getBookingLiveStatus } from '@/src/services/api/bookingsApi';
 import {
   buildWhatsAppBookingMessage,
   buildWhatsAppBookingUrl,
 } from '@/src/services/integrations/whatsapp';
-import type { CreatedBooking } from '@/src/types/booking';
+import type { BookingStatus, CreatedBooking } from '@/src/types/booking';
 import { formatReadableDate } from '@/src/utils/date';
 
 interface BookingConfirmationCardProps {
@@ -14,16 +26,111 @@ interface BookingConfirmationCardProps {
   onBookAnother: () => void;
 }
 
+function formatDateTimeLabel(isoValue?: string | null): string | null {
+  if (!isoValue) return null;
+  const parsed = new Date(isoValue);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toLocaleString('en-PK', {
+    timeZone: 'Asia/Karachi',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true,
+  });
+}
+
 export function BookingConfirmationCard({
   booking,
   onBookAnother,
 }: BookingConfirmationCardProps) {
   const [copiedMsg, setCopiedMsg] = useState(false);
+  const [liveStatus, setLiveStatus] = useState<BookingStatus>(booking.status);
+  const [holdExpiresAt, setHoldExpiresAt] = useState<string | null>(
+    booking.holdExpiresAt ?? null
+  );
+  const [confirmedAt, setConfirmedAt] = useState<string | null>(
+    booking.confirmedAt ?? null
+  );
 
-  const whatsappMessage = buildWhatsAppBookingMessage(booking);
-  const whatsappHref = buildWhatsAppBookingUrl(booking);
+  useEffect(() => {
+    setLiveStatus(booking.status);
+    setHoldExpiresAt(booking.holdExpiresAt ?? null);
+    setConfirmedAt(booking.confirmedAt ?? null);
+  }, [booking]);
+
+  const syncStatusFromServer = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!booking.statusToken) return;
+      try {
+        const latest = await getBookingLiveStatus(
+          booking.id,
+          booking.statusToken,
+          signal
+        );
+        if (signal?.aborted) return;
+        setLiveStatus(latest.status);
+        setHoldExpiresAt(latest.holdExpiresAt);
+        setConfirmedAt(latest.confirmedAt);
+      } catch {
+        // Ignore transient background status polling errors
+      }
+    },
+    [booking.id, booking.statusToken]
+  );
+
+  useEffect(() => {
+    if (!booking.statusToken) return;
+    const controller = new AbortController();
+    void syncStatusFromServer(controller.signal);
+
+    const pollInterval =
+      liveStatus === 'PENDING'
+        ? window.setInterval(() => {
+            void syncStatusFromServer();
+          }, 10_000)
+        : null;
+
+    return () => {
+      controller.abort();
+      if (pollInterval !== null) {
+        window.clearInterval(pollInterval);
+      }
+    };
+  }, [booking.statusToken, liveStatus, syncStatusFromServer]);
+
+  const handleStreamEvent = useCallback(
+    (event: SlotStreamEvent) => {
+      if (
+        event.type === 'slot_changed' &&
+        (event.bookingId === booking.id || event.bookingDate === booking.bookingDate)
+      ) {
+        void syncStatusFromServer();
+      }
+    },
+    [booking.id, booking.bookingDate, syncStatusFromServer]
+  );
+
+  useSlotStream({
+    enabled: Boolean(booking.statusToken),
+    onSyncEvent: handleStreamEvent,
+    onWakeOrReconnect: syncStatusFromServer,
+  });
+
+  const syncedBooking: CreatedBooking = {
+    ...booking,
+    status: liveStatus,
+    holdExpiresAt,
+    confirmedAt,
+  };
+
+  const whatsappMessage = buildWhatsAppBookingMessage(syncedBooking);
+  const whatsappHref = buildWhatsAppBookingUrl(syncedBooking);
   const advancePkr = Math.round((booking.totalAmountPkr * PAYMENT_INFO.advancePercent) / 100);
   const remainingPkr = booking.totalAmountPkr - advancePkr;
+  const confirmedAtLabel = formatDateTimeLabel(confirmedAt);
+  const holdExpiryLabel = formatDateTimeLabel(holdExpiresAt);
 
   const handleCopyMessage = async () => {
     try {
@@ -35,6 +142,11 @@ export function BookingConfirmationCard({
     }
   };
 
+  const isConfirmed = liveStatus === 'CONFIRMED';
+  const isRejected = liveStatus === 'REJECTED';
+  const isCancelled = liveStatus === 'CANCELLED';
+  const isPending = liveStatus === 'PENDING';
+
   return (
     <motion.div
       initial={{ opacity: 0, scale: 0.98, y: 12 }}
@@ -43,21 +155,71 @@ export function BookingConfirmationCard({
       className="rounded-xl border border-[#c4d835]/45 bg-[#121D52]/96 p-6 sm:p-8 space-y-6 shadow-[0_24px_70px_rgba(4,8,24,0.6)]"
     >
       <div className="flex items-start gap-4 pb-5 border-b border-white/10">
-        <div className="w-12 h-12 rounded-lg bg-[#c4d835] text-[#0E1845] flex items-center justify-center shrink-0">
-          <CheckCircle2 className="w-6 h-6" />
+        <div
+          className={`w-12 h-12 rounded-lg flex items-center justify-center shrink-0 ${
+            isConfirmed
+              ? 'bg-[#c4d835] text-[#0E1845]'
+              : isPending
+              ? 'bg-[#c4d835] text-[#0E1845]'
+              : 'bg-rose-500/20 text-rose-200 border border-rose-400/40'
+          }`}
+        >
+          {isConfirmed ? (
+            <ShieldCheck className="w-6 h-6" />
+          ) : isPending ? (
+            <CheckCircle2 className="w-6 h-6" />
+          ) : (
+            <Ban className="w-6 h-6" />
+          )}
         </div>
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#c4d835]">
-            Step 1 Complete · Requested
+            {isConfirmed
+              ? 'Reservation Verified & Confirmed'
+              : isRejected
+              ? 'Booking Request Rejected'
+              : isCancelled
+              ? 'Booking Cancelled / Slot Released'
+              : 'Step 1 Complete · Requested'}
           </p>
           <h1 className="mt-1 font-display text-3xl sm:text-4xl font-extrabold uppercase text-white">
-            Awaiting Advance Payment
+            {isConfirmed
+              ? 'Booking Confirmed'
+              : isRejected
+              ? 'Request Not Approved'
+              : isCancelled
+              ? 'Booking Released'
+              : 'Awaiting Advance Payment'}
           </h1>
           <p className="mt-1.5 text-sm text-slate-200 leading-relaxed">
-            Your booking request has been logged and your slot is temporarily held for{' '}
-            <strong className="text-white">{PAYMENT_INFO.holdDurationMinutes} minutes</strong>.
-            Confirmation completes only after your {PAYMENT_INFO.advancePercent}% advance transfer is
-            verified.
+            {isConfirmed ? (
+              <>
+                Your court reservation is{' '}
+                <strong className="text-[#c4d835]">confirmed</strong>
+                {confirmedAtLabel ? ` (${confirmedAtLabel} PKT)` : ''}. Present your
+                Booking Reference ID at THE GRID reception before kickoff.
+              </>
+            ) : isRejected ? (
+              <>
+                This booking request was declined by THE GRID administration and the
+                time slot has been released. You may select another available slot.
+              </>
+            ) : isCancelled ? (
+              <>
+                This booking was cancelled or its {PAYMENT_INFO.holdDurationMinutes}-minute
+                advance hold expired. The slot has been returned to live availability.
+              </>
+            ) : (
+              <>
+                Your booking request has been logged and your slot is temporarily held for{' '}
+                <strong className="text-white">
+                  {PAYMENT_INFO.holdDurationMinutes} minutes
+                </strong>
+                {holdExpiryLabel ? ` (until ${holdExpiryLabel} PKT)` : ''}. Confirmation
+                updates here automatically once your {PAYMENT_INFO.advancePercent}%
+                advance transfer is verified.
+              </>
+            )}
           </p>
         </div>
       </div>
@@ -71,21 +233,86 @@ export function BookingConfirmationCard({
           </div>
           <p className="mt-1 text-slate-300">Request logged under {booking.id}.</p>
         </li>
-        <li className="rounded-lg border border-amber-300/50 bg-amber-950/20 p-3">
-          <div className="flex items-center gap-1.5 font-bold uppercase text-amber-300">
-            <Clock className="w-3.5 h-3.5" aria-hidden="true" />
-            <span>2. Awaiting Advance (Current)</span>
+        <li
+          className={`rounded-lg border p-3 ${
+            isConfirmed
+              ? 'border-[#c4d835]/50 bg-[#0B1236]'
+              : isPending
+              ? 'border-amber-300/50 bg-amber-950/20'
+              : 'border-white/10 bg-[#0B1236]/60'
+          }`}
+        >
+          <div
+            className={`flex items-center gap-1.5 font-bold uppercase ${
+              isConfirmed
+                ? 'text-[#c4d835]'
+                : isPending
+                ? 'text-amber-300'
+                : 'text-slate-300'
+            }`}
+          >
+            {isConfirmed ? (
+              <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />
+            ) : (
+              <Clock className="w-3.5 h-3.5" aria-hidden="true" />
+            )}
+            <span>
+              {isConfirmed
+                ? '2. Advance Verified (Done)'
+                : isPending
+                ? '2. Awaiting Advance (Current)'
+                : '2. Advance Verification'}
+            </span>
           </div>
           <p className="mt-1 text-slate-200">
-            Transfer PKR {advancePkr.toLocaleString()} within {PAYMENT_INFO.holdDurationMinutes} min.
+            Transfer PKR {advancePkr.toLocaleString()} within{' '}
+            {PAYMENT_INFO.holdDurationMinutes} min.
           </p>
         </li>
-        <li className="rounded-lg border border-white/10 bg-[#0B1236]/60 p-3">
-          <div className="flex items-center gap-1.5 font-bold uppercase text-slate-300">
-            <ShieldCheck className="w-3.5 h-3.5" aria-hidden="true" />
-            <span>3. Confirmed (Next)</span>
+        <li
+          className={`rounded-lg border p-3 ${
+            isConfirmed
+              ? 'border-[#c4d835]/60 bg-[#192869]'
+              : isRejected || isCancelled
+              ? 'border-rose-400/40 bg-rose-950/25'
+              : 'border-white/10 bg-[#0B1236]/60'
+          }`}
+        >
+          <div
+            className={`flex items-center gap-1.5 font-bold uppercase ${
+              isConfirmed
+                ? 'text-[#c4d835]'
+                : isRejected || isCancelled
+                ? 'text-rose-300'
+                : 'text-slate-300'
+            }`}
+          >
+            {isConfirmed ? (
+              <ShieldCheck className="w-3.5 h-3.5" aria-hidden="true" />
+            ) : isRejected || isCancelled ? (
+              <AlertCircle className="w-3.5 h-3.5" aria-hidden="true" />
+            ) : (
+              <ShieldCheck className="w-3.5 h-3.5" aria-hidden="true" />
+            )}
+            <span>
+              {isConfirmed
+                ? '3. Confirmed (Active)'
+                : isRejected
+                ? '3. Rejected'
+                : isCancelled
+                ? '3. Cancelled'
+                : '3. Confirmed (Next)'}
+            </span>
           </div>
-          <p className="mt-1 text-slate-400">Admin verifies WhatsApp screenshot.</p>
+          <p className="mt-1 text-slate-300">
+            {isConfirmed
+              ? confirmedAtLabel
+                ? `Confirmed at ${confirmedAtLabel} PKT.`
+                : 'Verified by THE GRID admin team.'
+              : isRejected || isCancelled
+              ? 'Slot returned to public schedule.'
+              : 'Admin verifies WhatsApp screenshot.'}
+          </p>
         </li>
       </ol>
 
@@ -102,8 +329,20 @@ export function BookingConfirmationCard({
           <dt className="text-xs uppercase tracking-wider text-slate-400">
             Current Status
           </dt>
-          <dd className="mt-1 font-mono-tabular text-sm font-bold text-amber-300">
-            {booking.status} (Awaiting Advance Payment)
+          <dd
+            className={`mt-1 font-mono-tabular text-sm font-bold ${
+              isConfirmed
+                ? 'text-[#c4d835]'
+                : isPending
+                ? 'text-amber-300'
+                : 'text-rose-300'
+            }`}
+          >
+            {isConfirmed
+              ? 'CONFIRMED'
+              : isPending
+              ? 'PENDING (Awaiting Advance Payment)'
+              : liveStatus}
           </dd>
         </div>
         <div>
@@ -134,10 +373,12 @@ export function BookingConfirmationCard({
         </div>
         <div>
           <dt className="text-xs uppercase tracking-wider text-slate-400">
-            50% Advance Due / Total
+            {isConfirmed ? '50% Advance / Remaining at Venue' : '50% Advance Due / Total'}
           </dt>
           <dd className="mt-1 font-mono-tabular text-base font-bold text-[#c4d835]">
-            PKR {advancePkr.toLocaleString()} now · PKR {booking.totalAmountPkr.toLocaleString()} total
+            {isConfirmed
+              ? `PKR ${advancePkr.toLocaleString()} paid · PKR ${remainingPkr.toLocaleString()} at venue`
+              : `PKR ${advancePkr.toLocaleString()} now · PKR ${booking.totalAmountPkr.toLocaleString()} total`}
           </dd>
         </div>
       </dl>

@@ -80,6 +80,10 @@ export interface BookingRow {
   total_amount_pkr: number;
   status: 'PENDING' | 'CONFIRMED' | 'REJECTED' | 'CANCELLED';
   admin_notes: string | null;
+  hold_expires_at: string | null;
+  confirmed_at: string | null;
+  confirmed_by: string | null;
+  status_token: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -119,6 +123,7 @@ export function getDb(): DatabaseSync {
   } catch {
     db.exec('PRAGMA journal_mode = DELETE;');
   }
+  db.exec('PRAGMA busy_timeout = 5000;');
   db.exec('PRAGMA foreign_keys = ON;');
 
   db.exec(`
@@ -148,6 +153,10 @@ export function getDb(): DatabaseSync {
       total_amount_pkr INTEGER NOT NULL,
       status TEXT NOT NULL CHECK (status IN ('PENDING', 'CONFIRMED', 'REJECTED', 'CANCELLED')),
       admin_notes TEXT,
+      hold_expires_at TEXT,
+      confirmed_at TEXT,
+      confirmed_by TEXT,
+      status_token TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -305,6 +314,23 @@ export function getDb(): DatabaseSync {
   for (const [colName, colDef] of drinkMigrations) {
     if (!existingCols.has(colName)) {
       db.exec(`ALTER TABLE drinks ADD COLUMN ${colName} ${colDef};`);
+    }
+  }
+
+  const existingBookingCols = new Set(
+    (
+      db.prepare('PRAGMA table_info(bookings)').all() as unknown as Array<{ name: string }>
+    ).map((col) => col.name)
+  );
+  const bookingMigrations: Array<[string, string]> = [
+    ['hold_expires_at', 'TEXT'],
+    ['confirmed_at', 'TEXT'],
+    ['confirmed_by', 'TEXT'],
+    ['status_token', 'TEXT'],
+  ];
+  for (const [colName, colDef] of bookingMigrations) {
+    if (!existingBookingCols.has(colName)) {
+      db.exec(`ALTER TABLE bookings ADD COLUMN ${colName} ${colDef};`);
     }
   }
 

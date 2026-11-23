@@ -1,5 +1,6 @@
 import { apiRequest } from '@/src/services/api/client';
 import type {
+  BookingLiveStatus,
   CreateBookingPayload,
   CreatedBooking,
   SlotAvailability,
@@ -14,6 +15,21 @@ export async function getAvailableSlots(
     { signal }
   );
   return Array.isArray(data.slots) ? data.slots : [];
+}
+
+export async function getBookingLiveStatus(
+  bookingId: string,
+  statusToken: string,
+  signal?: AbortSignal
+): Promise<BookingLiveStatus> {
+  const data = await apiRequest<{ bookingStatus?: BookingLiveStatus }>(
+    `/api/bookings/${encodeURIComponent(bookingId)}/status?token=${encodeURIComponent(statusToken)}`,
+    { signal }
+  );
+  if (!data.bookingStatus) {
+    throw new Error('Could not verify booking status.');
+  }
+  return data.bookingStatus;
 }
 
 export async function submitBookingRequest(

@@ -27,6 +27,15 @@ export function createApiApp(): express.Express {
     })
   );
 
+  app.use('/api', (req, res, next) => {
+    if (!req.path.endsWith('/stream')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    }
+    next();
+  });
+
   app.use('/api', publicBookingRouter);
   app.use('/api/admin', adminRouter);
 
