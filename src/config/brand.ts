@@ -4,6 +4,7 @@ export const BRAND = {
   tagline: 'Picture Perfect, Culture Driven',
   motto: 'Game. Set. Grid.',
   logoUrl: '/brand/thegrid-logo.png',
+  logoWebpUrl: '/brand/thegrid-logo.webp',
   faviconUrl: '/brand/favicon-32x32.png',
   website: 'https://thegrid.pk',
 } as const;

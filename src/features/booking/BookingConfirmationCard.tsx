@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useState } from 'react';
-import { motion } from 'motion/react';
 import {
   AlertCircle,
   ArrowLeft,
@@ -148,12 +147,7 @@ export function BookingConfirmationCard({
   const isPending = liveStatus === 'PENDING';
 
   return (
-    <motion.div
-      initial={{ opacity: 0, scale: 0.98, y: 12 }}
-      animate={{ opacity: 1, scale: 1, y: 0 }}
-      transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
-      className="rounded-xl border border-[#c4d835]/45 bg-[#121D52]/96 p-6 sm:p-8 space-y-6 shadow-[0_24px_70px_rgba(4,8,24,0.6)]"
-    >
+    <div className="rounded-xl border border-[#c4d835]/45 bg-[#121D52]/96 p-6 sm:p-8 space-y-6 shadow-[0_24px_70px_rgba(4,8,24,0.6)]">
       <div className="flex items-start gap-4 pb-5 border-b border-white/10">
         <div
           className={`w-12 h-12 rounded-lg flex items-center justify-center shrink-0 ${
@@ -462,6 +456,6 @@ export function BookingConfirmationCard({
           <span>Book Another Slot</span>
         </button>
       </div>
-    </motion.div>
+    </div>
   );
 }

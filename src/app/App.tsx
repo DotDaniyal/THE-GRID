@@ -1,5 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
-import { MotionConfig } from 'motion/react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   parseRoute,
   syncDocumentRouteMeta,
@@ -7,32 +6,30 @@ import {
 } from '@/src/app/routes';
 import { Navbar } from '@/src/components/layout/Navbar';
 import { useBookingSelection } from '@/src/hooks/useBookingSelection';
-import { AdminPage } from '@/src/pages/AdminPage';
-import { BookingDetailsPage } from '@/src/pages/BookingDetailsPage';
-import { BookingSlotPage } from '@/src/pages/BookingSlotPage';
 import { HomePage } from '@/src/pages/HomePage';
 import { getKarachiTodayStr } from '@/src/utils/date';
 
-function prefersReducedMotionSync(): boolean {
-  if (typeof window === 'undefined' || !window.matchMedia) return false;
-  return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-}
+const BookingSlotPage = lazy(() =>
+  import('@/src/pages/BookingSlotPage').then((m) => ({ default: m.BookingSlotPage }))
+);
+const BookingDetailsPage = lazy(() =>
+  import('@/src/pages/BookingDetailsPage').then((m) => ({ default: m.BookingDetailsPage }))
+);
+const AdminPage = lazy(() =>
+  import('@/src/pages/AdminPage').then((m) => ({ default: m.AdminPage }))
+);
 
-function hasSeenIntroInSession(): boolean {
-  if (typeof window === 'undefined') return true;
-  try {
-    return window.sessionStorage.getItem('thegrid_intro_seen') === '1';
-  } catch {
-    return false;
-  }
+function RouteLoadingShell() {
+  return (
+    <div className="min-h-screen pt-28 bg-[#0C153B] flex items-center justify-center text-sm text-slate-300">
+      Loading...
+    </div>
+  );
 }
 
 export default function App() {
   const [currentPath, setCurrentPath] = useState<AppRoute>(() =>
     typeof window !== 'undefined' ? parseRoute(window.location.pathname) : '/'
-  );
-  const [navVisible, setNavVisible] = useState(
-    () => currentPath !== '/' || prefersReducedMotionSync() || hasSeenIntroInSession()
   );
 
   const karachiToday = useMemo(() => getKarachiTodayStr(), []);
@@ -40,11 +37,7 @@ export default function App() {
 
   useEffect(() => {
     const onPopState = () => {
-      const next = parseRoute(window.location.pathname);
-      setCurrentPath(next);
-      if (next !== '/' || prefersReducedMotionSync() || hasSeenIntroInSession()) {
-        setNavVisible(true);
-      }
+      setCurrentPath(parseRoute(window.location.pathname));
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
@@ -60,86 +53,68 @@ export default function App() {
       window.history.pushState({}, '', targetUrl);
     }
     setCurrentPath(path);
-    if (path !== '/' || prefersReducedMotionSync() || hasSeenIntroInSession()) {
-      setNavVisible(true);
-    }
-
-    const scrollBehavior: ScrollBehavior = prefersReducedMotionSync() ? 'auto' : 'smooth';
 
     if (hash) {
       window.requestAnimationFrame(() => {
         window.setTimeout(() => {
           const el = document.querySelector(hash);
           if (el) {
-            el.scrollIntoView({ behavior: scrollBehavior, block: 'start' });
+            el.scrollIntoView({ behavior: 'smooth', block: 'start' });
           }
-        }, 60);
+        }, 50);
       });
     } else {
-      window.scrollTo({ top: 0, behavior: scrollBehavior });
+      window.scrollTo({ top: 0, behavior: 'auto' });
     }
   }, []);
 
-  const handleIntroStart = useCallback(() => {
-    setNavVisible(false);
-  }, []);
-
-  const handleIntroComplete = useCallback(() => {
-    setNavVisible(true);
-  }, []);
-
   const handleBookNow = useCallback(() => {
-    setNavVisible(true);
     navigate('/booking');
   }, [navigate]);
 
   return (
-    <MotionConfig reducedMotion="user">
-      <div className="min-h-screen bg-[#070A14] text-[#F4F6FA] overflow-x-clip">
-        <Navbar
-          currentPath={currentPath}
-          onNavigate={navigate}
+    <div className="min-h-screen bg-[#070A14] text-[#F4F6FA] overflow-x-clip">
+      <Navbar currentPath={currentPath} onNavigate={navigate} onBookNow={handleBookNow} />
+
+      {currentPath === '/' && (
+        <HomePage
           onBookNow={handleBookNow}
-          visible={navVisible}
-          onFocusReveal={handleIntroComplete}
+          onNavigateAdmin={() => navigate('/admin')}
         />
+      )}
 
-        {currentPath === '/' && (
-          <HomePage
-            onBookNow={handleBookNow}
-            onIntroStart={handleIntroStart}
-            onIntroComplete={handleIntroComplete}
-            onNavigateAdmin={() => navigate('/admin')}
-          />
-        )}
-
-        {currentPath === '/booking' && (
-          <main>
+      {currentPath === '/booking' && (
+        <main>
+          <Suspense fallback={<RouteLoadingShell />}>
             <BookingSlotPage
               karachiToday={karachiToday}
               selection={bookingSelection}
               onSelectionChange={updateBookingSelection}
               onContinueToDetails={() => navigate('/booking/details')}
             />
-          </main>
-        )}
+          </Suspense>
+        </main>
+      )}
 
-        {currentPath === '/booking/details' && (
-          <main>
+      {currentPath === '/booking/details' && (
+        <main>
+          <Suspense fallback={<RouteLoadingShell />}>
             <BookingDetailsPage
               selection={bookingSelection}
               onBackToSlots={() => navigate('/booking')}
               onBookingSubmitted={() => updateBookingSelection(null)}
             />
-          </main>
-        )}
+          </Suspense>
+        </main>
+      )}
 
-        {currentPath === '/admin' && (
-          <main>
+      {currentPath === '/admin' && (
+        <main>
+          <Suspense fallback={<RouteLoadingShell />}>
             <AdminPage />
-          </main>
-        )}
-      </div>
-    </MotionConfig>
+          </Suspense>
+        </main>
+      )}
+    </div>
   );
 }

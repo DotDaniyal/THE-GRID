@@ -1,4 +1,3 @@
-import { motion } from 'motion/react';
 import {
   AlertCircle,
   CheckCircle2,
@@ -29,11 +28,8 @@ export function TimeSlotGrid({
   const bookedCount = slots.filter((s) => s.status === 'BOOKED').length;
 
   return (
-    <motion.section
+    <section
       aria-labelledby="step-slots-heading"
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.45, delay: 0.1 }}
       className="rounded-xl border border-[#c4d835]/30 bg-[#16235C]/92 p-4 sm:p-6"
     >
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-white/10">
@@ -105,7 +101,7 @@ export function TimeSlotGrid({
           {Array.from({ length: 12 }).map((_, idx) => (
             <div
               key={idx}
-              className="h-[78px] rounded-lg border border-white/10 bg-[#101B4D]/70 animate-pulse"
+              className="h-[78px] rounded-lg border border-white/10 bg-[#101B4D]/70"
             />
           ))}
         </div>
@@ -126,13 +122,11 @@ export function TimeSlotGrid({
             const isAvailable = slot.status === 'AVAILABLE';
 
             return (
-              <motion.button
+              <button
                 key={slot.slotId}
                 type="button"
                 disabled={!isAvailable}
                 onClick={() => onSelectSlot(slot)}
-                whileHover={isAvailable ? { y: -2 } : undefined}
-                whileTap={isAvailable ? { scale: 0.98 } : undefined}
                 aria-pressed={isSelected}
                 aria-label={`${slot.displayName}, ${
                   isBooked
@@ -145,7 +139,7 @@ export function TimeSlotGrid({
                   isSelected
                     ? 'bg-[#c4d835] text-[#0E1845] border-[#d4e157] shadow-[0_8px_24px_rgba(196,216,53,0.32)] cursor-pointer'
                     : isAvailable
-                    ? 'bg-[#1D2E7B]/85 text-white border-[#c4d835]/55 hover:border-[#c4d835] hover:bg-[#253A99] cursor-pointer'
+                    ? 'bg-[#1D2E7B]/85 text-white border-[#c4d835]/55 hover:border-[#c4d835] hover:bg-[#253A99] hover:-translate-y-0.5 active:scale-[0.98] cursor-pointer'
                     : isBooked
                     ? 'bg-[#0C1438]/65 text-slate-300/65 border-white/10 opacity-55 cursor-not-allowed'
                     : 'bg-[#09102E]/55 text-slate-400/60 border-white/5 opacity-45 cursor-not-allowed'
@@ -198,11 +192,11 @@ export function TimeSlotGrid({
                     </>
                   )}
                 </div>
-              </motion.button>
+              </button>
             );
           })}
         </div>
       )}
-    </motion.section>
+    </section>
   );
 }

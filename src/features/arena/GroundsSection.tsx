@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { motion } from 'motion/react';
 import { ArrowRight, Check, MapPin } from 'lucide-react';
 import { LOCATION } from '@/src/config/brand';
 import { COURT_VIEWS, PRICING_TIERS, SINGLE_COURT } from '@/src/config/venue';
@@ -55,18 +54,13 @@ export function GroundsSection({ onBookNow }: GroundsSectionProps) {
         </div>
 
         <div className="mt-10 grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
-          <motion.div
-            key={activeView.id}
-            initial={{ opacity: 0.7 }}
-            animate={{ opacity: 1 }}
-            transition={{ duration: 0.25 }}
-            className="lg:col-span-7 relative min-h-[300px] sm:min-h-[380px] rounded-xl overflow-hidden border border-white/10 bg-[#070A14]"
-          >
+          <div className="lg:col-span-7 relative min-h-[300px] sm:min-h-[380px] rounded-xl overflow-hidden border border-white/10 bg-[#070A14]">
             {!imgErrorMap[activeView.id] ? (
               <img
                 src={activeView.image}
                 alt={activeView.imageAlt}
                 loading="lazy"
+                decoding="async"
                 referrerPolicy="no-referrer"
                 onError={() =>
                   setImgErrorMap((prev) => ({ ...prev, [activeView.id]: true }))
@@ -100,7 +94,7 @@ export function GroundsSection({ onBookNow }: GroundsSectionProps) {
                 <span>{LOCATION.district}, Karachi</span>
               </div>
             </div>
-          </motion.div>
+          </div>
 
           <div className="lg:col-span-5 rounded-xl border border-white/10 bg-[#0E1428] p-6 sm:p-8 flex flex-col justify-between space-y-6">
             <div className="space-y-5">

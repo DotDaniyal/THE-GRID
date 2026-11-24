@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
 import { ChevronLeft, ChevronRight, CalendarDays } from 'lucide-react';
 import { addDaysToIsoDate, formatReadableDate } from '@/src/utils/date';
 
@@ -160,15 +159,7 @@ export function BookingDateCalendar({
         ))}
       </div>
 
-      <AnimatePresence mode="wait" initial={false}>
-        <motion.div
-          key={`${viewYear}-${viewMonth}`}
-          initial={{ opacity: 0, y: 4 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -4 }}
-          transition={{ duration: 0.16 }}
-          className="mt-1.5 grid grid-cols-7 gap-1.5"
-        >
+      <div className="mt-1.5 grid grid-cols-7 gap-1.5">
           {calendarCells.map((cell, idx) => {
             if (!cell.iso || cell.day === null) {
               return <div key={`empty-${idx}`} className="h-11 sm:h-12" />;
@@ -208,8 +199,7 @@ export function BookingDateCalendar({
               </button>
             );
           })}
-        </motion.div>
-      </AnimatePresence>
+      </div>
     </div>
   );
 }

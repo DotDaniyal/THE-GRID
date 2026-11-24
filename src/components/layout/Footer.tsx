@@ -23,12 +23,19 @@ export function Footer({ onBookNow, onNavigateAdmin }: FooterProps) {
           <div className="grid grid-cols-1 md:grid-cols-12 gap-10 pb-12 border-b border-white/10">
             <div className="md:col-span-5 space-y-4">
               <div className="flex items-center gap-3.5">
-                <img
-                  src={BRAND.logoUrl}
-                  alt="THE GRID Official Logo"
-                  className="w-12 h-12 rounded-lg object-contain border border-white/10"
-                  referrerPolicy="no-referrer"
-                />
+                <picture>
+                  <source srcSet={BRAND.logoWebpUrl} type="image/webp" />
+                  <img
+                    src={BRAND.logoUrl}
+                    alt="THE GRID Official Logo"
+                    width={48}
+                    height={48}
+                    loading="lazy"
+                    decoding="async"
+                    className="w-12 h-12 rounded-lg object-contain border border-white/10"
+                    referrerPolicy="no-referrer"
+                  />
+                </picture>
                 <div>
                   <div className="font-display text-2xl font-extrabold uppercase tracking-wider text-white">
                     {BRAND.name}

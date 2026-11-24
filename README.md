@@ -4,44 +4,47 @@ Official web platform and live hourly court booking system for **THE GRID by FC 
 
 ## Tech Stack
 
-- **Frontend**: React 19, TypeScript, Vite 8, Tailwind CSS v4, Lucide React, Motion (`motion/react`)
-- **Backend**: Express 4, Node.js `v22+` native TypeScript (`node server.ts`), `node:sqlite` (`DatabaseSync` in WAL mode)
+- **Frontend**: React 19, TypeScript, Vite 8 (route-level code splitting), Tailwind CSS v4, Lucide React
+- **Backend**: Express 4, Node.js `v22+` native TypeScript (`node server.ts`), `node:sqlite` (`DatabaseSync` in WAL mode), SSE live slot updates
+- **Security**: Argon2 password hashing (`argon2`), HTTP-only session cookies + Bearer tokens, TOTP MFA (`totp.ts`), `express-session`, `express-rate-limit`
 - **Testing**: Node built-in `node:test` runner executed via `tsx`
 
 ## Project Architecture
 
 ```text
 /
-├── index.html                          # SEO metadata, OpenGraph, SportsActivityLocation JSON-LD
-├── server.ts                           # Express entry point, security headers, API routers, Vite/SPA hosting
+├── index.html                          # SEO metadata, OpenGraph, preloaded hero WebP, JSON-LD
+├── server.ts                           # Express entry point, pending-hold sweeper, Vite/SPA hosting
+├── api/index.ts                        # Vercel serverless Express handler wrapper
 ├── package.json                        # Scripts: dev, start, build, lint, test
 ├── public/
-│   ├── brand/                          # Authentic THE GRID emblem and favicon
-│   ├── gallery/                        # Verified arena & matchday photography
+│   ├── brand/                          # Authentic THE GRID WebP & PNG emblem and favicon
+│   ├── gallery/                        # Optimized arena & matchday photography (WebP & JPEG)
 │   ├── robots.txt
 │   └── sitemap.xml
 ├── src/
 │   ├── main.tsx                        # React mount point
 │   ├── app/
-│   │   ├── App.tsx                     # Root router state & dynamic document meta sync
+│   │   ├── App.tsx                     # Root router state, lazy route splitting & meta sync
 │   │   └── routes.ts                   # Route definitions and SEO metadata lookup
 │   ├── config/
 │   │   ├── brand.ts                    # Official branding, WhatsApp, social links, location & legal copy
 │   │   └── venue.ts                    # Single-court specs, view switcher, pricing tiers, gallery & academy
 │   ├── types/
-│   │   ├── booking.ts                  # Shared booking, slot, admin & operating hour contracts
+│   │   ├── booking.ts                  # Shared booking, slot, admin, drinks & operating hour contracts
 │   │   └── venue.ts                    # Venue, court view, pricing & academy interfaces
 │   ├── utils/
 │   │   ├── date.ts                     # Asia/Karachi ISO date helpers
 │   │   └── validation.ts               # Customer & inquiry form validation rules
 │   ├── hooks/
 │   │   ├── useBookingSelection.ts      # Session storage persistence for selected slot across checkout
-│   │   └── useSlotAvailability.ts      # Real-time slot fetcher with AbortController cancellation
+│   │   ├── useSlotAvailability.ts      # Real-time slot fetcher with AbortController cancellation
+│   │   └── useSlotStream.ts            # EventSource SSE live slot synchronization hook
 │   ├── services/
 │   │   ├── api/
 │   │   │   ├── client.ts               # Typed JSON fetch helper
 │   │   │   ├── bookingsApi.ts          # Public slot availability & booking submission endpoints
-│   │   │   └── adminApi.ts             # Admin auth, dashboard data, status & schedule endpoints
+│   │   │   └── adminApi.ts             # Admin auth, dashboard data, bookings, schedule & drinks endpoints
 │   │   └── integrations/
 │   │       └── whatsapp.ts             # Pre-filled WhatsApp click-to-chat request & inquiry builders
 │   ├── components/
@@ -50,31 +53,35 @@ Official web platform and live hourly court booking system for **THE GRID by FC 
 │   │   ├── layout/Footer.tsx           # Footer navigation & legal modal trigger
 │   │   └── modals/LegalModal.tsx       # Privacy Policy & Terms modal
 │   ├── features/
-│   │   ├── arena/                      # Homepage sections & interactive physics football canvas
+│   │   ├── arena/                      # Lightweight homepage arena showcase, gallery & location sections
 │   │   ├── booking/                    # Page 02 calendar, slot grid, summary & Page 03 confirmation cards
-│   │   └── admin/                      # Admin login/setup, request management & pricing schedule editor
+│   │   └── admin/                      # Admin login/setup, bookings, schedule, security & private drinks P&L
 │   ├── pages/
-│   │   ├── HomePage.tsx                # Page 01: Arena showcase
-│   │   ├── BookingSlotPage.tsx         # Page 02: Date & hourly slot selection
-│   │   ├── BookingDetailsPage.tsx      # Page 03: Customer details, split calculator & confirmation
-│   │   └── AdminPage.tsx               # Protected admin booking & schedule desk
+│   │   ├── HomePage.tsx                # Page 01: Arena showcase (eagerly loaded)
+│   │   ├── BookingSlotPage.tsx         # Page 02: Date & hourly slot selection (lazy-loaded)
+│   │   ├── BookingDetailsPage.tsx      # Page 03: Customer details, split calculator & confirmation (lazy-loaded)
+│   │   └── AdminPage.tsx               # Protected admin booking, schedule & drinks inventory desk (lazy-loaded)
 │   ├── styles/index.css                # Tailwind v4 imports & base typography
 │   └── server/
+│       ├── app.ts                      # Express API app factory, security middleware & session config
 │       ├── config/constants.ts         # Single-court identity, port & runtime environment flags
 │       ├── db/sqlite.ts                # SQLite schema initialization & default hourly tier seeding
+│       ├── events/bookingEvents.ts     # In-process SSE broadcaster for real-time slot updates
 │       ├── middleware/
-│       │   ├── auth.ts                 # scrypt password verification & HMAC-SHA256 Bearer sessions
-│       │   ├── rateLimit.ts            # IP rate limiters for public booking & admin login routes
+│       │   ├── auth.ts                 # Argon2 verification, session tokens & TOTP MFA verification
+│       │   ├── rateLimit.ts            # IP rate limiters & progressive lockouts
 │       │   └── securityHeaders.ts      # Defensive HTTP response headers
 │       ├── routes/
-│       │   ├── publicBookingRoutes.ts  # /api/health, /api/slots, /api/bookings
-│       │   └── adminRoutes.ts          # /api/admin/* endpoints
+│       │   ├── publicBookingRoutes.ts  # /api/health, /api/slots, /api/slots/stream, /api/bookings
+│       │   └── adminRoutes.ts          # /api/admin/* endpoints (bookings, hours, accounts, MFA, drinks)
 │       ├── services/
 │       │   ├── bookingService.ts       # Single-court slot queries & transactional booking insertion
-│       │   └── adminService.ts         # Admin queries, status conflict validation & hours management
+│       │   ├── adminService.ts         # Admin queries, status conflict validation & hours management
+│       │   └── drinkService.ts         # Private admin drinks inventory, sales & P&L analytics service
 │       └── utils/
 │           ├── phone.ts                # Pakistani (+92) and international phone normalization
-│           └── time.ts                 # Pakistan Standard Time (Asia/Karachi) slot cutoff checks
+│           ├── time.ts                 # Pakistan Standard Time (Asia/Karachi) slot cutoff checks
+│           └── totp.ts                 # RFC 6238 TOTP authenticator helper
 └── tests/
     ├── unit/bookingDomain.test.ts      # Domain unit tests (dates, PKT cutoffs, phone, auth, WhatsApp)
     └── integration/apiBookingFlow.test.ts # Live HTTP API & SQLite conflict protection tests
@@ -94,7 +101,7 @@ Configure secrets via environment variables or hosting secrets panel (see `/.env
 
 - `PORT` (optional, defaults to `3000`)
 - `ADMIN_PASSCODE` (recommended preset passcode for `/admin` across Vercel / serverless deployments; if omitted on persistent Node servers, first visit prompts one-time setup)
-- `SESSION_SECRET` (recommended 16+ characters in production for admin Bearer token signing)
+- `SESSION_SECRET` (recommended 16+ characters in production for admin session signing)
 - `SQLITE_DB_PATH` (optional custom writable path; defaults to `./data/thegrid.db`, automatically falling back to `/tmp/thegrid-data/thegrid.db` on Vercel)
 - `NODE_ENV` (`development` or `production`)
 
@@ -107,6 +114,7 @@ Configure secrets via environment variables or hosting secrets panel (see `/.env
 ## Single-Court Booking & Operations
 
 1. **Single Court Enforcement**: SQLite enforces `court_number = 1` (`THE GRID - Main Futsal Court`) with a partial unique index `idx_active_court_slot` over `(court_number, booking_date, start_time) WHERE status IN ('PENDING', 'CONFIRMED')`.
-2. **Pakistan Standard Time (`Asia/Karachi`)**: All hourly slots, calendar defaults, and expired-slot checks execute explicitly in `Asia/Karachi`.
-3. **WhatsApp Handoff**: After saving a `PENDING` booking request in SQLite, customers review a pre-filled WhatsApp summary and confirm delivery directly in WhatsApp (`+92 323 8148153`).
-4. **Admin Desk (`/admin`)**: Authenticated via Bearer HMAC token stored solely in React state memory. Supports approving/rejecting/canceling requests, marking notifications read, and editing hourly PKR rates.
+2. **Real-Time Synchronization**: Public booking views subscribe to `GET /api/slots/stream` (Server-Sent Events) alongside immediate central SQLite validation.
+3. **Pakistan Standard Time (`Asia/Karachi`)**: All hourly slots, calendar defaults, and expired-slot checks execute explicitly in `Asia/Karachi`.
+4. **WhatsApp Handoff**: After saving a `PENDING` booking request in SQLite, customers review a pre-filled WhatsApp summary and confirm delivery directly in WhatsApp (`+92 323 8148153`).
+5. **Admin Desk (`/admin`)**: Protected via Argon2 + HTTP-only session cookie / Bearer auth with optional TOTP MFA. Supports booking confirmations, notifications, operating hours/PKR rates, and private Drinks & Inventory sales/P&L tracking.

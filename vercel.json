@@ -13,7 +13,7 @@
       "destination": "/api/index.ts"
     },
     {
-      "source": "/((?!api/|assets/|brand/|gallery/|src/assets/|robots\\.txt|sitemap\\.xml).*)",
+      "source": "/((?!api/|assets/|brand/|gallery/|robots\\.txt|sitemap\\.xml).*)",
       "destination": "/index.html"
     }
   ]

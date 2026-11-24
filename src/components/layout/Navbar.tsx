@@ -7,16 +7,12 @@ interface NavbarProps {
   currentPath: AppRoute;
   onNavigate: (path: AppRoute, hash?: string) => void;
   onBookNow: () => void;
-  visible?: boolean;
-  onFocusReveal?: () => void;
 }
 
 export function Navbar({
   currentPath,
   onNavigate,
   onBookNow,
-  visible = true,
-  onFocusReveal,
 }: NavbarProps) {
   const [scrolled, setScrolled] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -47,10 +43,7 @@ export function Navbar({
 
   return (
     <header
-      onFocusCapture={onFocusReveal}
-      className={`fixed top-0 inset-x-0 z-40 transition-all duration-300 motion-reduce:transition-none focus-within:opacity-100 focus-within:translate-y-0 focus-within:pointer-events-auto ${
-        visible ? 'opacity-100 translate-y-0' : 'opacity-0 -translate-y-4 pointer-events-none'
-      } ${
+      className={`fixed top-0 inset-x-0 z-40 transition-colors duration-200 ${
         scrolled || isBookingRoute || currentPath === '/admin'
           ? 'bg-[#0C153B]/95 border-b border-[#c4d835]/20'
           : 'bg-gradient-to-b from-[#070A14]/85 to-transparent border-b border-transparent'

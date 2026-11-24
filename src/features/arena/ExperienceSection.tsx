@@ -66,11 +66,12 @@ export function ExperienceSection() {
                     src={item.src}
                     alt={item.alt}
                     loading="lazy"
+                    decoding="async"
                     referrerPolicy="no-referrer"
                     onError={() =>
                       setImgErrors((prev) => ({ ...prev, [item.id]: true }))
                     }
-                    className="w-full h-full object-cover object-center transition-transform duration-500 group-hover:scale-[1.04]"
+                    className="w-full h-full object-cover object-center"
                   />
                 ) : (
                   <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-[#131B3A] to-[#070A14] p-6">
@@ -163,6 +164,7 @@ export function ExperienceSection() {
               <img
                 src={activeItem.src}
                 alt={activeItem.alt}
+                decoding="async"
                 referrerPolicy="no-referrer"
                 className="w-full h-full object-contain"
               />

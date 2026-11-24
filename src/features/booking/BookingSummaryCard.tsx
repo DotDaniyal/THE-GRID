@@ -1,4 +1,3 @@
-import { motion } from 'motion/react';
 import { ArrowRight } from 'lucide-react';
 import { LOCATION, PAYMENT_INFO } from '@/src/config/brand';
 import { SINGLE_COURT } from '@/src/config/venue';
@@ -17,12 +16,7 @@ export function BookingSummaryCard({
   onContinue,
 }: BookingSummaryCardProps) {
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.45, delay: 0.14 }}
-      className="rounded-xl border border-[#c4d835]/35 bg-[#121D52]/95 p-6 space-y-6 shadow-[0_20px_50px_rgba(4,8,24,0.5)]"
-    >
+    <div className="rounded-xl border border-[#c4d835]/35 bg-[#121D52]/95 p-6 space-y-6 shadow-[0_20px_50px_rgba(4,8,24,0.5)]">
       <div className="pb-4 border-b border-white/10">
         <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#c4d835]">
           Booking Summary
@@ -81,6 +75,6 @@ export function BookingSummaryCard({
         {PAYMENT_INFO.advancePercent}% advance payment confirmation applies via{' '}
         {PAYMENT_INFO.bankName} after submitting your booking request.
       </p>
-    </motion.div>
+    </div>
   );
 }

@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react';
-import { motion } from 'motion/react';
 import { AlertCircle, MapPin } from 'lucide-react';
 import { LOCATION } from '@/src/config/brand';
 import { SINGLE_COURT } from '@/src/config/venue';
@@ -83,6 +82,7 @@ export function BookingSlotPage({
         <img
           src="/gallery/turf.jpeg"
           alt=""
+          decoding="async"
           className="w-full h-full object-cover object-center opacity-30"
           referrerPolicy="no-referrer"
         />
@@ -90,12 +90,7 @@ export function BookingSlotPage({
       </div>
 
       <div className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <motion.div
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-          className="pb-8 border-b border-[#c4d835]/20 flex flex-col md:flex-row md:items-end justify-between gap-4"
-        >
+        <div className="pb-8 border-b border-[#c4d835]/20 flex flex-col md:flex-row md:items-end justify-between gap-4">
           <div>
             <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#c4d835]">
               Page 02 · Court Reservation
@@ -122,16 +117,11 @@ export function BookingSlotPage({
             </span>
             <span className="text-slate-400">02. Booking Details</span>
           </div>
-        </motion.div>
+        </div>
 
         <div className="mt-8 grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
           <div className="lg:col-span-8 space-y-8">
-            <motion.section
-              aria-labelledby="step-date-heading"
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.45, delay: 0.05 }}
-            >
+            <section aria-labelledby="step-date-heading">
               <div className="mb-3 flex items-center justify-between gap-4">
                 <h2
                   id="step-date-heading"
@@ -146,7 +136,7 @@ export function BookingSlotPage({
                 karachiToday={karachiToday}
                 onSelectDate={handleDateChange}
               />
-            </motion.section>
+            </section>
 
             {slotNotice && (
               <div

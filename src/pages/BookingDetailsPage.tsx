@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { motion } from 'motion/react';
 import { AlertCircle, ArrowLeft, CheckCircle2, Clock, Lock, ShieldCheck, User, Users } from 'lucide-react';
 import { LegalModal, type LegalDocType } from '@/src/components/modals/LegalModal';
 import { CONTACT, PAYMENT_INFO } from '@/src/config/brand';
@@ -272,6 +271,7 @@ export function BookingDetailsPage({
         <img
           src="/gallery/turf.jpeg"
           alt=""
+          decoding="async"
           className="w-full h-full object-cover object-center opacity-30"
           referrerPolicy="no-referrer"
         />
@@ -279,12 +279,7 @@ export function BookingDetailsPage({
       </div>
 
       <div className="relative z-10 max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 space-y-6">
-        <motion.div
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.4 }}
-          className="pb-6 border-b border-[#c4d835]/20 flex flex-col sm:flex-row sm:items-end justify-between gap-4"
-        >
+        <div className="pb-6 border-b border-[#c4d835]/20 flex flex-col sm:flex-row sm:items-end justify-between gap-4">
           <div>
             <button
               type="button"
@@ -309,14 +304,11 @@ export function BookingDetailsPage({
             </span>
             <span className="text-[#c4d835]">02. Booking Details</span>
           </div>
-        </motion.div>
+        </div>
 
         {/* Slot & Amount Summary */}
-        <motion.section
+        <section
           aria-label="Selected booking summary"
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.4, delay: 0.05 }}
           className="rounded-xl border border-[#c4d835]/35 bg-[#16235C]/92 p-5 sm:p-6 grid grid-cols-2 md:grid-cols-4 gap-4"
         >
           <div>
@@ -343,14 +335,11 @@ export function BookingDetailsPage({
               PKR {totalPkr.toLocaleString()}
             </div>
           </div>
-        </motion.section>
+        </section>
 
         {/* Payment, Temporary Hold & Confirmation Clarity */}
-        <motion.section
+        <section
           aria-labelledby="payment-clarity-heading"
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.4, delay: 0.08 }}
           className="rounded-xl border border-[#c4d835]/35 bg-[#121D52]/95 p-5 sm:p-6 space-y-5"
         >
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-white/10">
@@ -449,15 +438,12 @@ export function BookingDetailsPage({
               </ol>
             </div>
           </div>
-        </motion.section>
+        </section>
 
-        <motion.form
+        <form
           onSubmit={handleSubmit}
           onKeyDown={handleFormKeyDown}
           noValidate
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.45, delay: 0.1 }}
           className="rounded-xl border border-[#c4d835]/30 bg-[#16235C]/92 p-6 sm:p-8 space-y-6"
         >
           <h2 className="font-display text-2xl font-bold uppercase text-[#c4d835]">
@@ -784,7 +770,7 @@ export function BookingDetailsPage({
                 : 'Ready to submit your booking request. Submitting places a 30-minute hold awaiting 50% advance payment verification.'}
             </p>
           </div>
-        </motion.form>
+        </form>
       </div>
 
       <LegalModal

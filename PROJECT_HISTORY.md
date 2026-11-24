@@ -206,3 +206,21 @@ Resolved root causes preventing intro animations, `/booking` calendar/slots, and
   - Fixed `overflow-x-clip` on `BookingSlotPage.tsx` so sticky `BookingSummaryCard` sticks on desktop, guarded against expired `sessionStorage` booking dates, added `initial={false}` + month sync on `BookingDateCalendar.tsx`, used `formatToParts` in `src/utils/date.ts`, added readable dark `<option>` styling, and fixed Schema.org image URLs in `index.html`.
 - **Verification Results**:
   - `npm test` (6/6 unit tests), `esbuild api/index.ts` bundle check, `VERCEL=1` serverless handler simulation, `tests/integration/apiBookingFlow.test.ts` (4/4 live API tests), and headless Chromium CDP E2E tests (`NODE_ENV=production` across desktop `1440x900` & mobile `390x844`) all passed with zero console or network errors.
+
+---
+
+## 24. Website Cleanup, Intro Removal & Performance Optimization (2026-11-23)
+Performed a full codebase, asset, animation, and dependency cleanup while preserving all booking, SSE real-time synchronization, admin security, and private drinks inventory functionality:
+- **Removed Unnecessary 3D Intro & Heavy Assets**:
+  - Deleted `/src/features/arena/intro3d/` (`CinematicStadiumIntro.tsx`, `introAudio.ts`, `logoReveal3d.ts`, `playerAndBallBuilder.ts`, `proceduralTextures.ts`, `stadiumBuilder.ts`) including procedural Three.js scene geometry and Web Audio synth intro sequences.
+  - Deleted unused `/public/assets/aistudio/` stray PNG uploads, empty `/workspace/` and `/src/assets/` directories, and duplicate `/src/assets/images/hero_futsal_arena_1795364505927.jpg` (replaced by a single preloaded WebP hero backdrop `/public/gallery/hero-arena.webp`).
+- **Removed Unnecessary Libraries & Motion Wrappers**:
+  - Removed `three`, `@types/three`, `motion`, `@google/genai`, `bcryptjs`, `@types/bcryptjs`, and `autoprefixer` from `/package.json`.
+  - Removed `MotionConfig`, `motion`, `AnimatePresence`, intro delay locks (`thegrid_intro_seen`), `Replay 3D Stadium Intro` trigger, image scale zoom effects, and loading pulse animations across `App.tsx`, `HeroSection.tsx`, `Navbar.tsx`, `ExploreSection.tsx`, `GroundsSection.tsx`, `ExperienceSection.tsx`, `BookingDateCalendar.tsx`, `TimeSlotGrid.tsx`, `BookingSummaryCard.tsx`, `BookingConfirmationCard.tsx`, `BookingSlotPage.tsx`, and `BookingDetailsPage.tsx`.
+- **Route Code-Splitting & Asset Optimization**:
+  - Added `React.lazy()` + `<Suspense>` code-splitting for `/booking`, `/booking/details`, and `/admin` in `src/app/App.tsx` while keeping `HomePage` eagerly loaded for instant `/` paint.
+  - Converted and compressed authentic images with ImageMagick (`public/gallery/*` reduced from ~3.5 MB total including hero source down to `874K`, including `DSC04684.jpg` `2.2 MB -> 185 KB`, `hero-arena.webp` `709 KB -> 78 KB`, and `/public/brand/thegrid-logo.webp` `6.7 KB` via `<picture>` fallback).
+  - Preloaded `/gallery/hero-arena.webp` and `/brand/thegrid-logo.webp` in `/index.html`, modernized `/vite.config.ts` with `import.meta.dirname`, and removed obsolete `/src/assets/` rules from `vite.config.ts` and `vercel.json`.
+- **Verified Outcomes**:
+  - Vite initial entry JavaScript dropped from `1,543.96 kB` (`398.10 kB` gzip, `2,112` modules) to `492.45 kB` (`140.41 kB` gzip, `1,698` modules) with zero chunk-size warnings and lazy chunks for `/booking`, `/booking/details`, and `/admin`.
+

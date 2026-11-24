@@ -76,7 +76,10 @@ export function ExploreSection() {
                 <img
                   src="/gallery/main-court.jpeg"
                   alt="THE GRID Main Court two-tone striped turf and stepped bleachers in Malir Cantonment, Karachi"
+                  width={817}
+                  height={433}
                   loading="lazy"
+                  decoding="async"
                   referrerPolicy="no-referrer"
                   onError={() => setImgError(true)}
                   className="w-full h-full lg:h-full object-cover object-center"
