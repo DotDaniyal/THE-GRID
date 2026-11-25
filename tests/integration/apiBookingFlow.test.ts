@@ -5,8 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { after, before } from 'node:test';
 
-const TEMP_DB_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'thegrid-int-'));
-process.env.SQLITE_DB_PATH = path.join(TEMP_DB_DIR, 'integration.sqlite');
+const TEMP_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'thegrid-int-json-'));
+process.env.JSON_DATA_DIR = TEMP_DATA_DIR;
 delete process.env.ADMIN_PASSCODE;
 
 const { createApiApp } = await import('../../src/server/app.ts');
@@ -36,7 +36,7 @@ after(async () => {
     server?.close(() => resolve());
   });
   try {
-    fs.rmSync(TEMP_DB_DIR, { recursive: true, force: true });
+    fs.rmSync(TEMP_DATA_DIR, { recursive: true, force: true });
   } catch {
     // Ignore cleanup errors on exit
   }
@@ -715,3 +715,371 @@ test('Centralized real-time sync, concurrent double-booking protection, admin co
   }
 });
 
+test('Vercel Blob multi-container JSON persistence, ETag concurrency protection, and ADMIN_PASSCODE auth work across separate Lambda instances', async () => {
+  const { spawn } = await import('node:child_process');
+
+  const runScriptAsync = (script: string): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        ['--import', 'tsx', '--input-type=module', '-e', script],
+        { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d.toString()));
+      child.stderr.on('data', (d) => (stderr += d.toString()));
+      child.on('close', (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`Child process failed (code ${code}):\n${stderr}\n${stdout}`));
+      });
+    });
+  };
+
+  // Spin up an in-memory HTTP emulator implementing Vercel Blob REST GET/PUT + x-if-match ETag CAS
+  const blobs = new Map<string, { body: string; etag: string; contentType: string }>();
+  let etagSeq = 1;
+
+  const blobServer = http.createServer((req, res) => {
+    const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
+
+    if (req.method === 'PUT') {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(Buffer.from(c)));
+      req.on('end', () => {
+        const pathname = reqUrl.searchParams.get('pathname') || reqUrl.pathname.replace(/^\/+/, '');
+        const allowOverwrite = req.headers['x-allow-overwrite'] === '1';
+        const ifMatch = typeof req.headers['x-if-match'] === 'string' ? req.headers['x-if-match'] : '';
+        const existing = blobs.get(pathname);
+
+        if (existing && !allowOverwrite) {
+          res.statusCode = 409;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: { code: 'precondition_failed', message: 'Blob already exists' } }));
+          return;
+        }
+        if (ifMatch && (!existing || existing.etag !== ifMatch)) {
+          res.statusCode = 412;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: { code: 'precondition_failed', message: 'ETag mismatch' } }));
+          return;
+        }
+
+        const bodyStr = Buffer.concat(chunks).toString('utf8');
+        const nextEtag = `"etag-${etagSeq++}"`;
+        const contentType = String(req.headers['content-type'] || 'application/json');
+        blobs.set(pathname, { body: bodyStr, etag: nextEtag, contentType });
+
+        const origin = `http://${req.headers.host}`;
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            url: `${origin}/${pathname}`,
+            downloadUrl: `${origin}/${pathname}?download=1`,
+            pathname,
+            contentType,
+            contentDisposition: 'inline',
+            etag: nextEtag,
+          })
+        );
+      });
+      return;
+    }
+
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      const pathname = reqUrl.pathname.replace(/^\/+/, '');
+      const entry = blobs.get(pathname);
+      if (!entry) {
+        res.statusCode = 404;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: { code: 'not_found', message: 'Not found' } }));
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader('Content-Type', entry.contentType);
+      res.setHeader('ETag', entry.etag);
+      res.setHeader('Content-Length', String(Buffer.byteLength(entry.body)));
+      if (req.method === 'HEAD') {
+        res.end();
+      } else {
+        res.end(entry.body);
+      }
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => blobServer.listen(0, '127.0.0.1', resolve));
+  const blobPort = (blobServer.address() as { port: number }).port;
+  const blobApiUrl = `http://127.0.0.1:${blobPort}`;
+  const blobToken = 'vercel_blob_rw_teststore12345_secret';
+
+  try {
+    // Boot Container A & Container B as two separate Node processes sharing ONLY the external Blob store
+    const spawnContainerScript = `
+      import assert from 'node:assert/strict';
+      process.env.VERCEL = '1';
+      process.env.BLOB_READ_WRITE_TOKEN = ${JSON.stringify(blobToken)};
+      process.env.VERCEL_BLOB_API_URL = ${JSON.stringify(blobApiUrl)};
+      process.env.ADMIN_PASSCODE = 'VercelGridSecret2026!';
+      delete process.env.SESSION_SECRET;
+      delete process.env.JSON_DATA_DIR;
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+
+      // Health confirms Vercel Blob driver is active and persistent
+      const healthRes = await fetch(url + '/api/health');
+      const health = await healthRes.json();
+      assert.equal(health.storage.mode, 'vercel_blob');
+      assert.equal(health.storage.persistent, true);
+
+      // Login on Container A
+      const loginRes = await fetch(url + '/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+        body: JSON.stringify({ username: 'admin', password: 'VercelGridSecret2026!' }),
+      });
+      assert.equal(loginRes.status, 200);
+      const cookie = loginRes.headers.get('set-cookie').split(';')[0];
+
+      // Add a drink on Container A
+      const drinkRes = await fetch(url + '/api/admin/drinks', {
+        method: 'POST',
+        headers: {
+          Cookie: cookie,
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          name: 'Blob Mineral Water',
+          category: 'water',
+          pricePkr: 120,
+          openingStock: 10,
+        }),
+      });
+      assert.equal(drinkRes.status, 201);
+
+      // Fire 2 simultaneous bookings on Container A for the SAME slot -> exactly 1 succeeds (201), 1 fails (409)
+      const [b1, b2] = await Promise.all([
+        fetch(url + '/api/bookings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            customerName: 'Blob Race 1',
+            customerEmail: 'race1@thegrid.pk',
+            countryCode: '+92',
+            customerPhone: '03211111111',
+            bookingDate: '2027-07-20',
+            startTime: '20:00',
+            bookingType: 'individual',
+            additionalGuestsCount: 0,
+            policiesAccepted: true,
+          }),
+        }),
+        fetch(url + '/api/bookings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            customerName: 'Blob Race 2',
+            customerEmail: 'race2@thegrid.pk',
+            countryCode: '+92',
+            customerPhone: '03212222222',
+            bookingDate: '2027-07-20',
+            startTime: '20:00',
+            bookingType: 'individual',
+            additionalGuestsCount: 0,
+            policiesAccepted: true,
+          }),
+        }),
+      ]);
+      const statuses = [b1.status, b2.status].sort();
+      assert.deepEqual(statuses, [201, 409]);
+
+      // Print cookie so Container B (separate process) reads the exact Blob-persisted data
+      console.log('COOKIE:' + cookie);
+      srv.close();
+    `;
+
+    const outA = await runScriptAsync(spawnContainerScript);
+    const cookieLine = outA.split(/\r?\n/).find((l) => l.startsWith('COOKIE:'));
+    assert.ok(cookieLine, 'Expected cookie output from Container A');
+    const cookie = cookieLine.slice('COOKIE:'.length).trim();
+
+    const containerBScript = `
+      import assert from 'node:assert/strict';
+      process.env.VERCEL = '1';
+      process.env.BLOB_READ_WRITE_TOKEN = ${JSON.stringify(blobToken)};
+      process.env.VERCEL_BLOB_API_URL = ${JSON.stringify(blobApiUrl)};
+      process.env.ADMIN_PASSCODE = 'VercelGridSecret2026!';
+      delete process.env.SESSION_SECRET;
+      delete process.env.JSON_DATA_DIR;
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+      const cookie = ${JSON.stringify(cookie)};
+
+      // Container B sees the booking + drink created on Container A via Vercel Blob JSON!
+      const dashRes = await fetch(url + '/api/admin/bookings', { headers: { Cookie: cookie } });
+      assert.equal(dashRes.status, 200);
+      const dash = await dashRes.json();
+      assert.equal(dash.bookings.filter((b) => b.booking_date === '2027-07-20').length, 1);
+
+      const drinksRes = await fetch(url + '/api/admin/drinks', { headers: { Cookie: cookie } });
+      assert.equal(drinksRes.status, 200);
+      const drinks = await drinksRes.json();
+      assert.ok(drinks.drinks.some((d) => d.name === 'Blob Mineral Water'));
+
+      // Logout on Container B revokes session in external Blob JSON!
+      const logoutRes = await fetch(url + '/api/admin/logout', {
+        method: 'POST',
+        headers: { Cookie: cookie, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      assert.equal(logoutRes.status, 200);
+
+      const afterLogout = await fetch(url + '/api/admin/bookings', { headers: { Cookie: cookie } });
+      assert.equal(afterLogout.status, 401);
+      srv.close();
+    `;
+
+    await runScriptAsync(containerBScript);
+
+    // Verify private JSON files exist in Blob storage
+    assert.ok(blobs.has('thegrid/data/bookings.json'));
+    assert.ok(blobs.has('thegrid/data/customers.json'));
+    assert.ok(blobs.has('thegrid/data/products.json'));
+    assert.ok(blobs.has('thegrid/data/inventory.json'));
+    assert.ok(blobs.has('thegrid/data/settings.json'));
+    assert.ok(blobs.has('thegrid/data/admin-settings.json'));
+  } finally {
+    await new Promise<void>((resolve) => {
+      blobServer.closeAllConnections?.();
+      blobServer.close(() => resolve());
+    });
+  }
+});
+
+test('SQLite to Local JSON migration backs up existing DB, converts all records without loss, and derives customers.json', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const { migrateSqliteFileToLocalJson } = await import(
+    '../../src/server/db/migrateSqliteToJson.ts'
+  );
+
+  const migDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thegrid-mig-'));
+  const sqliteFile = path.join(migDir, 'legacy.sqlite');
+  const jsonDir = path.join(migDir, 'json-out');
+
+  try {
+    const db = new DatabaseSync(sqliteFile);
+    db.exec(`
+      CREATE TABLE operating_hours (start_time TEXT PRIMARY KEY, end_time TEXT, display_name TEXT, price_pkr INTEGER, is_active INTEGER);
+      CREATE TABLE bookings (id TEXT PRIMARY KEY, court_number INTEGER, venue_name TEXT, booking_date TEXT, start_time TEXT, end_time TEXT, duration_minutes INTEGER, booking_type TEXT, customer_name TEXT, customer_email TEXT, country_code TEXT, customer_phone TEXT, participants_json TEXT, additional_guests_count INTEGER, total_amount_pkr INTEGER, status TEXT, admin_notes TEXT, hold_expires_at TEXT, confirmed_at TEXT, confirmed_by TEXT, status_token TEXT, created_at TEXT, updated_at TEXT);
+      CREATE TABLE admin_notifications (id INTEGER PRIMARY KEY, booking_id TEXT, message TEXT, is_read INTEGER, created_at TEXT);
+      CREATE TABLE drinks (id INTEGER PRIMARY KEY, name TEXT, category TEXT, brand TEXT, bottle_size TEXT, purchase_price_pkr INTEGER, price_pkr INTEGER, opening_stock INTEGER, current_stock INTEGER, min_stock_alert INTEGER, description TEXT, image_url TEXT, is_available INTEGER, is_active INTEGER, created_by TEXT, updated_by TEXT, created_at TEXT, updated_at TEXT);
+      CREATE TABLE drink_stock_adjustments (id INTEGER PRIMARY KEY, drink_id INTEGER, adjustment_type TEXT, delta_qty INTEGER, previous_stock INTEGER, new_stock INTEGER, reason TEXT, created_by TEXT, created_at TEXT);
+      CREATE TABLE drink_sales (id INTEGER PRIMARY KEY, drink_id INTEGER, product_name TEXT, category TEXT, quantity INTEGER, unit_selling_price_pkr INTEGER, total_sale_pkr INTEGER, unit_purchase_price_pkr INTEGER, total_cost_pkr INTEGER, profit_pkr INTEGER, sold_at TEXT, sale_date TEXT, notes TEXT, status TEXT, created_by TEXT, updated_by TEXT, cancelled_by TEXT, cancel_reason TEXT, created_at TEXT, updated_at TEXT, cancelled_at TEXT);
+      CREATE TABLE drink_sale_audit_logs (id INTEGER PRIMARY KEY, sale_id INTEGER, action TEXT, summary TEXT, actor_username TEXT, created_at TEXT);
+      CREATE TABLE drink_expenses (id INTEGER PRIMARY KEY, title TEXT, amount_pkr INTEGER, expense_date TEXT, description TEXT, created_by TEXT, updated_by TEXT, created_at TEXT, updated_at TEXT);
+      CREATE TABLE admin_users (id INTEGER PRIMARY KEY, username TEXT, display_name TEXT, role TEXT, password_hash TEXT, mfa_enabled INTEGER, mfa_secret TEXT, is_active INTEGER, created_at TEXT, last_login_at TEXT);
+      CREATE TABLE admin_sessions (id TEXT PRIMARY KEY, admin_user_id INTEGER, username TEXT, display_name TEXT, role TEXT, expires_at INTEGER, created_at TEXT, revoked_at TEXT);
+      CREATE TABLE admin_login_attempts (attempt_key TEXT PRIMARY KEY, failed_count INTEGER, first_failed_at INTEGER, locked_until INTEGER, updated_at INTEGER);
+      CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT);
+    `);
+    db.prepare(
+      `INSERT INTO bookings VALUES ('GRD-MIG-1', 1, 'THE GRID - Main Futsal Court', '2026-12-01', '20:00', '21:00', 60, 'individual', 'Tariq Mahmood', 'tariq@example.com', '+92', '+92 300 5556677', NULL, 0, 4000, 'CONFIRMED', NULL, NULL, '2026-11-24T00:00:00.000Z', 'admin', 'tok', '2026-11-24T00:00:00.000Z', '2026-11-24T00:00:00.000Z')`
+    ).run();
+    db.prepare(
+      `INSERT INTO drinks VALUES (1, 'Aquafina 500ml', 'water', 'PepsiCo', '500ml', 40, 80, 24, 20, 5, NULL, NULL, 1, 1, 'admin', 'admin', '2026-11-24T00:00:00.000Z', '2026-11-24T00:00:00.000Z')`
+    ).run();
+    db.prepare(
+      `INSERT INTO drink_sales VALUES (1, 1, 'Aquafina 500ml', 'water', 4, 80, 320, 40, 160, 160, '2026-11-24T19:00', '2026-11-24', NULL, 'COMPLETED', 'admin', 'admin', NULL, NULL, '2026-11-24T19:00:00.000Z', '2026-11-24T19:00:00.000Z', NULL)`
+    ).run();
+    db.prepare(
+      `INSERT INTO drink_expenses VALUES (1, 'Chiller Ice', 500, '2026-11-24', NULL, 'admin', 'admin', '2026-11-24T12:00:00.000Z', '2026-11-24T12:00:00.000Z')`
+    ).run();
+    db.prepare(
+      `INSERT INTO admin_users VALUES (1, 'owner', 'Owner', 'SUPER_ADMIN', 'hash', 0, NULL, 1, '2026-11-24T00:00:00.000Z', NULL)`
+    ).run();
+    db.close();
+
+    const summary = await migrateSqliteFileToLocalJson({
+      sqlitePath: sqliteFile,
+      targetDataDir: jsonDir,
+    });
+
+    assert.equal(summary.migrated, true);
+    assert.ok(summary.backupPath && fs.existsSync(summary.backupPath));
+    assert.ok(fs.existsSync(sqliteFile), 'Original SQLite DB must not be deleted');
+    assert.equal(summary.counts.bookings, 1);
+    assert.equal(summary.counts.customers, 1);
+    assert.equal(summary.counts.products, 1);
+    assert.equal(summary.counts.sales, 1);
+    assert.equal(summary.counts.expenses, 1);
+    assert.equal(summary.counts.adminUsers, 1);
+
+    const migratedBookings = JSON.parse(
+      fs.readFileSync(path.join(jsonDir, 'bookings.json'), 'utf8')
+    );
+    assert.equal(migratedBookings.records[0].id, 'GRD-MIG-1');
+  } finally {
+    fs.rmSync(migDir, { recursive: true, force: true });
+  }
+});
+
+test('Vercel without persistent storage credentials rejects writes with 503 instead of losing data to /tmp', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const script = `
+    import assert from 'node:assert/strict';
+    process.env.VERCEL = '1';
+    delete process.env.BLOB_READ_WRITE_TOKEN;
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    delete process.env.KV_REST_API_URL;
+    delete process.env.KV_REST_API_TOKEN;
+    delete process.env.JSON_DATA_DIR;
+
+    const { createApiApp } = await import('./src/server/app.ts');
+    const app = createApiApp();
+    const srv = app.listen(0, '127.0.0.1');
+    await new Promise((r) => srv.once('listening', r));
+    const url = 'http://127.0.0.1:' + srv.address().port;
+
+    const health = await (await fetch(url + '/api/health')).json();
+    assert.equal(health.storage.mode, 'unconfigured_vercel');
+    assert.equal(health.storage.persistent, false);
+
+    const writeRes = await fetch(url + '/api/bookings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerName: 'Test Player',
+        customerEmail: 'test@thegrid.pk',
+        countryCode: '+92',
+        customerPhone: '03211234567',
+        bookingDate: '2027-09-01',
+        startTime: '20:00',
+        bookingType: 'individual',
+        additionalGuestsCount: 0,
+        policiesAccepted: true,
+      }),
+    });
+    assert.equal(writeRes.status, 503);
+    const errBody = await writeRes.json();
+    assert.match(errBody.error, /Persistent external JSON storage is not configured/i);
+    srv.close();
+  `;
+
+  execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+    cwd: process.cwd(),
+    stdio: 'pipe',
+  });
+});

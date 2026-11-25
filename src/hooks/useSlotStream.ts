@@ -39,12 +39,18 @@ export function useSlotStream({
 
     if (typeof window.EventSource === 'function') {
       es = new window.EventSource('/api/slots/stream');
+      let hadErrorDisconnect = false;
+
+      es.addEventListener('error', () => {
+        hadErrorDisconnect = true;
+      });
 
       es.addEventListener('connected', () => {
-        if (hasConnectedOnce) {
+        if (hasConnectedOnce && hadErrorDisconnect) {
           onWakeRef.current?.();
         }
         hasConnectedOnce = true;
+        hadErrorDisconnect = false;
       });
 
       const handleEvent = (raw: MessageEvent) => {

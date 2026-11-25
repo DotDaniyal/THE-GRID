@@ -224,3 +224,21 @@ Performed a full codebase, asset, animation, and dependency cleanup while preser
 - **Verified Outcomes**:
   - Vite initial entry JavaScript dropped from `1,543.96 kB` (`398.10 kB` gzip, `2,112` modules) to `492.45 kB` (`140.41 kB` gzip, `1,698` modules) with zero chunk-size warnings and lazy chunks for `/booking`, `/booking/details`, and `/admin`.
 
+---
+
+## 25. Vercel Production Admin Panel Authentication & Routing Fixes (2026-11-23)
+Diagnosed and fixed the technical root causes blocking `/admin` login and dashboard access in Vercel Serverless production (`https://thegridbyfc.vercel.app/admin`):
+- **Serverless Multi-Instance Session & Env Credential Fixes (`src/server/middleware/auth.ts`, `src/server/routes/adminRoutes.ts`)**:
+  - Restored `ADMIN_PASSCODE` (+ optional `ADMIN_USERNAME`, defaulting to `admin` / `admin@thegrid.pk`) constant-time verification alongside named `admin_users` Argon2 accounts so serverless deployments work reliably even before/across ephemeral `/tmp` container lifecycles.
+  - Updated `getSessionSecret()` to derive a deterministic HMAC-SHA256 signing key from `ADMIN_PASSCODE` whenever `SESSION_SECRET` is omitted, eliminating cross-container HMAC signature mismatches.
+  - Embedded verified session claims inside the signed session token and updated `verifyAdminSessionToken()` so `VERCEL === '1'` instances verify valid signed HTTP-only cookies/Bearer tokens across concurrent/recycled serverless containers instead of dropping sessions with `401 SESSION_EXPIRED`. Preserved strict DB revocation checks on single-node deployments and recorded logout tombstones cleanly.
+  - Added graceful Node `scrypt` fallback in `hashPassword`/`verifyPassword` if native `argon2` fails on a serverless runtime, and normalized multi-value `x-forwarded-host` proxy headers.
+- **Database, SSE & Unused Middleware Fixes (`src/server/app.ts`, `src/server/db/sqlite.ts`, `src/server/routes/publicBookingRoutes.ts`, `src/hooks/useSlotStream.ts`)**:
+  - Removed unused `express-session` (`MemoryStore` + hardcoded fallback secret) from `src/server/app.ts`.
+  - Updated `resolveDbPath()` in `src/server/db/sqlite.ts` to copy any pre-bundled read-only seed DB to `/tmp/thegrid-data/` on first Vercel cold start if absent.
+  - Added clean 7.5s SSE stream closure with `retry: 15000` on `VERCEL === '1'` in `publicBookingRoutes.ts` and prevented redundant fetch storms in `useSlotStream.ts`.
+- **Admin Subroute & Session Expiry UX Fixes (`src/app/routes.ts`, `src/pages/AdminPage.tsx`, `src/features/admin/AdminDrinksPanel.tsx`, `src/features/admin/AdminSecurityPanel.tsx`, `src/features/admin/AdminLoginCard.tsx`)**:
+  - Updated `parseRoute()` to recognize `/admin` and `/admin/*` (`/admin/hours`, `/admin/drinks`, `/admin/security`, `/admin/dashboard`, `/admin/login`) cleanly without falling back to `/` or producing 404s on refresh.
+  - Synced active sidebar tab with URL history and wired `401` `onSessionExpired` callbacks from `AdminDrinksPanel` and `AdminSecurityPanel` cleanly back to `AdminPage`.
+
+

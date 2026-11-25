@@ -6,18 +6,20 @@ import { createServer as createViteServer } from 'vite';
 import { createApiApp } from './src/server/app.ts';
 import { IS_PRODUCTION, SERVER_PORT } from './src/server/config/constants.ts';
 import { releaseExpiredPendingBookings } from './src/server/services/bookingService.ts';
+import { ensureStoreInitialized } from './src/server/storage/jsonStore.ts';
 
 async function startServer() {
+  await ensureStoreInitialized();
   const app = createApiApp();
 
   // Proactively release expired 30-minute pending holds every 30 seconds
-  releaseExpiredPendingBookings();
+  await releaseExpiredPendingBookings().catch((err) => {
+    console.error('Initial pending hold sweep error:', err);
+  });
   const holdSweepTimer = setInterval(() => {
-    try {
-      releaseExpiredPendingBookings();
-    } catch (err) {
+    void releaseExpiredPendingBookings().catch((err) => {
       console.error('Pending hold sweep error:', err);
-    }
+    });
   }, 30_000);
   holdSweepTimer.unref?.();
 

@@ -7,18 +7,21 @@ import {
   fetchAdminAccounts,
   verifyAdminMfa,
 } from '@/src/services/api/adminApi';
+import { ApiRequestError } from '@/src/services/api/client';
 import type { AdminAccountSummary } from '@/src/types/booking';
 
 interface AdminSecurityPanelProps {
   currentAccount: AdminAccountSummary;
   authMode: 'named_accounts' | 'legacy_passcode_fallback' | 'setup_required';
   onAccountUpdated: () => Promise<void>;
+  onSessionExpired?: () => void;
 }
 
 export function AdminSecurityPanel({
   currentAccount,
   authMode,
   onAccountUpdated,
+  onSessionExpired,
 }: AdminSecurityPanelProps) {
   const [accounts, setAccounts] = useState<AdminAccountSummary[]>([]);
   const [loadingAccounts, setLoadingAccounts] = useState(true);
@@ -49,6 +52,10 @@ export function AdminSecurityPanel({
       const list = await fetchAdminAccounts();
       setAccounts(list);
     } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        onSessionExpired?.();
+        return;
+      }
       setAccountsError(err instanceof Error ? err.message : 'Unable to load admin accounts.');
     } finally {
       setLoadingAccounts(false);
@@ -81,6 +88,10 @@ export function AdminSecurityPanel({
       );
       await onAccountUpdated();
     } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        onSessionExpired?.();
+        return;
+      }
       setCreateFeedback(err instanceof Error ? err.message : 'Unable to create administrator.');
     } finally {
       setCreatingAccount(false);
@@ -94,6 +105,10 @@ export function AdminSecurityPanel({
       const data = await enrollAdminMfa();
       setMfaEnrollment(data);
     } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        onSessionExpired?.();
+        return;
+      }
       setMfaFeedback(err instanceof Error ? err.message : 'Unable to start MFA enrollment.');
     } finally {
       setMfaBusy(false);
@@ -113,6 +128,10 @@ export function AdminSecurityPanel({
       await onAccountUpdated();
       await loadAccounts();
     } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        onSessionExpired?.();
+        return;
+      }
       setMfaFeedback(err instanceof Error ? err.message : 'Invalid authenticator code.');
     } finally {
       setMfaBusy(false);
@@ -131,6 +150,10 @@ export function AdminSecurityPanel({
       await onAccountUpdated();
       await loadAccounts();
     } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        onSessionExpired?.();
+        return;
+      }
       setMfaFeedback(err instanceof Error ? err.message : 'Unable to disable MFA.');
     } finally {
       setMfaBusy(false);

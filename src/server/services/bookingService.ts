@@ -1,17 +1,17 @@
 import crypto from 'node:crypto';
-import type { DatabaseSync } from 'node:sqlite';
 import {
   COURT_NUMBER,
   PENDING_HOLD_MINUTES,
   SLOT_DURATION_MINUTES,
   VENUE_NAME,
 } from '../config/constants.ts';
-import {
-  getDb,
-  type BookingRow,
-  type OperatingHourRow,
-} from '../db/sqlite.ts';
 import { emitSlotUpdate, type SlotSyncEvent } from '../events/bookingEvents.ts';
+import { readCollection, updateCollection, withSlotLock } from '../storage/jsonStore.ts';
+import type {
+  BookingRecord,
+  BookingsCollection,
+  OperatingHourRecord,
+} from '../storage/types.ts';
 import { normalizePhone } from '../utils/phone.ts';
 import {
   getKarachiNow,
@@ -89,76 +89,65 @@ export function generateBookingId(bookingDate: string): string {
   return `GRD-${compactDate}-${randomCode}`;
 }
 
+function isBookingHoldExpired(record: BookingRecord, nowIso: string, legacyCutoffIso: string): boolean {
+  if (record.status !== 'PENDING') return false;
+  if (record.hold_expires_at !== null) {
+    return record.hold_expires_at <= nowIso;
+  }
+  return record.created_at <= legacyCutoffIso;
+}
+
 /**
- * Releases expired PENDING holds so unconfirmed reservations do not block slots indefinitely.
- * Returns pending events to broadcast after transaction commit.
+ * Releases expired PENDING holds inside a BookingsCollection draft so unconfirmed
+ * reservations do not block slots indefinitely. Returns events to emit after commit.
  */
-export function collectExpiredPendingBookings(
-  db: DatabaseSync,
+export function applyExpiredPendingBookingsOnDraft(
+  bookingsCol: BookingsCollection,
   nowMs: number = Date.now()
 ): SlotSyncEvent[] {
   const nowIso = new Date(nowMs).toISOString();
   const legacyCutoffIso = new Date(nowMs - PENDING_HOLD_MINUTES * 60_000).toISOString();
+  const events: SlotSyncEvent[] = [];
 
-  const expiredRows = db
-    .prepare(
-      `SELECT id, booking_date, start_time
-       FROM bookings
-       WHERE status = 'PENDING'
-         AND (
-           (hold_expires_at IS NOT NULL AND hold_expires_at <= ?)
-           OR (hold_expires_at IS NULL AND created_at <= ?)
-         )`
-    )
-    .all(nowIso, legacyCutoffIso) as unknown as Array<{
-    id: string;
-    booking_date: string;
-    start_time: string;
-  }>;
+  for (const record of bookingsCol.records) {
+    if (isBookingHoldExpired(record, nowIso, legacyCutoffIso)) {
+      record.status = 'CANCELLED';
+      record.hold_expires_at = null;
+      record.admin_notes =
+        record.admin_notes ?? 'Auto-released after 30-minute hold expiry';
+      record.updated_at = nowIso;
 
-  if (expiredRows.length === 0) {
-    return [];
+      events.push({
+        type: 'slot_changed',
+        bookingDate: record.booking_date,
+        startTime: record.start_time,
+        bookingId: record.id,
+        bookingStatus: 'EXPIRED',
+        updatedAt: nowIso,
+      });
+    }
   }
 
-  db.prepare(
-    `UPDATE bookings
-     SET status = 'CANCELLED',
-         hold_expires_at = NULL,
-         admin_notes = COALESCE(admin_notes, 'Auto-released after 30-minute hold expiry'),
-         updated_at = ?
-     WHERE status = 'PENDING'
-       AND (
-         (hold_expires_at IS NOT NULL AND hold_expires_at <= ?)
-         OR (hold_expires_at IS NULL AND created_at <= ?)
-       )`
-  ).run(nowIso, nowIso, legacyCutoffIso);
-
-  return expiredRows.map((row) => ({
-    type: 'slot_changed',
-    bookingDate: row.booking_date,
-    startTime: row.start_time,
-    bookingId: row.id,
-    bookingStatus: 'EXPIRED',
-    updatedAt: nowIso,
-  }));
+  return events;
 }
 
-export function releaseExpiredPendingBookings(nowMs: number = Date.now()): number {
-  const db = getDb();
-  let events: SlotSyncEvent[] = [];
+export async function releaseExpiredPendingBookings(
+  nowMs: number = Date.now()
+): Promise<number> {
+  const nowIso = new Date(nowMs).toISOString();
+  const legacyCutoffIso = new Date(nowMs - PENDING_HOLD_MINUTES * 60_000).toISOString();
 
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    events = collectExpiredPendingBookings(db, nowMs);
-    db.exec('COMMIT;');
-  } catch (err) {
-    try {
-      db.exec('ROLLBACK;');
-    } catch {
-      // Ignore rollback if transaction is already closed
-    }
-    throw err;
+  const snapshot = await readCollection('bookings');
+  const hasExpired = snapshot.records.some((r) =>
+    isBookingHoldExpired(r, nowIso, legacyCutoffIso)
+  );
+  if (!hasExpired) {
+    return 0;
   }
+
+  const { result: events } = await updateCollection('bookings', (draft) =>
+    applyExpiredPendingBookingsOnDraft(draft, nowMs)
+  );
 
   for (const evt of events) {
     emitSlotUpdate(evt);
@@ -166,8 +155,10 @@ export function releaseExpiredPendingBookings(nowMs: number = Date.now()): numbe
   return events.length;
 }
 
-export function getSlotsForDate(requestedDate: string): SlotsResponseData {
-  releaseExpiredPendingBookings();
+export async function getSlotsForDate(
+  requestedDate: string
+): Promise<SlotsResponseData> {
+  await releaseExpiredPendingBookings();
 
   const karachiNow = getKarachiNow();
   const targetDate = requestedDate.trim() || karachiNow.dateStr;
@@ -176,25 +167,24 @@ export function getSlotsForDate(requestedDate: string): SlotsResponseData {
     throw new ServiceError(400, 'Invalid date format. Expected YYYY-MM-DD.');
   }
 
-  const db = getDb();
-  const hours = db
-    .prepare(
-      'SELECT start_time, end_time, display_name, price_pkr, is_active FROM operating_hours WHERE is_active = 1 ORDER BY start_time ASC'
-    )
-    .all() as unknown as OperatingHourRow[];
+  const [settings, bookingsCol] = await Promise.all([
+    readCollection('settings'),
+    readCollection('bookings'),
+  ]);
 
-  const activeBookings = db
-    .prepare(
-      "SELECT start_time, status FROM bookings WHERE court_number = ? AND booking_date = ? AND status IN ('PENDING', 'CONFIRMED')"
-    )
-    .all(COURT_NUMBER, targetDate) as unknown as Array<{
-    start_time: string;
-    status: 'PENDING' | 'CONFIRMED';
-  }>;
+  const hours: OperatingHourRecord[] = settings.operatingHours
+    .filter((h) => h.is_active === 1)
+    .sort((a, b) => a.start_time.localeCompare(b.start_time));
 
   const bookedMap = new Map<string, 'PENDING' | 'CONFIRMED'>();
-  for (const booking of activeBookings) {
-    bookedMap.set(booking.start_time, booking.status);
+  for (const booking of bookingsCol.records) {
+    if (
+      booking.court_number === COURT_NUMBER &&
+      booking.booking_date === targetDate &&
+      (booking.status === 'PENDING' || booking.status === 'CONFIRMED')
+    ) {
+      bookedMap.set(booking.start_time, booking.status);
+    }
   }
 
   const slots: SlotAvailabilityItem[] = hours.map((slot) => {
@@ -235,7 +225,56 @@ export function getSlotsForDate(requestedDate: string): SlotsResponseData {
   };
 }
 
-export function createBookingRequest(rawBody: Record<string, unknown>): CreatedBookingRecord {
+async function upsertCustomerForBooking(input: {
+  bookingId: string;
+  bookingDate: string;
+  customerName: string;
+  customerEmail: string;
+  countryCode: string;
+  customerPhone: string;
+  nowIso: string;
+}): Promise<string> {
+  const { result: customerId } = await updateCollection('customers', (draft) => {
+    const targetPhoneKey = `${input.countryCode}|${input.customerPhone}`.toLowerCase();
+    const existing = draft.records.find(
+      (c) => `${c.country_code}|${c.customer_phone}`.toLowerCase() === targetPhoneKey
+    );
+    if (existing) {
+      existing.customer_name = input.customerName;
+      existing.customer_email = input.customerEmail;
+      if (!existing.booking_ids.includes(input.bookingId)) {
+        existing.booking_ids.push(input.bookingId);
+        existing.total_bookings = existing.booking_ids.length;
+      }
+      if (!existing.last_booking_date || input.bookingDate > existing.last_booking_date) {
+        existing.last_booking_date = input.bookingDate;
+      }
+      existing.updated_at = input.nowIso;
+      return existing.id;
+    }
+
+    const id = `CUST-${String(draft.records.length + 1).padStart(4, '0')}`;
+    draft.records.push({
+      id,
+      customer_name: input.customerName,
+      customer_email: input.customerEmail,
+      country_code: input.countryCode,
+      customer_phone: input.customerPhone,
+      total_bookings: 1,
+      booking_ids: [input.bookingId],
+      last_booking_date: input.bookingDate,
+      created_at: input.nowIso,
+      updated_at: input.nowIso,
+    });
+    return id;
+  });
+
+  return customerId;
+}
+
+export async function createBookingRequest(
+  rawBody: Record<string, unknown>
+): Promise<CreatedBookingRecord> {
   const customerName =
     typeof rawBody.customerName === 'string' ? rawBody.customerName.trim() : '';
   const customerEmail =
@@ -289,12 +328,10 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
     throw new ServiceError(400, 'Past dates cannot be booked.');
   }
 
-  const db = getDb();
-  const slot = db
-    .prepare(
-      'SELECT start_time, end_time, display_name, price_pkr, is_active FROM operating_hours WHERE start_time = ? AND is_active = 1'
-    )
-    .get(startTime) as unknown as OperatingHourRow | undefined;
+  const settings = await readCollection('settings');
+  const slot = settings.operatingHours.find(
+    (h) => h.start_time === startTime && h.is_active === 1
+  );
 
   if (!slot) {
     throw new ServiceError(
@@ -334,84 +371,80 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
   const holdExpiresAt = new Date(nowMs + PENDING_HOLD_MINUTES * 60_000).toISOString();
   const statusToken = crypto.randomBytes(16).toString('hex');
 
-  let expiredEvents: SlotSyncEvent[] = [];
+  const { result: expiredEvents } = await withSlotLock(
+    bookingDate,
+    slot.start_time,
+    () =>
+      updateCollection('bookings', (draft) => {
+        const released = applyExpiredPendingBookingsOnDraft(draft, nowMs);
 
-  try {
-    db.exec('BEGIN IMMEDIATE;');
+        const existing = draft.records.find(
+          (b) =>
+            b.court_number === COURT_NUMBER &&
+            b.booking_date === bookingDate &&
+            b.start_time === slot.start_time &&
+            (b.status === 'PENDING' || b.status === 'CONFIRMED')
+        );
 
-    expiredEvents = collectExpiredPendingBookings(db, nowMs);
+        if (existing) {
+          throw new ServiceError(
+            409,
+            'Sorry, this slot has just been booked. Please select another available time.'
+          );
+        }
 
-    const existing = db
-      .prepare(
-        "SELECT id FROM bookings WHERE court_number = ? AND booking_date = ? AND start_time = ? AND status IN ('PENDING', 'CONFIRMED')"
-      )
-      .get(COURT_NUMBER, bookingDate, startTime) as { id: string } | undefined;
+        draft.records.push({
+          id: bookingId,
+          court_number: COURT_NUMBER,
+          venue_name: VENUE_NAME,
+          booking_date: bookingDate,
+          start_time: slot.start_time,
+          end_time: slot.end_time,
+          duration_minutes: SLOT_DURATION_MINUTES,
+          booking_type: bookingType,
+          customer_name: customerName,
+          customer_email: customerEmail,
+          country_code: countryCode,
+          customer_phone: phoneResult.formatted,
+          participants_json: participantsJson,
+          additional_guests_count: additionalGuestsCount,
+          total_amount_pkr: totalAmountPkr,
+          status: 'PENDING',
+          admin_notes: null,
+          hold_expires_at: holdExpiresAt,
+          confirmed_at: null,
+          confirmed_by: null,
+          status_token: statusToken,
+          created_at: nowIso,
+          updated_at: nowIso,
+        });
 
-    if (existing) {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(
-        409,
-        'Sorry, this slot has just been booked. Please select another available time.'
-      );
-    }
+        const notifId = draft.nextNotificationId;
+        draft.nextNotificationId += 1;
+        draft.notifications.push({
+          id: notifId,
+          booking_id: bookingId,
+          message: `New ${bookingType} booking request (${bookingId}) from ${customerName} for ${bookingDate} at ${slot.display_name} (PKR ${totalAmountPkr.toLocaleString()}).`,
+          is_read: 0,
+          created_at: nowIso,
+        });
 
-    db.prepare(
-      `INSERT INTO bookings (
-        id, court_number, venue_name, booking_date, start_time, end_time,
-        duration_minutes, booking_type, customer_name, customer_email,
-        country_code, customer_phone, participants_json, additional_guests_count,
-        total_amount_pkr, status, hold_expires_at, status_token, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)`
-    ).run(
-      bookingId,
-      COURT_NUMBER,
-      VENUE_NAME,
-      bookingDate,
-      slot.start_time,
-      slot.end_time,
-      SLOT_DURATION_MINUTES,
-      bookingType,
-      customerName,
-      customerEmail,
-      countryCode,
-      phoneResult.formatted,
-      participantsJson,
-      additionalGuestsCount,
-      totalAmountPkr,
-      holdExpiresAt,
-      statusToken,
-      nowIso,
-      nowIso
-    );
+        return released;
+      })
+  );
 
-    db.prepare(
-      'INSERT INTO admin_notifications (booking_id, message, is_read, created_at) VALUES (?, ?, 0, ?)'
-    ).run(
-      bookingId,
-      `New ${bookingType} booking request (${bookingId}) from ${customerName} for ${bookingDate} at ${slot.display_name} (PKR ${totalAmountPkr.toLocaleString()}).`,
-      nowIso
-    );
-
-    db.exec('COMMIT;');
-  } catch (err: unknown) {
-    if (err instanceof ServiceError) {
-      throw err;
-    }
-    try {
-      db.exec('ROLLBACK;');
-    } catch {
-      // Ignore rollback if transaction is already closed
-    }
-    const msg = err instanceof Error ? err.message : '';
-    if (msg.includes('UNIQUE constraint failed')) {
-      throw new ServiceError(
-        409,
-        'Sorry, this slot has just been booked. Please select another available time.'
-      );
-    }
-    console.error('Booking insert error:', err);
-    throw new ServiceError(500, 'Unable to save booking request. Please try again.');
-  }
+  // Sync customer directory in customers.json without blocking booking creation
+  await upsertCustomerForBooking({
+    bookingId,
+    bookingDate,
+    customerName,
+    customerEmail,
+    countryCode,
+    customerPhone: phoneResult.formatted,
+    nowIso,
+  }).catch((err) => {
+    console.error('Customer JSON sync warning:', err);
+  });
 
   for (const evt of expiredEvents) {
     emitSlotUpdate(evt);
@@ -448,34 +481,20 @@ export function createBookingRequest(rawBody: Record<string, unknown>): CreatedB
   };
 }
 
-export function getBookingLiveStatus(
+export async function getBookingLiveStatus(
   bookingId: string,
   statusToken: string
-): BookingLiveStatus {
+): Promise<BookingLiveStatus> {
   const trimmedId = bookingId.trim();
   const trimmedToken = statusToken.trim();
   if (!trimmedId || !trimmedToken) {
     throw new ServiceError(400, 'Booking ID and verification token are required.');
   }
 
-  releaseExpiredPendingBookings();
+  await releaseExpiredPendingBookings();
 
-  const db = getDb();
-  const row = db
-    .prepare(
-      'SELECT id, status, booking_date, start_time, hold_expires_at, confirmed_at, updated_at, status_token FROM bookings WHERE id = ?'
-    )
-    .get(trimmedId) as unknown as Pick<
-    BookingRow,
-    | 'id'
-    | 'status'
-    | 'booking_date'
-    | 'start_time'
-    | 'hold_expires_at'
-    | 'confirmed_at'
-    | 'updated_at'
-    | 'status_token'
-  > | undefined;
+  const bookingsCol = await readCollection('bookings');
+  const row = bookingsCol.records.find((b) => b.id === trimmedId);
 
   if (!row || !row.status_token) {
     throw new ServiceError(404, 'Booking status record not found.');

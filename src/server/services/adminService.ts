@@ -1,16 +1,20 @@
 import { COURT_NUMBER } from '../config/constants.ts';
-import {
-  getDb,
-  type AdminNotificationRow,
-  type BookingRow,
-  type OperatingHourRow,
-} from '../db/sqlite.ts';
 import { emitSlotUpdate, type SlotSyncEvent } from '../events/bookingEvents.ts';
+import { readCollection, updateCollection } from '../storage/jsonStore.ts';
+import type {
+  AdminNotificationRecord,
+  BookingRecord,
+  OperatingHourRecord,
+} from '../storage/types.ts';
 import {
-  collectExpiredPendingBookings,
+  applyExpiredPendingBookingsOnDraft,
   releaseExpiredPendingBookings,
   ServiceError,
 } from './bookingService.ts';
+
+export type BookingRow = Omit<BookingRecord, 'status_token'>;
+export type AdminNotificationRow = AdminNotificationRecord;
+export type OperatingHourRow = OperatingHourRecord;
 
 const ALLOWED_BOOKING_STATUSES = new Set([
   'PENDING',
@@ -19,48 +23,51 @@ const ALLOWED_BOOKING_STATUSES = new Set([
   'CANCELLED',
 ]);
 
-export function getAdminDashboardData(): {
+function stripStatusToken(record: BookingRecord): BookingRow {
+  const { status_token: _omitted, ...publicAdminView } = record;
+  return publicAdminView;
+}
+
+export async function getAdminDashboardData(): Promise<{
   bookings: BookingRow[];
   notifications: AdminNotificationRow[];
   unreadCount: number;
-} {
-  releaseExpiredPendingBookings();
-  const db = getDb();
+}> {
+  await releaseExpiredPendingBookings();
+  const bookingsCol = await readCollection('bookings');
 
-  const bookings = db
-    .prepare(
-      `SELECT id, court_number, venue_name, booking_date, start_time, end_time,
-              duration_minutes, booking_type, customer_name, customer_email,
-              country_code, customer_phone, participants_json, additional_guests_count,
-              total_amount_pkr, status, admin_notes, hold_expires_at,
-              confirmed_at, confirmed_by, created_at, updated_at
-       FROM bookings
-       ORDER BY booking_date DESC, start_time ASC, created_at DESC
-       LIMIT 300`
-    )
-    .all() as unknown as BookingRow[];
+  const bookings = [...bookingsCol.records]
+    .sort((a, b) => {
+      if (b.booking_date !== a.booking_date) {
+        return b.booking_date.localeCompare(a.booking_date);
+      }
+      if (a.start_time !== b.start_time) {
+        return a.start_time.localeCompare(b.start_time);
+      }
+      return b.created_at.localeCompare(a.created_at);
+    })
+    .slice(0, 300)
+    .map(stripStatusToken);
 
-  const notifications = db
-    .prepare('SELECT * FROM admin_notifications ORDER BY created_at DESC LIMIT 50')
-    .all() as unknown as AdminNotificationRow[];
+  const notifications = [...bookingsCol.notifications]
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .slice(0, 50);
 
-  const unreadRow = db
-    .prepare('SELECT COUNT(*) AS count FROM admin_notifications WHERE is_read = 0')
-    .get() as { count: number };
+  const unreadCount = bookingsCol.notifications.filter((n) => n.is_read === 0).length;
 
   return {
     bookings,
     notifications,
-    unreadCount: unreadRow.count,
+    unreadCount,
   };
 }
 
-export function updateAdminBookingStatus(
+export async function updateAdminBookingStatus(
   bookingId: string,
   nextStatus: string,
   adminNotes: string | null,
   actorUsername = 'admin'
-): BookingRow {
+): Promise<BookingRow> {
   const trimmedId = bookingId.trim();
   const normalizedStatus = nextStatus.trim();
 
@@ -71,35 +78,27 @@ export function updateAdminBookingStatus(
     throw new ServiceError(400, 'Invalid booking status.');
   }
 
-  const db = getDb();
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
-  let expiredEvents: SlotSyncEvent[] = [];
 
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    expiredEvents = collectExpiredPendingBookings(db, nowMs);
+  const { result } = await updateCollection('bookings', (draft) => {
+    const expiredEvents: SlotSyncEvent[] = applyExpiredPendingBookingsOnDraft(draft, nowMs);
 
-    const existing = db
-      .prepare('SELECT * FROM bookings WHERE id = ?')
-      .get(trimmedId) as unknown as BookingRow | undefined;
-
+    const existing = draft.records.find((b) => b.id === trimmedId);
     if (!existing) {
-      db.exec('ROLLBACK;');
       throw new ServiceError(404, 'Booking not found.');
     }
 
     if (normalizedStatus === 'PENDING' || normalizedStatus === 'CONFIRMED') {
-      const conflict = db
-        .prepare(
-          "SELECT id FROM bookings WHERE court_number = ? AND booking_date = ? AND start_time = ? AND status IN ('PENDING', 'CONFIRMED') AND id != ?"
-        )
-        .get(COURT_NUMBER, existing.booking_date, existing.start_time, trimmedId) as
-        | { id: string }
-        | undefined;
-
+      const conflict = draft.records.find(
+        (b) =>
+          b.court_number === COURT_NUMBER &&
+          b.booking_date === existing.booking_date &&
+          b.start_time === existing.start_time &&
+          (b.status === 'PENDING' || b.status === 'CONFIRMED') &&
+          b.id !== trimmedId
+      );
       if (conflict) {
-        db.exec('ROLLBACK;');
         throw new ServiceError(
           409,
           `Slot already occupied by active booking ${conflict.id}.`
@@ -108,101 +107,72 @@ export function updateAdminBookingStatus(
     }
 
     if (normalizedStatus === 'CONFIRMED') {
-      db.prepare(
-        `UPDATE bookings
-         SET status = 'CONFIRMED',
-             admin_notes = COALESCE(?, admin_notes),
-             hold_expires_at = NULL,
-             confirmed_at = COALESCE(confirmed_at, ?),
-             confirmed_by = ?,
-             updated_at = ?
-         WHERE id = ?`
-      ).run(adminNotes, nowIso, actorUsername, nowIso, trimmedId);
+      existing.status = 'CONFIRMED';
+      if (adminNotes !== null) {
+        existing.admin_notes = adminNotes;
+      }
+      existing.hold_expires_at = null;
+      existing.confirmed_at = existing.confirmed_at ?? nowIso;
+      existing.confirmed_by = actorUsername;
+      existing.updated_at = nowIso;
     } else if (normalizedStatus === 'PENDING') {
-      db.prepare(
-        `UPDATE bookings
-         SET status = 'PENDING',
-             admin_notes = COALESCE(?, admin_notes),
-             updated_at = ?
-         WHERE id = ?`
-      ).run(adminNotes, nowIso, trimmedId);
+      existing.status = 'PENDING';
+      if (adminNotes !== null) {
+        existing.admin_notes = adminNotes;
+      }
+      existing.updated_at = nowIso;
     } else {
-      db.prepare(
-        `UPDATE bookings
-         SET status = ?,
-             admin_notes = COALESCE(?, admin_notes),
-             hold_expires_at = NULL,
-             updated_at = ?
-         WHERE id = ?`
-      ).run(normalizedStatus, adminNotes, nowIso, trimmedId);
+      existing.status = normalizedStatus as BookingRecord['status'];
+      if (adminNotes !== null) {
+        existing.admin_notes = adminNotes;
+      }
+      existing.hold_expires_at = null;
+      existing.updated_at = nowIso;
     }
 
-    db.exec('COMMIT;');
-  } catch (err: unknown) {
-    if (err instanceof ServiceError) {
-      throw err;
-    }
-    try {
-      db.exec('ROLLBACK;');
-    } catch {
-      // Ignore rollback if transaction is already closed
-    }
-    const msg = err instanceof Error ? err.message : '';
-    if (msg.includes('UNIQUE constraint failed')) {
-      throw new ServiceError(
-        409,
-        'Sorry, this slot has just been booked. Please select another available time.'
-      );
-    }
-    throw err;
-  }
+    return {
+      updated: stripStatusToken(structuredClone(existing)),
+      expiredEvents,
+    };
+  });
 
-  const updated = db
-    .prepare(
-      `SELECT id, court_number, venue_name, booking_date, start_time, end_time,
-              duration_minutes, booking_type, customer_name, customer_email,
-              country_code, customer_phone, participants_json, additional_guests_count,
-              total_amount_pkr, status, admin_notes, hold_expires_at,
-              confirmed_at, confirmed_by, created_at, updated_at
-       FROM bookings WHERE id = ?`
-    )
-    .get(trimmedId) as unknown as BookingRow;
-
-  for (const evt of expiredEvents) {
+  for (const evt of result.expiredEvents) {
     emitSlotUpdate(evt);
   }
   emitSlotUpdate({
     type: 'slot_changed',
-    bookingDate: updated.booking_date,
-    startTime: updated.start_time,
-    bookingId: updated.id,
-    bookingStatus: updated.status,
+    bookingDate: result.updated.booking_date,
+    startTime: result.updated.start_time,
+    bookingId: result.updated.id,
+    bookingStatus: result.updated.status,
     updatedAt: nowIso,
   });
 
-  return updated;
+  return result.updated;
 }
 
-export function markAllAdminNotificationsRead(): void {
-  const db = getDb();
-  db.prepare('UPDATE admin_notifications SET is_read = 1 WHERE is_read = 0').run();
+export async function markAllAdminNotificationsRead(): Promise<void> {
+  await updateCollection('bookings', (draft) => {
+    for (const n of draft.notifications) {
+      if (n.is_read === 0) {
+        n.is_read = 1;
+      }
+    }
+  });
 }
 
-export function getAllOperatingHours(): OperatingHourRow[] {
-  const db = getDb();
-  return db
-    .prepare('SELECT * FROM operating_hours ORDER BY start_time ASC')
-    .all() as unknown as OperatingHourRow[];
-}
-
-export function updateOperatingHours(updates: unknown[]): OperatingHourRow[] {
-  const db = getDb();
-  const stmt = db.prepare(
-    'UPDATE operating_hours SET price_pkr = ?, is_active = ? WHERE start_time = ?'
+export async function getAllOperatingHours(): Promise<OperatingHourRow[]> {
+  const settings = await readCollection('settings');
+  return [...settings.operatingHours].sort((a, b) =>
+    a.start_time.localeCompare(b.start_time)
   );
+}
 
-  db.exec('BEGIN IMMEDIATE;');
-  try {
+export async function updateOperatingHours(
+  updates: unknown[]
+): Promise<OperatingHourRow[]> {
+  const { data } = await updateCollection('settings', (draft) => {
+    const byStart = new Map(draft.operatingHours.map((h) => [h.start_time, h]));
     for (const item of updates) {
       const rec = item as Record<string, unknown>;
       const startTime = typeof rec.start_time === 'string' ? rec.start_time : '';
@@ -211,23 +181,20 @@ export function updateOperatingHours(updates: unknown[]): OperatingHourRow[] {
       if (!/^\d{2}:\d{2}$/.test(startTime) || !Number.isFinite(pricePkr) || pricePkr < 0) {
         continue;
       }
-      stmt.run(Math.round(pricePkr), isActive, startTime);
+      const existing = byStart.get(startTime);
+      if (existing) {
+        existing.price_pkr = Math.round(pricePkr);
+        existing.is_active = isActive;
+      }
     }
-    db.exec('COMMIT;');
-  } catch (err) {
-    try {
-      db.exec('ROLLBACK;');
-    } catch {
-      // Ignore rollback if transaction is already closed
-    }
-    console.error('Operating hours update error:', err);
-    throw new ServiceError(500, 'Failed to update operating hours.');
-  }
+  });
 
   emitSlotUpdate({
     type: 'hours_changed',
     updatedAt: new Date().toISOString(),
   });
 
-  return getAllOperatingHours();
+  return [...data.operatingHours].sort((a, b) =>
+    a.start_time.localeCompare(b.start_time)
+  );
 }

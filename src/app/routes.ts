@@ -6,12 +6,29 @@ export interface RouteMeta {
   canonicalPath: string;
 }
 
+export type AdminTab = 'bookings' | 'hours' | 'drinks' | 'security';
+
 export function parseRoute(pathname: string): AppRoute {
   const clean = pathname.replace(/\/+$/, '') || '/';
   if (clean === '/booking') return '/booking';
   if (clean === '/booking/details') return '/booking/details';
-  if (clean === '/admin') return '/admin';
+  if (clean === '/admin' || clean.startsWith('/admin/')) return '/admin';
   return '/';
+}
+
+export function parseAdminTabFromPath(pathname: string): AdminTab {
+  const clean = pathname.replace(/\/+$/, '') || '/';
+  if (clean === '/admin/hours') return 'hours';
+  if (clean === '/admin/drinks') return 'drinks';
+  if (clean === '/admin/security') return 'security';
+  return 'bookings';
+}
+
+export function getAdminPathForTab(tab: AdminTab): string {
+  if (tab === 'hours') return '/admin/hours';
+  if (tab === 'drinks') return '/admin/drinks';
+  if (tab === 'security') return '/admin/security';
+  return '/admin';
 }
 
 export const ROUTE_META: Record<AppRoute, RouteMeta> = {

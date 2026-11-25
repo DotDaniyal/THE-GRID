@@ -1,6 +1,5 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
-import { getDb } from '../db/sqlite.ts';
 import {
   authenticateAdminCredentials,
   clearAdminSessionCookie,
@@ -20,7 +19,6 @@ import {
   verifyMfaChallengeToken,
   verifyPassword,
   verifyUserMfaCode,
-  type AdminUserRow,
 } from '../middleware/auth.ts';
 import {
   authRateLimit,
@@ -52,6 +50,8 @@ import {
   updateDrink,
   updateDrinkSale,
 } from '../services/drinkService.ts';
+import { StorageConfigurationError } from '../storage/drivers.ts';
+import { readCollection, updateCollection } from '../storage/jsonStore.ts';
 import { buildOtpAuthUri, generateTotpSecret, verifyTotpCode } from '../utils/totp.ts';
 
 export const adminRouter = Router();
@@ -67,137 +67,228 @@ const adminLoginLimiter = rateLimit({
 const GENERIC_AUTH_ERROR =
   'Invalid credentials. Please verify your sign-in details and try again.';
 
-adminRouter.get('/auth-status', (req, res) => {
-  const overview = getAdminAuthOverview();
-  const session = getAdminSessionFromRequest(req);
+adminRouter.get('/auth-status', async (req, res) => {
+  try {
+    const overview = await getAdminAuthOverview();
+    const session = await getAdminSessionFromRequest(req);
 
-  if (!session) {
-    if (req.headers.cookie?.includes('thegrid_admin_session=')) {
-      clearAdminSessionCookie(req, res);
+    if (!session) {
+      if (req.headers.cookie?.includes('thegrid_admin_session=')) {
+        clearAdminSessionCookie(req, res);
+      }
+      res.json({
+        authenticated: false,
+        setupRequired: overview.setupRequired,
+        authMode: overview.authMode,
+        expiresAt: null,
+        account: null,
+        mfaMigrationRecommended: false,
+        sessionTtlMinutes: getSessionTtlMinutes(),
+      });
+      return;
     }
+
     res.json({
-      authenticated: false,
-      setupRequired: overview.setupRequired,
+      authenticated: true,
+      setupRequired: false,
       authMode: overview.authMode,
-      expiresAt: null,
-      account: null,
-      mfaMigrationRecommended: false,
+      expiresAt: session.expiresAt,
+      account: {
+        id: session.adminUserId ?? 0,
+        username: session.username,
+        displayName: session.displayName,
+        role: session.role,
+        mfaEnabled: session.mfaEnabled,
+      },
+      mfaMigrationRecommended: !session.mfaEnabled,
       sessionTtlMinutes: getSessionTtlMinutes(),
     });
-    return;
+  } catch (err) {
+    console.error('Admin auth-status error:', err);
+    res.status(500).json({ error: 'Unable to check admin authentication status.' });
   }
-
-  res.json({
-    authenticated: true,
-    setupRequired: false,
-    authMode: overview.authMode,
-    expiresAt: session.expiresAt,
-    account: {
-      id: session.adminUserId ?? 0,
-      username: session.username,
-      displayName: session.displayName,
-      role: session.role,
-      mfaEnabled: session.mfaEnabled,
-    },
-    mfaMigrationRecommended: !session.mfaEnabled,
-    sessionTtlMinutes: getSessionTtlMinutes(),
-  });
 });
 
 adminRouter.post('/setup', authRateLimit, requireSameOriginForCookieMutation, async (req, res) => {
-  const overview = getAdminAuthOverview();
-  if (!overview.setupRequired) {
-    res.status(403).json({ error: 'Primary administrator account is already configured.' });
-    return;
-  }
-
-  const rawUsername = typeof req.body?.username === 'string' ? req.body.username : '';
-  const username = normalizeAdminUsername(rawUsername);
-  const displayName =
-    typeof req.body?.displayName === 'string' && req.body.displayName.trim()
-      ? req.body.displayName.trim()
-      : username || 'Administrator';
-  const password = typeof req.body?.password === 'string' ? req.body.password : '';
-
-  const usernameError = validateAdminUsername(rawUsername);
-  if (usernameError) {
-    res.status(400).json({ error: usernameError });
-    return;
-  }
-  const passwordError = validateStrongPassword(password);
-  if (passwordError) {
-    res.status(400).json({ error: passwordError });
-    return;
-  }
-
-  const hash = await hashPassword(password);
-  const nowIso = new Date().toISOString();
-  const db = getDb();
-
-  let insertedId = 0;
   try {
-    const info = db
-      .prepare(
-        `INSERT INTO admin_users (username, display_name, role, password_hash, mfa_enabled, mfa_secret, is_active, created_at, last_login_at)
-         VALUES (?, ?, 'SUPER_ADMIN', ?, 0, NULL, 1, ?, ?)`
-      )
-      .run(username, displayName, hash, nowIso, nowIso);
-    insertedId = Number(info.lastInsertRowid);
-  } catch {
-    res.status(409).json({ error: 'Administrator setup has already been completed.' });
-    return;
-  }
+    const overview = await getAdminAuthOverview();
+    if (!overview.setupRequired) {
+      res.status(403).json({ error: 'Primary administrator account is already configured.' });
+      return;
+    }
 
-  const session = createAdminSession({
-    adminUserId: insertedId,
-    username,
-    displayName,
-    role: 'SUPER_ADMIN',
-  });
-  setAdminSessionCookie(req, res, session.token, session.expiresAt);
+    const rawUsername = typeof req.body?.username === 'string' ? req.body.username : '';
+    const username = normalizeAdminUsername(rawUsername);
+    const displayName =
+      typeof req.body?.displayName === 'string' && req.body.displayName.trim()
+        ? req.body.displayName.trim()
+        : username || 'Administrator';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
 
-  res.status(201).json({
-    authenticated: true,
-    expiresAt: session.expiresAt,
-    sessionToken: session.token,
-    authMode: 'named_accounts',
-    account: {
-      id: insertedId,
+    const usernameError = validateAdminUsername(rawUsername);
+    if (usernameError) {
+      res.status(400).json({ error: usernameError });
+      return;
+    }
+    const passwordError = validateStrongPassword(password);
+    if (passwordError) {
+      res.status(400).json({ error: passwordError });
+      return;
+    }
+
+    const hash = await hashPassword(password);
+    const nowIso = new Date().toISOString();
+
+    const { result: insertedId } = await updateCollection('admin-settings', (draft) => {
+      if (draft.users.some((u) => u.is_active === 1 || u.username === username)) {
+        throw new ServiceError(409, 'Administrator setup has already been completed.');
+      }
+      const id = draft.nextUserId;
+      draft.nextUserId += 1;
+      draft.users.push({
+        id,
+        username,
+        display_name: displayName,
+        role: 'SUPER_ADMIN',
+        password_hash: hash,
+        mfa_enabled: 0,
+        mfa_secret: null,
+        is_active: 1,
+        created_at: nowIso,
+        last_login_at: nowIso,
+      });
+      return id;
+    });
+
+    const session = await createAdminSession({
+      adminUserId: insertedId,
       username,
       displayName,
       role: 'SUPER_ADMIN',
-      mfaEnabled: false,
-    },
-    mfaMigrationRecommended: true,
-  });
+    });
+    setAdminSessionCookie(req, res, session.token, session.expiresAt);
+
+    res.status(201).json({
+      authenticated: true,
+      expiresAt: session.expiresAt,
+      sessionToken: session.token,
+      authMode: 'named_accounts',
+      account: {
+        id: insertedId,
+        username,
+        displayName,
+        role: 'SUPER_ADMIN',
+        mfaEnabled: false,
+      },
+      mfaMigrationRecommended: true,
+    });
+  } catch (err: unknown) {
+    if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
+      res.status(err.statusCode).json({ error: err.message });
+      return;
+    }
+    console.error('Admin setup error:', err);
+    res.status(500).json({ error: 'Unable to complete administrator setup.' });
+  }
 });
 
 adminRouter.post('/login', adminLoginLimiter, authRateLimit, requireSameOriginForCookieMutation, async (req, res) => {
-  const ip = getRequestClientIp(req);
-  const lockout = checkAuthLockout(ip);
-  if (lockout.locked) {
-    res.setHeader('Retry-After', String(lockout.retryAfterSeconds));
-    res.status(429).json({
-      error: `Too many unsuccessful sign-in attempts. Please wait ${lockout.retryAfterSeconds} seconds before trying again.`,
-      retryAfterSeconds: lockout.retryAfterSeconds,
-    });
-    return;
-  }
+  try {
+    const ip = getRequestClientIp(req);
+    const lockout = await checkAuthLockout(ip);
+    if (lockout.locked) {
+      res.setHeader('Retry-After', String(lockout.retryAfterSeconds));
+      res.status(429).json({
+        error: `Too many unsuccessful sign-in attempts. Please wait ${lockout.retryAfterSeconds} seconds before trying again.`,
+        retryAfterSeconds: lockout.retryAfterSeconds,
+      });
+      return;
+    }
 
-  const overview = getAdminAuthOverview();
-  if (overview.setupRequired) {
-    res.status(400).json({ error: 'Administrator setup is required before signing in.' });
-    return;
-  }
+    const overview = await getAdminAuthOverview();
+    if (overview.setupRequired) {
+      res.status(400).json({ error: 'Administrator setup is required before signing in.' });
+      return;
+    }
 
-  const challengeToken =
-    typeof req.body?.challengeToken === 'string' ? req.body.challengeToken.trim() : '';
-  const mfaCode = typeof req.body?.mfaCode === 'string' ? req.body.mfaCode.trim() : '';
+    const challengeToken =
+      typeof req.body?.challengeToken === 'string' ? req.body.challengeToken.trim() : '';
+    const mfaCode = typeof req.body?.mfaCode === 'string' ? req.body.mfaCode.trim() : '';
 
-  if (challengeToken) {
-    const userId = verifyMfaChallengeToken(challengeToken);
-    if (!userId) {
-      const failure = recordAuthFailure(ip);
+    if (challengeToken) {
+      const userId = await verifyMfaChallengeToken(challengeToken);
+      if (!userId) {
+        const failure = await recordAuthFailure(ip);
+        if (failure.locked) {
+          res.setHeader('Retry-After', String(failure.retryAfterSeconds));
+          res.status(429).json({
+            error: `Too many unsuccessful sign-in attempts. Please wait ${failure.retryAfterSeconds} seconds before trying again.`,
+            retryAfterSeconds: failure.retryAfterSeconds,
+          });
+          return;
+        }
+        res.status(401).json({ error: GENERIC_AUTH_ERROR });
+        return;
+      }
+
+      const verifiedUser = await verifyUserMfaCode(userId, mfaCode);
+      if (!verifiedUser) {
+        const failure = await recordAuthFailure(ip);
+        if (failure.locked) {
+          res.setHeader('Retry-After', String(failure.retryAfterSeconds));
+          res.status(429).json({
+            error: `Too many unsuccessful sign-in attempts. Please wait ${failure.retryAfterSeconds} seconds before trying again.`,
+            retryAfterSeconds: failure.retryAfterSeconds,
+          });
+          return;
+        }
+        res.status(401).json({ error: GENERIC_AUTH_ERROR });
+        return;
+      }
+
+      await clearAuthFailures(ip);
+      await updateCollection(
+        'admin-settings',
+        (draft) => {
+          const u = draft.users.find((x) => x.id === verifiedUser.id);
+          if (u) u.last_login_at = new Date().toISOString();
+        },
+        { skipBackup: true }
+      );
+
+      const session = await createAdminSession({
+        adminUserId: verifiedUser.id,
+        username: verifiedUser.username,
+        displayName: verifiedUser.display_name,
+        role: verifiedUser.role,
+        mfaEnabled: true,
+      });
+      setAdminSessionCookie(req, res, session.token, session.expiresAt);
+
+      res.json({
+        authenticated: true,
+        mfaRequired: false,
+        expiresAt: session.expiresAt,
+        sessionToken: session.token,
+        authMode: overview.authMode,
+        account: {
+          id: verifiedUser.id,
+          username: verifiedUser.username,
+          displayName: verifiedUser.display_name,
+          role: verifiedUser.role,
+          mfaEnabled: true,
+        },
+        mfaMigrationRecommended: false,
+      });
+      return;
+    }
+
+    const username = typeof req.body?.username === 'string' ? req.body.username : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+    const authResult = await authenticateAdminCredentials(username, password);
+    if (!authResult.ok) {
+      const failure = await recordAuthFailure(ip);
       if (failure.locked) {
         res.setHeader('Retry-After', String(failure.retryAfterSeconds));
         res.status(429).json({
@@ -210,33 +301,35 @@ adminRouter.post('/login', adminLoginLimiter, authRateLimit, requireSameOriginFo
       return;
     }
 
-    const verifiedUser = verifyUserMfaCode(userId, mfaCode);
-    if (!verifiedUser) {
-      const failure = recordAuthFailure(ip);
-      if (failure.locked) {
-        res.setHeader('Retry-After', String(failure.retryAfterSeconds));
-        res.status(429).json({
-          error: `Too many unsuccessful sign-in attempts. Please wait ${failure.retryAfterSeconds} seconds before trying again.`,
-          retryAfterSeconds: failure.retryAfterSeconds,
-        });
-        return;
-      }
-      res.status(401).json({ error: GENERIC_AUTH_ERROR });
+    const user = authResult.user;
+    if (user.mfa_enabled === 1) {
+      const nextChallenge = await issueMfaChallengeToken(user.id);
+      res.json({
+        authenticated: false,
+        mfaRequired: true,
+        challengeToken: nextChallenge,
+      });
       return;
     }
 
-    clearAuthFailures(ip);
-    const db = getDb();
-    db.prepare('UPDATE admin_users SET last_login_at = ? WHERE id = ?').run(
-      new Date().toISOString(),
-      verifiedUser.id
-    );
+    await clearAuthFailures(ip);
+    if (user.id > 0) {
+      await updateCollection(
+        'admin-settings',
+        (draft) => {
+          const u = draft.users.find((x) => x.id === user.id);
+          if (u) u.last_login_at = new Date().toISOString();
+        },
+        { skipBackup: true }
+      );
+    }
 
-    const session = createAdminSession({
-      adminUserId: verifiedUser.id,
-      username: verifiedUser.username,
-      displayName: verifiedUser.display_name,
-      role: verifiedUser.role,
+    const session = await createAdminSession({
+      adminUserId: user.id,
+      username: user.username,
+      displayName: user.display_name,
+      role: user.role,
+      mfaEnabled: false,
     });
     setAdminSessionCookie(req, res, session.token, session.expiresAt);
 
@@ -247,93 +340,52 @@ adminRouter.post('/login', adminLoginLimiter, authRateLimit, requireSameOriginFo
       sessionToken: session.token,
       authMode: overview.authMode,
       account: {
-        id: verifiedUser.id,
-        username: verifiedUser.username,
-        displayName: verifiedUser.display_name,
-        role: verifiedUser.role,
-        mfaEnabled: true,
+        id: user.id,
+        username: user.username,
+        displayName: user.display_name,
+        role: user.role,
+        mfaEnabled: false,
       },
       mfaMigrationRecommended: false,
     });
-    return;
-  }
-
-  const username = typeof req.body?.username === 'string' ? req.body.username : '';
-  const password = typeof req.body?.password === 'string' ? req.body.password : '';
-
-  const authResult = await authenticateAdminCredentials(username, password);
-  if (!authResult.ok) {
-    const failure = recordAuthFailure(ip);
-    if (failure.locked) {
-      res.setHeader('Retry-After', String(failure.retryAfterSeconds));
-      res.status(429).json({
-        error: `Too many unsuccessful sign-in attempts. Please wait ${failure.retryAfterSeconds} seconds before trying again.`,
-        retryAfterSeconds: failure.retryAfterSeconds,
-      });
+  } catch (err: unknown) {
+    if (err instanceof StorageConfigurationError) {
+      res.status(err.statusCode).json({ error: err.message });
       return;
     }
-    res.status(401).json({ error: GENERIC_AUTH_ERROR });
-    return;
+    console.error('Admin login error:', err);
+    res.status(500).json({ error: 'Unable to sign in.' });
   }
-
-  const user = authResult.user;
-  if (user.mfa_enabled === 1) {
-    const nextChallenge = issueMfaChallengeToken(user.id);
-    res.json({
-      authenticated: false,
-      mfaRequired: true,
-      challengeToken: nextChallenge,
-    });
-    return;
-  }
-
-  clearAuthFailures(ip);
-  const db = getDb();
-  db.prepare('UPDATE admin_users SET last_login_at = ? WHERE id = ?').run(
-    new Date().toISOString(),
-    user.id
-  );
-
-  const session = createAdminSession({
-    adminUserId: user.id,
-    username: user.username,
-    displayName: user.display_name,
-    role: user.role,
-  });
-  setAdminSessionCookie(req, res, session.token, session.expiresAt);
-
-  res.json({
-    authenticated: true,
-    mfaRequired: false,
-    expiresAt: session.expiresAt,
-    sessionToken: session.token,
-    authMode: overview.authMode,
-    account: {
-      id: user.id,
-      username: user.username,
-      displayName: user.display_name,
-      role: user.role,
-      mfaEnabled: false,
-    },
-    mfaMigrationRecommended: false,
-  });
 });
 
-adminRouter.post('/logout', requireSameOriginForCookieMutation, (req, res) => {
-  revokeAdminSessionFromRequest(req);
+adminRouter.post('/logout', requireSameOriginForCookieMutation, async (req, res) => {
+  try {
+    await revokeAdminSessionFromRequest(req);
+  } catch (err) {
+    console.error('Admin logout revocation error:', err);
+  }
   clearAdminSessionCookie(req, res);
   res.json({ ok: true });
 });
 
-adminRouter.get('/bookings', requireAdminAuth, (_req, res) => {
-  res.json(getAdminDashboardData());
+adminRouter.get('/bookings', requireAdminAuth, async (_req, res) => {
+  try {
+    res.json(await getAdminDashboardData());
+  } catch (err: unknown) {
+    if (err instanceof StorageConfigurationError) {
+      res.status(err.statusCode).json({ error: err.message });
+      return;
+    }
+    console.error('Admin bookings fetch error:', err);
+    res.status(500).json({ error: 'Failed to load bookings dashboard.' });
+  }
 });
 
 adminRouter.patch(
   '/bookings/:id/status',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (req, res) => {
+  async (req, res) => {
     const bookingId = req.params.id?.trim() ?? '';
     const nextStatus = typeof req.body?.status === 'string' ? req.body.status.trim() : '';
     const adminNotes =
@@ -343,10 +395,10 @@ adminRouter.patch(
 
     try {
       const actor = req.adminSession?.username ?? 'admin';
-      const booking = updateAdminBookingStatus(bookingId, nextStatus, adminNotes, actor);
+      const booking = await updateAdminBookingStatus(bookingId, nextStatus, adminNotes, actor);
       res.json({ booking });
     } catch (err: unknown) {
-      if (err instanceof ServiceError) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
         res.status(err.statusCode).json({ error: err.message });
         return;
       }
@@ -360,21 +412,35 @@ adminRouter.post(
   '/notifications/mark-read',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (_req, res) => {
-    markAllAdminNotificationsRead();
-    res.json({ ok: true });
+  async (_req, res) => {
+    try {
+      await markAllAdminNotificationsRead();
+      res.json({ ok: true });
+    } catch (err: unknown) {
+      if (err instanceof StorageConfigurationError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      console.error('Mark notifications error:', err);
+      res.status(500).json({ error: 'Failed to mark notifications read.' });
+    }
   }
 );
 
-adminRouter.get('/operating-hours', requireAdminAuth, (_req, res) => {
-  res.json({ hours: getAllOperatingHours() });
+adminRouter.get('/operating-hours', requireAdminAuth, async (_req, res) => {
+  try {
+    res.json({ hours: await getAllOperatingHours() });
+  } catch (err) {
+    console.error('Operating hours fetch error:', err);
+    res.status(500).json({ error: 'Failed to fetch operating hours.' });
+  }
 });
 
 adminRouter.put(
   '/operating-hours',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (req, res) => {
+  async (req, res) => {
     const updates = Array.isArray(req.body?.hours) ? req.body.hours : null;
     if (!updates) {
       res.status(400).json({ error: 'Invalid operating hours payload.' });
@@ -382,10 +448,10 @@ adminRouter.put(
     }
 
     try {
-      const hours = updateOperatingHours(updates);
+      const hours = await updateOperatingHours(updates);
       res.json({ hours });
     } catch (err: unknown) {
-      if (err instanceof ServiceError) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
         res.status(err.statusCode).json({ error: err.message });
         return;
       }
@@ -395,27 +461,27 @@ adminRouter.put(
   }
 );
 
-adminRouter.get('/accounts', requireAdminAuth, (_req, res) => {
-  const db = getDb();
-  const rows = db
-    .prepare(
-      `SELECT id, username, display_name, role, mfa_enabled, is_active, created_at, last_login_at
-       FROM admin_users ORDER BY id ASC`
-    )
-    .all() as unknown as Array<Omit<AdminUserRow, 'password_hash' | 'mfa_secret'>>;
+adminRouter.get('/accounts', requireAdminAuth, async (_req, res) => {
+  try {
+    const adminSettings = await readCollection('admin-settings');
+    const rows = [...adminSettings.users].sort((a, b) => a.id - b.id);
 
-  res.json({
-    accounts: rows.map((r) => ({
-      id: r.id,
-      username: r.username,
-      displayName: r.display_name,
-      role: r.role,
-      mfaEnabled: r.mfa_enabled === 1,
-      isActive: r.is_active === 1,
-      createdAt: r.created_at,
-      lastLoginAt: r.last_login_at,
-    })),
-  });
+    res.json({
+      accounts: rows.map((r) => ({
+        id: r.id,
+        username: r.username,
+        displayName: r.display_name,
+        role: r.role,
+        mfaEnabled: r.mfa_enabled === 1,
+        isActive: r.is_active === 1,
+        createdAt: r.created_at,
+        lastLoginAt: r.last_login_at,
+      })),
+    });
+  } catch (err) {
+    console.error('Admin accounts fetch error:', err);
+    res.status(500).json({ error: 'Failed to load admin accounts.' });
+  }
 });
 
 adminRouter.post(
@@ -448,21 +514,30 @@ adminRouter.post(
       return;
     }
 
-    const db = getDb();
     const hash = await hashPassword(password);
     const nowIso = new Date().toISOString();
 
     try {
-      const info = db
-        .prepare(
-          `INSERT INTO admin_users (username, display_name, role, password_hash, mfa_enabled, mfa_secret, is_active, created_at)
-           VALUES (?, ?, ?, ?, 0, NULL, 1, ?)`
-        )
-        .run(username, displayName, role, hash, nowIso);
-
-      res.status(201).json({
-        account: {
-          id: Number(info.lastInsertRowid),
+      const { result: createdAccount } = await updateCollection('admin-settings', (draft) => {
+        if (draft.users.some((u) => u.username === username)) {
+          throw new ServiceError(409, 'That administrator username already exists.');
+        }
+        const id = draft.nextUserId;
+        draft.nextUserId += 1;
+        draft.users.push({
+          id,
+          username,
+          display_name: displayName,
+          role,
+          password_hash: hash,
+          mfa_enabled: 0,
+          mfa_secret: null,
+          is_active: 1,
+          created_at: nowIso,
+          last_login_at: null,
+        });
+        return {
+          id,
           username,
           displayName,
           role,
@@ -470,10 +545,17 @@ adminRouter.post(
           isActive: true,
           createdAt: nowIso,
           lastLoginAt: null,
-        },
+        };
       });
-    } catch {
-      res.status(409).json({ error: 'That administrator username already exists.' });
+
+      res.status(201).json({ account: createdAccount });
+    } catch (err: unknown) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      console.error('Create admin account error:', err);
+      res.status(500).json({ error: 'Failed to create administrator account.' });
     }
   }
 );
@@ -482,26 +564,36 @@ adminRouter.post(
   '/mfa/enroll',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (req, res) => {
+  async (req, res) => {
     const session = req.adminSession!;
-    if (session.adminUserId === null) {
+    if (session.adminUserId === null || session.adminUserId <= 0) {
       res.status(400).json({
         error: 'Create and sign in with a named administrator account first before enabling MFA.',
       });
       return;
     }
 
-    const secret = generateTotpSecret();
-    const db = getDb();
-    db.prepare('UPDATE admin_users SET mfa_secret = ?, mfa_enabled = 0 WHERE id = ?').run(
-      secret,
-      session.adminUserId
-    );
+    try {
+      const secret = generateTotpSecret();
+      await updateCollection('admin-settings', (draft) => {
+        const user = draft.users.find((u) => u.id === session.adminUserId);
+        if (!user) throw new ServiceError(404, 'Administrator account not found.');
+        user.mfa_secret = secret;
+        user.mfa_enabled = 0;
+      });
 
-    res.json({
-      secret,
-      otpAuthUri: buildOtpAuthUri(session.username, secret),
-    });
+      res.json({
+        secret,
+        otpAuthUri: buildOtpAuthUri(session.username, secret),
+      });
+    } catch (err: unknown) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      console.error('MFA enroll error:', err);
+      res.status(500).json({ error: 'Failed to enroll MFA.' });
+    }
   }
 );
 
@@ -509,26 +601,33 @@ adminRouter.post(
   '/mfa/verify',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (req, res) => {
+  async (req, res) => {
     const session = req.adminSession!;
-    if (session.adminUserId === null) {
+    if (session.adminUserId === null || session.adminUserId <= 0) {
       res.status(400).json({ error: 'MFA requires a named administrator account.' });
       return;
     }
 
     const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
-    const db = getDb();
-    const row = db
-      .prepare('SELECT mfa_secret FROM admin_users WHERE id = ?')
-      .get(session.adminUserId) as { mfa_secret: string | null } | undefined;
 
-    if (!row?.mfa_secret || !verifyTotpCode(row.mfa_secret, code)) {
-      res.status(400).json({ error: 'Invalid 6-digit authenticator code. Please try again.' });
-      return;
+    try {
+      await updateCollection('admin-settings', (draft) => {
+        const user = draft.users.find((u) => u.id === session.adminUserId);
+        if (!user?.mfa_secret || !verifyTotpCode(user.mfa_secret, code)) {
+          throw new ServiceError(400, 'Invalid 6-digit authenticator code. Please try again.');
+        }
+        user.mfa_enabled = 1;
+      });
+
+      res.json({ mfaEnabled: true });
+    } catch (err: unknown) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      console.error('MFA verify error:', err);
+      res.status(500).json({ error: 'Failed to verify MFA.' });
     }
-
-    db.prepare('UPDATE admin_users SET mfa_enabled = 1 WHERE id = ?').run(session.adminUserId);
-    res.json({ mfaEnabled: true });
   }
 );
 
@@ -538,30 +637,42 @@ adminRouter.post(
   requireAdminAuth,
   async (req, res) => {
     const session = req.adminSession!;
-    if (session.adminUserId === null) {
+    if (session.adminUserId === null || session.adminUserId <= 0) {
       res.status(400).json({ error: 'MFA requires a named administrator account.' });
       return;
     }
 
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
-    const db = getDb();
-    const row = db
-      .prepare('SELECT password_hash FROM admin_users WHERE id = ?')
-      .get(session.adminUserId) as { password_hash: string } | undefined;
 
-    if (!row || !(await verifyPassword(password, row.password_hash))) {
-      res.status(401).json({ error: 'Current password verification failed.' });
-      return;
+    try {
+      const adminSettings = await readCollection('admin-settings');
+      const user = adminSettings.users.find((u) => u.id === session.adminUserId);
+      if (!user || !(await verifyPassword(password, user.password_hash))) {
+        res.status(401).json({ error: 'Current password verification failed.' });
+        return;
+      }
+
+      await updateCollection('admin-settings', (draft) => {
+        const target = draft.users.find((u) => u.id === session.adminUserId);
+        if (target) {
+          target.mfa_enabled = 0;
+          target.mfa_secret = null;
+        }
+      });
+
+      res.json({ mfaEnabled: false });
+    } catch (err: unknown) {
+      if (err instanceof StorageConfigurationError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      console.error('MFA disable error:', err);
+      res.status(500).json({ error: 'Failed to disable MFA.' });
     }
-
-    db.prepare('UPDATE admin_users SET mfa_enabled = 0, mfa_secret = NULL WHERE id = ?').run(
-      session.adminUserId
-    );
-    res.json({ mfaEnabled: false });
   }
 );
 
-adminRouter.get('/drinks/reports', requireAdminAuth, (req, res) => {
+adminRouter.get('/drinks/reports', requireAdminAuth, async (req, res) => {
   try {
     const from = typeof req.query.from === 'string' ? req.query.from.trim() : undefined;
     const to = typeof req.query.to === 'string' ? req.query.to.trim() : undefined;
@@ -576,10 +687,10 @@ adminRouter.get('/drinks/reports', requireAdminAuth, (req, res) => {
         ? rawDrinkId
         : undefined;
 
-    const report = getDrinksAnalyticsAndReports({ from, to, category, drinkId });
+    const report = await getDrinksAnalyticsAndReports({ from, to, category, drinkId });
     res.json(report);
   } catch (err: unknown) {
-    if (err instanceof ServiceError) {
+    if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
       res.status(err.statusCode).json({ error: err.message });
       return;
     }
@@ -588,7 +699,7 @@ adminRouter.get('/drinks/reports', requireAdminAuth, (req, res) => {
   }
 });
 
-adminRouter.get('/drinks/sales', requireAdminAuth, (req, res) => {
+adminRouter.get('/drinks/sales', requireAdminAuth, async (req, res) => {
   try {
     const from = typeof req.query.from === 'string' ? req.query.from.trim() : undefined;
     const to = typeof req.query.to === 'string' ? req.query.to.trim() : undefined;
@@ -604,7 +715,7 @@ adminRouter.get('/drinks/sales', requireAdminAuth, (req, res) => {
         : undefined;
     const includeCancelled = req.query.includeCancelled !== 'false';
 
-    const sales = getDrinkSales({ from, to, category, drinkId, includeCancelled });
+    const sales = await getDrinkSales({ from, to, category, drinkId, includeCancelled });
     res.json({ sales });
   } catch (err: unknown) {
     console.error('Admin drink sales fetch error:', err);
@@ -616,13 +727,13 @@ adminRouter.post(
   '/drinks/sales',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (req, res) => {
+  async (req, res) => {
     try {
       const actor = req.adminSession?.username ?? 'admin';
-      const sale = createDrinkSale(req.body ?? {}, actor);
+      const sale = await createDrinkSale(req.body ?? {}, actor);
       res.status(201).json({ sale });
     } catch (err: unknown) {
-      if (err instanceof ServiceError) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
         res.status(err.statusCode).json({ error: err.message });
         return;
       }
@@ -636,7 +747,7 @@ adminRouter.put(
   '/drinks/sales/:saleId',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (req, res) => {
+  async (req, res) => {
     const saleId = Number(req.params.saleId);
     if (!Number.isInteger(saleId) || saleId <= 0) {
       res.status(400).json({ error: 'Invalid sale ID.' });
@@ -644,10 +755,10 @@ adminRouter.put(
     }
     try {
       const actor = req.adminSession?.username ?? 'admin';
-      const sale = updateDrinkSale(saleId, req.body ?? {}, actor);
+      const sale = await updateDrinkSale(saleId, req.body ?? {}, actor);
       res.json({ sale });
     } catch (err: unknown) {
-      if (err instanceof ServiceError) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
         res.status(err.statusCode).json({ error: err.message });
         return;
       }
@@ -661,7 +772,7 @@ adminRouter.post(
   '/drinks/sales/:saleId/cancel',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (req, res) => {
+  async (req, res) => {
     const saleId = Number(req.params.saleId);
     if (!Number.isInteger(saleId) || saleId <= 0) {
       res.status(400).json({ error: 'Invalid sale ID.' });
@@ -670,10 +781,10 @@ adminRouter.post(
     try {
       const actor = req.adminSession?.username ?? 'admin';
       const reason = typeof req.body?.reason === 'string' ? req.body.reason : null;
-      const sale = cancelDrinkSale(saleId, reason, actor);
+      const sale = await cancelDrinkSale(saleId, reason, actor);
       res.json({ sale });
     } catch (err: unknown) {
-      if (err instanceof ServiceError) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
         res.status(err.statusCode).json({ error: err.message });
         return;
       }
@@ -683,11 +794,11 @@ adminRouter.post(
   }
 );
 
-adminRouter.get('/drinks/expenses', requireAdminAuth, (req, res) => {
+adminRouter.get('/drinks/expenses', requireAdminAuth, async (req, res) => {
   try {
     const from = typeof req.query.from === 'string' ? req.query.from.trim() : undefined;
     const to = typeof req.query.to === 'string' ? req.query.to.trim() : undefined;
-    const expenses = getDrinkExpenses({ from, to });
+    const expenses = await getDrinkExpenses({ from, to });
     res.json({ expenses });
   } catch (err: unknown) {
     console.error('Admin drink expenses fetch error:', err);
@@ -699,13 +810,13 @@ adminRouter.post(
   '/drinks/expenses',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (req, res) => {
+  async (req, res) => {
     try {
       const actor = req.adminSession?.username ?? 'admin';
-      const expense = createDrinkExpense(req.body ?? {}, actor);
+      const expense = await createDrinkExpense(req.body ?? {}, actor);
       res.status(201).json({ expense });
     } catch (err: unknown) {
-      if (err instanceof ServiceError) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
         res.status(err.statusCode).json({ error: err.message });
         return;
       }
@@ -719,17 +830,17 @@ adminRouter.delete(
   '/drinks/expenses/:expenseId',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (req, res) => {
+  async (req, res) => {
     const expenseId = Number(req.params.expenseId);
     if (!Number.isInteger(expenseId) || expenseId <= 0) {
       res.status(400).json({ error: 'Invalid expense ID.' });
       return;
     }
     try {
-      deleteDrinkExpense(expenseId);
+      await deleteDrinkExpense(expenseId);
       res.json({ ok: true });
     } catch (err: unknown) {
-      if (err instanceof ServiceError) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
         res.status(err.statusCode).json({ error: err.message });
         return;
       }
@@ -739,9 +850,9 @@ adminRouter.delete(
   }
 );
 
-adminRouter.get('/drinks', requireAdminAuth, (_req, res) => {
+adminRouter.get('/drinks', requireAdminAuth, async (_req, res) => {
   try {
-    const drinks = getAllDrinksAdmin();
+    const drinks = await getAllDrinksAdmin();
     res.json({ drinks });
   } catch (err: unknown) {
     console.error('Admin drinks fetch error:', err);
@@ -749,26 +860,31 @@ adminRouter.get('/drinks', requireAdminAuth, (_req, res) => {
   }
 });
 
-adminRouter.post('/drinks', requireSameOriginForCookieMutation, requireAdminAuth, (req, res) => {
-  try {
-    const actor = req.adminSession?.username ?? 'admin';
-    const drink = createDrink(req.body ?? {}, actor);
-    res.status(201).json({ drink });
-  } catch (err: unknown) {
-    if (err instanceof ServiceError) {
-      res.status(err.statusCode).json({ error: err.message });
-      return;
+adminRouter.post(
+  '/drinks',
+  requireSameOriginForCookieMutation,
+  requireAdminAuth,
+  async (req, res) => {
+    try {
+      const actor = req.adminSession?.username ?? 'admin';
+      const drink = await createDrink(req.body ?? {}, actor);
+      res.status(201).json({ drink });
+    } catch (err: unknown) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      console.error('Admin drink create error:', err);
+      res.status(500).json({ error: 'Failed to create drink product.' });
     }
-    console.error('Admin drink create error:', err);
-    res.status(500).json({ error: 'Failed to create drink product.' });
   }
-});
+);
 
 adminRouter.post(
   '/drinks/:id/adjust-stock',
   requireSameOriginForCookieMutation,
   requireAdminAuth,
-  (req, res) => {
+  async (req, res) => {
     const drinkId = Number(req.params.id);
     if (!Number.isInteger(drinkId) || drinkId <= 0) {
       res.status(400).json({ error: 'Invalid product ID.' });
@@ -776,10 +892,10 @@ adminRouter.post(
     }
     try {
       const actor = req.adminSession?.username ?? 'admin';
-      const result = adjustDrinkStock(drinkId, req.body ?? {}, actor);
+      const result = await adjustDrinkStock(drinkId, req.body ?? {}, actor);
       res.json(result);
     } catch (err: unknown) {
-      if (err instanceof ServiceError) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
         res.status(err.statusCode).json({ error: err.message });
         return;
       }
@@ -789,41 +905,51 @@ adminRouter.post(
   }
 );
 
-adminRouter.put('/drinks/:id', requireSameOriginForCookieMutation, requireAdminAuth, (req, res) => {
-  const drinkId = Number(req.params.id);
-  if (!Number.isInteger(drinkId) || drinkId <= 0) {
-    res.status(400).json({ error: 'Invalid product ID.' });
-    return;
-  }
-  try {
-    const actor = req.adminSession?.username ?? 'admin';
-    const drink = updateDrink(drinkId, req.body ?? {}, actor);
-    res.json({ drink });
-  } catch (err: unknown) {
-    if (err instanceof ServiceError) {
-      res.status(err.statusCode).json({ error: err.message });
+adminRouter.put(
+  '/drinks/:id',
+  requireSameOriginForCookieMutation,
+  requireAdminAuth,
+  async (req, res) => {
+    const drinkId = Number(req.params.id);
+    if (!Number.isInteger(drinkId) || drinkId <= 0) {
+      res.status(400).json({ error: 'Invalid product ID.' });
       return;
     }
-    console.error('Admin drink update error:', err);
-    res.status(500).json({ error: 'Failed to update product.' });
+    try {
+      const actor = req.adminSession?.username ?? 'admin';
+      const drink = await updateDrink(drinkId, req.body ?? {}, actor);
+      res.json({ drink });
+    } catch (err: unknown) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      console.error('Admin drink update error:', err);
+      res.status(500).json({ error: 'Failed to update product.' });
+    }
   }
-});
+);
 
-adminRouter.delete('/drinks/:id', requireSameOriginForCookieMutation, requireAdminAuth, (req, res) => {
-  const drinkId = Number(req.params.id);
-  if (!Number.isInteger(drinkId) || drinkId <= 0) {
-    res.status(400).json({ error: 'Invalid product ID.' });
-    return;
-  }
-  try {
-    deleteDrink(drinkId);
-    res.json({ ok: true });
-  } catch (err: unknown) {
-    if (err instanceof ServiceError) {
-      res.status(err.statusCode).json({ error: err.message });
+adminRouter.delete(
+  '/drinks/:id',
+  requireSameOriginForCookieMutation,
+  requireAdminAuth,
+  async (req, res) => {
+    const drinkId = Number(req.params.id);
+    if (!Number.isInteger(drinkId) || drinkId <= 0) {
+      res.status(400).json({ error: 'Invalid product ID.' });
       return;
     }
-    console.error('Admin drink delete error:', err);
-    res.status(500).json({ error: 'Failed to delete product.' });
+    try {
+      await deleteDrink(drinkId);
+      res.json({ ok: true });
+    } catch (err: unknown) {
+      if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      console.error('Admin drink delete error:', err);
+      res.status(500).json({ error: 'Failed to delete product.' });
+    }
   }
-});
+);

@@ -8,6 +8,11 @@ import {
   RefreshCw,
   Shield,
 } from 'lucide-react';
+import {
+  getAdminPathForTab,
+  parseAdminTabFromPath,
+  type AdminTab,
+} from '@/src/app/routes';
 import { AdminBookingsList } from '@/src/features/admin/AdminBookingsList';
 import { AdminDrinksPanel } from '@/src/features/admin/AdminDrinksPanel';
 import { AdminLoginCard } from '@/src/features/admin/AdminLoginCard';
@@ -44,7 +49,9 @@ export function AdminPage() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [authStatusMessage, setAuthStatusMessage] = useState<string | null>(null);
 
-  const [activeTab, setActiveTab] = useState<'bookings' | 'hours' | 'drinks' | 'security'>('bookings');
+  const [activeTab, setActiveTab] = useState<AdminTab>(() =>
+    typeof window !== 'undefined' ? parseAdminTabFromPath(window.location.pathname) : 'bookings'
+  );
   const [bookings, setBookings] = useState<AdminBookingRow[]>([]);
   const [notifications, setNotifications] = useState<AdminNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -56,6 +63,24 @@ export function AdminPage() {
   const [savingHours, setSavingHours] = useState(false);
   const [hoursMessage, setHoursMessage] = useState<string | null>(null);
 
+  const handleSelectTab = useCallback((nextTab: AdminTab) => {
+    setActiveTab(nextTab);
+    if (typeof window !== 'undefined') {
+      const targetPath = getAdminPathForTab(nextTab);
+      if (window.location.pathname !== targetPath) {
+        window.history.pushState({}, '', targetPath);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      setActiveTab(parseAdminTabFromPath(window.location.pathname));
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
   const clearClientSession = useCallback((message?: string, isError = false) => {
     clearInMemoryAdminSessionToken();
     setAuthenticated(false);
@@ -65,6 +90,9 @@ export function AdminPage() {
     setNotifications([]);
     setUnreadCount(0);
     setHours([]);
+    if (typeof window !== 'undefined' && window.location.pathname.startsWith('/admin/')) {
+      window.history.replaceState({}, '', '/admin');
+    }
     if (message) {
       if (isError) {
         setAuthError(message);
@@ -84,6 +112,9 @@ export function AdminPage() {
       setAuthenticated(Boolean(status.authenticated));
       setExpiresAt(status.expiresAt);
       setCurrentAccount(status.account);
+      if (!status.authenticated && typeof window !== 'undefined' && window.location.pathname.startsWith('/admin/')) {
+        window.history.replaceState({}, '', '/admin');
+      }
     } catch {
       setAuthError('Unable to check admin authentication status.');
     } finally {
@@ -172,6 +203,7 @@ export function AdminPage() {
     } catch {
       // Clear local session state even if network call fails
     }
+    setActiveTab('bookings');
     clearClientSession('You have signed out cleanly. Your session has been terminated.', false);
     await refreshAuthStatus();
   };
@@ -252,6 +284,12 @@ export function AdminPage() {
           setExpiresAt(session.expiresAt);
           setCurrentAccount(session.account);
           setAuthenticated(true);
+          if (typeof window !== 'undefined') {
+            const targetPath = getAdminPathForTab(activeTab);
+            if (window.location.pathname !== targetPath) {
+              window.history.replaceState({}, '', targetPath);
+            }
+          }
         }}
       />
     );
@@ -394,7 +432,7 @@ export function AdminPage() {
                   <button
                     key={item.id}
                     type="button"
-                    onClick={() => setActiveTab(item.id)}
+                    onClick={() => handleSelectTab(item.id)}
                     className={`w-full text-left flex items-center justify-between gap-2.5 px-3 py-2.5 rounded-lg border transition-colors cursor-pointer ${
                       isSelected
                         ? 'bg-[#c4d835] text-[#0E1845] border-[#c4d835] shadow-sm'
@@ -482,13 +520,22 @@ export function AdminPage() {
               />
             )}
 
-            {activeTab === 'drinks' && <AdminDrinksPanel />}
+            {activeTab === 'drinks' && (
+              <AdminDrinksPanel
+                onSessionExpired={() =>
+                  clearClientSession('Admin session expired. Please sign in again.', true)
+                }
+              />
+            )}
 
             {activeTab === 'security' && (
               <AdminSecurityPanel
                 currentAccount={currentAccount}
                 authMode={authMode}
                 onAccountUpdated={refreshAuthStatus}
+                onSessionExpired={() =>
+                  clearClientSession('Admin session expired. Please sign in again.', true)
+                }
               />
             )}
           </main>

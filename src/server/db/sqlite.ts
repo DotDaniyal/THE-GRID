@@ -18,6 +18,17 @@ function ensureWritableDbPath(targetFile: string): string | null {
   }
 }
 
+function copySeedDbIfNeeded(seedFile: string, targetFile: string): void {
+  try {
+    if (fs.existsSync(targetFile) || !fs.existsSync(seedFile)) return;
+    const stat = fs.statSync(seedFile);
+    if (!stat.isFile() || stat.size === 0) return;
+    fs.copyFileSync(seedFile, targetFile);
+  } catch {
+    // Ignore seed copy failure and allow fresh initialization
+  }
+}
+
 function resolveDbPath(): string {
   const customPath = process.env.SQLITE_DB_PATH?.trim();
   const vercelTmpDir = path.join(os.tmpdir(), 'thegrid-data');
@@ -33,11 +44,14 @@ function resolveDbPath(): string {
       }
     }
     // If SQLITE_DB_PATH points to a read-only mount (e.g. ./database.sqlite on Vercel),
-    // safely fall back to writable /tmp while preserving the configured filename.
+    // safely fall back to writable /tmp while preserving any bundled seed DB and filename.
     const tmpFallback = ensureWritableDbPath(
       path.join(vercelTmpDir, path.basename(customPath) || 'database.sqlite')
     );
-    if (tmpFallback) return tmpFallback;
+    if (tmpFallback) {
+      copySeedDbIfNeeded(resolved, tmpFallback);
+      return tmpFallback;
+    }
   }
 
   // On Vercel serverless runtimes, process.cwd() (/var/task) is read-only.
@@ -51,7 +65,10 @@ function resolveDbPath(): string {
   }
 
   fs.mkdirSync(vercelTmpDir, { recursive: true });
-  return path.join(vercelTmpDir, 'thegrid.db');
+  const tmpDefault = path.join(vercelTmpDir, 'thegrid.db');
+  const localSeedCandidate = path.join(process.cwd(), 'data', 'thegrid.db');
+  copySeedDbIfNeeded(localSeedCandidate, tmpDefault);
+  return tmpDefault;
 }
 
 export interface OperatingHourRow {

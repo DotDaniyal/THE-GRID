@@ -1,39 +1,29 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
-import session from 'express-session';
-import { getDb } from './db/sqlite.ts';
 import { securityHeadersMiddleware } from './middleware/securityHeaders.ts';
 import { adminRouter } from './routes/adminRoutes.ts';
 import { publicBookingRouter } from './routes/publicBookingRoutes.ts';
+import { StorageConfigurationError } from './storage/drivers.ts';
+import { ensureStoreInitialized } from './storage/jsonStore.ts';
 
 export function createApiApp(): express.Express {
-  getDb();
-
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
   app.use(securityHeadersMiddleware);
   app.use(express.json({ limit: '1mb' }));
-  app.use(
-    session({
-      secret: process.env.SESSION_SECRET || 'thegrid-secure-session-secret-change-me',
-      resave: false,
-      saveUninitialized: false,
-      cookie: {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: 4 * 60 * 60 * 1000,
-      },
-    })
-  );
 
-  app.use('/api', (req, res, next) => {
+  app.use('/api', async (req, res, next) => {
     if (!req.path.endsWith('/stream')) {
       res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
     }
-    next();
+    try {
+      await ensureStoreInitialized();
+      next();
+    } catch (err) {
+      next(err);
+    }
   });
 
   app.use('/api', publicBookingRouter);
@@ -42,6 +32,10 @@ export function createApiApp(): express.Express {
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     console.error('Unhandled API error:', err);
     if (!res.headersSent) {
+      if (err instanceof StorageConfigurationError) {
+        res.status(503).json({ error: err.message });
+        return;
+      }
       res.status(500).json({ error: 'Internal server error.' });
     }
   });

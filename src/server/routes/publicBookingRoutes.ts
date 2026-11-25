@@ -8,27 +8,34 @@ import {
   getSlotsForDate,
   ServiceError,
 } from '../services/bookingService.ts';
+import { StorageConfigurationError } from '../storage/drivers.ts';
+import { getStorageStatus } from '../storage/jsonStore.ts';
 import { getKarachiNow } from '../utils/time.ts';
 
 export const publicBookingRouter = Router();
 
 publicBookingRouter.get('/health', (_req, res) => {
+  const storage = getStorageStatus();
   res.json({
     ok: true,
     karachiNow: getKarachiNow(),
     courtNumber: COURT_NUMBER,
     venue: VENUE_NAME,
+    storage: {
+      mode: storage.mode,
+      persistent: storage.persistent,
+    },
   });
 });
 
-publicBookingRouter.get('/slots', (req, res) => {
+publicBookingRouter.get('/slots', async (req, res) => {
   try {
     const requestedDate =
       typeof req.query.date === 'string' ? req.query.date.trim() : '';
-    const data = getSlotsForDate(requestedDate);
+    const data = await getSlotsForDate(requestedDate);
     res.json(data);
   } catch (err: unknown) {
-    if (err instanceof ServiceError) {
+    if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
       res.status(err.statusCode).json({ error: err.message });
       return;
     }
@@ -43,6 +50,10 @@ publicBookingRouter.get('/slots/stream', (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
+
+  if (process.env.VERCEL === '1') {
+    res.write('retry: 15000\n');
+  }
 
   const sendEvent = (eventName: string, payload: unknown) => {
     if (res.writableEnded) return;
@@ -62,8 +73,21 @@ publicBookingRouter.get('/slots/stream', (req, res) => {
   }, 25_000);
   heartbeat.unref?.();
 
+  let vercelCloseTimer: ReturnType<typeof setTimeout> | null = null;
+  if (process.env.VERCEL === '1') {
+    vercelCloseTimer = setTimeout(() => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      if (!res.writableEnded) {
+        res.end();
+      }
+    }, 7_500);
+    vercelCloseTimer.unref?.();
+  }
+
   req.on('close', () => {
     clearInterval(heartbeat);
+    if (vercelCloseTimer) clearTimeout(vercelCloseTimer);
     unsubscribe();
     if (!res.writableEnded) {
       res.end();
@@ -71,16 +95,16 @@ publicBookingRouter.get('/slots/stream', (req, res) => {
   });
 });
 
-publicBookingRouter.get('/bookings/:id/status', (req, res) => {
+publicBookingRouter.get('/bookings/:id/status', async (req, res) => {
   const bookingId = req.params.id?.trim() ?? '';
   const statusToken =
     typeof req.query.token === 'string' ? req.query.token.trim() : '';
 
   try {
-    const statusRecord = getBookingLiveStatus(bookingId, statusToken);
+    const statusRecord = await getBookingLiveStatus(bookingId, statusToken);
     res.json({ bookingStatus: statusRecord });
   } catch (err: unknown) {
-    if (err instanceof ServiceError) {
+    if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
       res.status(err.statusCode).json({ error: err.message });
       return;
     }
@@ -89,7 +113,7 @@ publicBookingRouter.get('/bookings/:id/status', (req, res) => {
   }
 });
 
-publicBookingRouter.post('/bookings', bookingRateLimit, (req, res) => {
+publicBookingRouter.post('/bookings', bookingRateLimit, async (req, res) => {
   const body = req.body as Record<string, unknown> | null;
   if (!body || typeof body !== 'object') {
     res.status(400).json({ error: 'Invalid request body.' });
@@ -97,10 +121,10 @@ publicBookingRouter.post('/bookings', bookingRateLimit, (req, res) => {
   }
 
   try {
-    const booking = createBookingRequest(body);
+    const booking = await createBookingRequest(body);
     res.status(201).json({ booking });
   } catch (err: unknown) {
-    if (err instanceof ServiceError) {
+    if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
       res.status(err.statusCode).json({ error: err.message });
       return;
     }

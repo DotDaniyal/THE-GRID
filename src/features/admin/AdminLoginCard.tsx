@@ -18,6 +18,7 @@ interface AdminLoginCardProps {
 
 export function AdminLoginCard({
   setupRequired,
+  authMode,
   externalError,
   statusMessage,
   onAuthenticated,
@@ -185,6 +186,8 @@ export function AdminLoginCard({
                 ? 'Set your admin username and password to access the panel.'
                 : challengeToken
                 ? 'Enter the 6-digit verification code from your authenticator app.'
+                : authMode === 'legacy_passcode_fallback'
+                ? 'Sign in with your administrator username (e.g. admin) and configured passcode.'
                 : 'Sign in with your administrator username and password.'}
             </p>
           </div>
@@ -244,7 +247,7 @@ export function AdminLoginCard({
                 required
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="admin@thegrid.pk"
+                placeholder={authMode === 'legacy_passcode_fallback' ? 'admin' : 'admin@thegrid.pk'}
                 className="w-full min-h-[46px] px-3.5 py-2.5 text-sm text-white bg-[#0B1338] border border-white/20 rounded-lg focus:outline-none focus:border-[#c4d835] focus-visible:ring-2 focus-visible:ring-[#c4d835]"
               />
             </div>

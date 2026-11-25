@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import argon2 from 'argon2';
 import type { NextFunction, Request, Response } from 'express';
-import { getDb } from '../db/sqlite.ts';
+import { readCollection, updateCollection } from '../storage/jsonStore.ts';
+import type { AdminUserRecord } from '../storage/types.ts';
 import { verifyTotpCode } from '../utils/totp.ts';
 
 export const SESSION_COOKIE_NAME = 'thegrid_admin_session';
@@ -9,20 +10,10 @@ const DEFAULT_SESSION_TTL_MINUTES = 240; // 4 hours
 const MFA_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
 let cachedFallbackSecret: string | null = null;
-const DUMMY_PASSWORD_HASH = '$argon2id$v=19$m=65536,t=3,p=4$dummySaltySaltDataHere$dummyHashValueDataHerePlaceholder...';
+const DUMMY_PASSWORD_HASH =
+  '$argon2id$v=19$m=65536,t=3,p=4$dummySaltySaltDataHere$dummyHashValueDataHerePlaceholder...';
 
-export interface AdminUserRow {
-  id: number;
-  username: string;
-  display_name: string;
-  role: 'SUPER_ADMIN' | 'ADMIN';
-  password_hash: string;
-  mfa_enabled: number;
-  mfa_secret: string | null;
-  is_active: number;
-  created_at: string;
-  last_login_at: string | null;
-}
+export type AdminUserRow = AdminUserRecord;
 
 export interface AdminSessionContext {
   sessionId: string;
@@ -50,10 +41,34 @@ export function getSessionTtlMinutes(): number {
   return DEFAULT_SESSION_TTL_MINUTES;
 }
 
-function getSessionSecret(): string {
+function getEnvAdminPasscode(): string {
+  return process.env.ADMIN_PASSCODE?.trim() || '';
+}
+
+function getEnvAdminUsername(): string | null {
+  const configured = process.env.ADMIN_USERNAME?.trim();
+  return configured ? normalizeAdminUsername(configured) : null;
+}
+
+function constantTimeStringEqual(a: string, b: string): boolean {
+  const digestA = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const digestB = crypto.createHash('sha256').update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(digestA, digestB);
+}
+
+async function getSessionSecret(): Promise<string> {
   const envSecret = process.env.SESSION_SECRET?.trim();
   if (envSecret && envSecret.length >= 16) {
     return envSecret;
+  }
+
+  // Deterministic cross-container key when running on Vercel with ADMIN_PASSCODE
+  const envPasscode = getEnvAdminPasscode();
+  if (envPasscode) {
+    return crypto
+      .createHmac('sha256', 'thegrid-admin-session-secret-v1')
+      .update(envPasscode)
+      .digest('hex');
   }
 
   if (cachedFallbackSecret) {
@@ -61,23 +76,20 @@ function getSessionSecret(): string {
   }
 
   try {
-    const db = getDb();
-    const row = db
-      .prepare("SELECT value FROM app_meta WHERE key = 'session_secret'")
-      .get() as { value: string } | undefined;
-    if (row?.value) {
-      cachedFallbackSecret = row.value;
-      return row.value;
+    const adminSettings = await readCollection('admin-settings');
+    if (adminSettings.appMeta?.session_secret) {
+      cachedFallbackSecret = adminSettings.appMeta.session_secret;
+      return cachedFallbackSecret;
     }
 
     const generated = crypto.randomBytes(32).toString('hex');
-    db.prepare(
-      "INSERT OR IGNORE INTO app_meta (key, value) VALUES ('session_secret', ?)"
-    ).run(generated);
-    const stored = db
-      .prepare("SELECT value FROM app_meta WHERE key = 'session_secret'")
-      .get() as { value: string } | undefined;
-    cachedFallbackSecret = stored?.value || generated;
+    const { result: storedSecret } = await updateCollection('admin-settings', (draft) => {
+      if (!draft.appMeta.session_secret) {
+        draft.appMeta.session_secret = generated;
+      }
+      return draft.appMeta.session_secret;
+    });
+    cachedFallbackSecret = storedSecret || generated;
     return cachedFallbackSecret;
   } catch {
     cachedFallbackSecret = crypto.randomBytes(32).toString('hex');
@@ -86,16 +98,46 @@ function getSessionSecret(): string {
 }
 
 export async function hashPassword(password: string): Promise<string> {
-  return await argon2.hash(password, {
-    type: argon2.argon2id,
-    memoryCost: 65536,
-    timeCost: 3,
-    parallelism: 4,
-  });
+  try {
+    return await argon2.hash(password, {
+      type: argon2.argon2id,
+      memoryCost: 65536,
+      timeCost: 3,
+      parallelism: 4,
+    });
+  } catch {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+    return `$scrypt2$${salt}$${derived}`;
+  }
 }
 
 export async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
   if (!storedHash) return false;
+
+  if (storedHash.startsWith('$scrypt2$')) {
+    const parts = storedHash.split('$');
+    if (parts.length !== 4 || !parts[2] || !parts[3]) return false;
+    try {
+      const derived = crypto.scryptSync(password, parts[2], 64);
+      const expected = Buffer.from(parts[3], 'hex');
+      return derived.length === expected.length && crypto.timingSafeEqual(derived, expected);
+    } catch {
+      return false;
+    }
+  }
+
+  if (/^[0-9a-f]{32}:[0-9a-f]{128}$/i.test(storedHash)) {
+    const [salt, hashHex] = storedHash.split(':');
+    try {
+      const derived = crypto.scryptSync(password, salt, 64);
+      const expected = Buffer.from(hashHex, 'hex');
+      return derived.length === expected.length && crypto.timingSafeEqual(derived, expected);
+    } catch {
+      return false;
+    }
+  }
+
   try {
     return await argon2.verify(storedHash, password);
   } catch {
@@ -125,22 +167,34 @@ export function validateStrongPassword(password: string): string | null {
   return null;
 }
 
-export function getAdminAuthOverview(): {
+export async function getAdminAuthOverview(): Promise<{
   setupRequired: boolean;
-  authMode: 'named_accounts' | 'setup_required';
+  authMode: 'named_accounts' | 'legacy_passcode_fallback' | 'setup_required';
   hasNamedAccounts: boolean;
-} {
-  const db = getDb();
-  const namedCount = db
-    .prepare('SELECT COUNT(*) AS count FROM admin_users WHERE is_active = 1')
-    .get() as { count: number };
-  const hasNamedAccounts = namedCount.count > 0;
+}> {
+  let hasNamedAccounts = false;
+  try {
+    const adminSettings = await readCollection('admin-settings');
+    hasNamedAccounts = adminSettings.users.some((u) => u.is_active === 1);
+  } catch {
+    hasNamedAccounts = false;
+  }
+
+  const hasEnvPasscode = Boolean(getEnvAdminPasscode());
 
   if (hasNamedAccounts) {
     return {
       setupRequired: false,
       authMode: 'named_accounts',
       hasNamedAccounts: true,
+    };
+  }
+
+  if (hasEnvPasscode) {
+    return {
+      setupRequired: false,
+      authMode: 'legacy_passcode_fallback',
+      hasNamedAccounts: false,
     };
   }
 
@@ -155,7 +209,6 @@ export async function authenticateAdminCredentials(
   rawUsername: string,
   secretInput: string
 ): Promise<{ ok: true; user: AdminUserRow } | { ok: false }> {
-  const db = getDb();
   const username = normalizeAdminUsername(rawUsername);
 
   if (!username || !secretInput) {
@@ -163,40 +216,64 @@ export async function authenticateAdminCredentials(
     return { ok: false };
   }
 
-  const userRow = db
-    .prepare('SELECT * FROM admin_users WHERE username = ? AND is_active = 1')
-    .get(username) as unknown as AdminUserRow | undefined;
+  const adminSettings = await readCollection('admin-settings');
+  const userRow = adminSettings.users.find(
+    (u) => u.username === username && u.is_active === 1
+  );
 
   if (userRow) {
     const isValid = await verifyPassword(secretInput, userRow.password_hash);
     if (isValid) {
       return { ok: true, user: userRow };
     }
-    return { ok: false };
   }
 
-  // Constant-time dummy work so unknown usernames have identical response timing
+  const envPasscode = getEnvAdminPasscode();
+  if (envPasscode) {
+    const configuredUsername = getEnvAdminUsername();
+    const allowedUsernames = configuredUsername
+      ? [configuredUsername]
+      : ['admin', 'admin@thegrid.pk'];
+
+    if (allowedUsernames.includes(username) && constantTimeStringEqual(secretInput, envPasscode)) {
+      return {
+        ok: true,
+        user: {
+          id: 0,
+          username,
+          display_name: 'THE GRID Admin',
+          role: 'SUPER_ADMIN',
+          password_hash: '',
+          mfa_enabled: 0,
+          mfa_secret: null,
+          is_active: 1,
+          created_at: new Date().toISOString(),
+          last_login_at: null,
+        },
+      };
+    }
+  }
+
   await verifyPassword(secretInput, DUMMY_PASSWORD_HASH).catch(() => false);
   return { ok: false };
 }
 
-function signPayload(payloadObject: Record<string, unknown>): string {
+async function signPayload(payloadObject: Record<string, unknown>): Promise<string> {
+  const secret = await getSessionSecret();
   const payload = Buffer.from(JSON.stringify(payloadObject), 'utf8').toString('base64url');
-  const sig = crypto
-    .createHmac('sha256', getSessionSecret())
-    .update(payload)
-    .digest('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
   return `${payload}.${sig}`;
 }
 
-function verifySignedPayload<T>(token: string): T | null {
+async function verifySignedPayload<T>(token: string): Promise<T | null> {
   const parts = token.split('.');
   if (parts.length !== 2) return null;
   const [payload, sig] = parts;
   if (!payload || !sig) return null;
 
+  const secret = await getSessionSecret();
   const expectedSig = crypto
-    .createHmac('sha256', getSessionSecret())
+    .createHmac('sha256', secret)
     .update(payload)
     .digest('base64url');
 
@@ -212,7 +289,7 @@ function verifySignedPayload<T>(token: string): T | null {
   }
 }
 
-export function issueMfaChallengeToken(userId: number): string {
+export async function issueMfaChallengeToken(userId: number): Promise<string> {
   return signPayload({
     typ: 'mfa_challenge',
     uid: userId,
@@ -221,56 +298,67 @@ export function issueMfaChallengeToken(userId: number): string {
   });
 }
 
-export function verifyMfaChallengeToken(token: string): number | null {
-  const parsed = verifySignedPayload<{ typ?: string; uid?: number; exp?: number }>(token);
+export async function verifyMfaChallengeToken(token: string): Promise<number | null> {
+  const parsed = await verifySignedPayload<{ typ?: string; uid?: number; exp?: number }>(token);
   if (!parsed || parsed.typ !== 'mfa_challenge') return null;
   if (typeof parsed.uid !== 'number' || typeof parsed.exp !== 'number') return null;
   if (Date.now() > parsed.exp) return null;
   return parsed.uid;
 }
 
-export function verifyUserMfaCode(userId: number, code: string): AdminUserRow | null {
-  const db = getDb();
-  const row = db
-    .prepare('SELECT * FROM admin_users WHERE id = ? AND is_active = 1 AND mfa_enabled = 1')
-    .get(userId) as unknown as AdminUserRow | undefined;
+export async function verifyUserMfaCode(
+  userId: number,
+  code: string
+): Promise<AdminUserRow | null> {
+  const adminSettings = await readCollection('admin-settings');
+  const row = adminSettings.users.find(
+    (u) => u.id === userId && u.is_active === 1 && u.mfa_enabled === 1
+  );
   if (!row || !row.mfa_secret) return null;
   if (!verifyTotpCode(row.mfa_secret, code)) return null;
   return row;
 }
 
-export function createAdminSession(input: {
+export async function createAdminSession(input: {
   adminUserId: number;
   username: string;
   displayName: string;
   role: 'SUPER_ADMIN' | 'ADMIN';
-}): { token: string; sessionId: string; expiresAt: number } {
-  const db = getDb();
+  mfaEnabled?: boolean;
+}): Promise<{ token: string; sessionId: string; expiresAt: number }> {
   const ttlMs = getSessionTtlMinutes() * 60 * 1000;
   const expiresAt = Date.now() + ttlMs;
   const sessionId = crypto.randomBytes(16).toString('hex');
   const nowIso = new Date().toISOString();
+  const pruneCutoff = Date.now() - 86_400_000;
 
-  db.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').run(Date.now() - 86_400_000);
-
-  db.prepare(
-    `INSERT INTO admin_sessions (id, admin_user_id, username, display_name, role, expires_at, created_at, revoked_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`
-  ).run(
-    sessionId,
-    input.adminUserId,
-    input.username,
-    input.displayName,
-    input.role,
-    expiresAt,
-    nowIso
+  await updateCollection(
+    'admin-settings',
+    (draft) => {
+      draft.sessions = draft.sessions.filter((s) => s.expires_at >= pruneCutoff);
+      draft.sessions.push({
+        id: sessionId,
+        admin_user_id: input.adminUserId,
+        username: input.username,
+        display_name: input.displayName,
+        role: input.role,
+        expires_at: expiresAt,
+        created_at: nowIso,
+        revoked_at: null,
+      });
+    },
+    { skipBackup: true }
   );
 
-  const token = signPayload({
+  const token = await signPayload({
     typ: 'admin_session',
     sid: sessionId,
+    uid: input.adminUserId,
+    usr: input.username,
+    dsp: input.displayName,
+    rol: input.role,
+    mfa: Boolean(input.mfaEnabled),
     exp: expiresAt,
-    role: input.role,
   });
 
   return { token, sessionId, expiresAt };
@@ -294,8 +382,14 @@ export function parseCookies(cookieHeader: string | undefined): Record<string, s
   return result;
 }
 
+function getNormalizedFirstHeader(req: Request, headerName: string): string {
+  const value = req.get(headerName);
+  if (!value) return '';
+  return value.split(',')[0]?.trim().toLowerCase() || '';
+}
+
 function getCookieSecurityFlags(req: Request): string {
-  const forwardedProto = req.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+  const forwardedProto = getNormalizedFirstHeader(req, 'x-forwarded-proto');
   const origin = (req.get('origin') || '').toLowerCase();
   const referer = (req.get('referer') || '').toLowerCase();
   const isHttps =
@@ -304,7 +398,8 @@ function getCookieSecurityFlags(req: Request): string {
     origin.startsWith('https://') ||
     referer.startsWith('https://');
 
-  const host = (req.get('x-forwarded-host') || req.get('host') || '').toLowerCase();
+  const host =
+    getNormalizedFirstHeader(req, 'x-forwarded-host') || (req.get('host') || '').toLowerCase();
   const appUrl = (process.env.APP_URL || '').toLowerCase();
   const secFetchSite = (req.get('sec-fetch-site') || '').toLowerCase();
   const isEmbeddedIframe =
@@ -346,10 +441,17 @@ export function clearAdminSessionCookie(req: Request, res: Response): void {
   );
 }
 
-export function verifyAdminSessionToken(token: string): AdminSessionContext | null {
-  const parsed = verifySignedPayload<{
+export async function verifyAdminSessionToken(
+  token: string
+): Promise<AdminSessionContext | null> {
+  const parsed = await verifySignedPayload<{
     typ?: string;
     sid?: string;
+    uid?: number;
+    usr?: string;
+    dsp?: string;
+    rol?: 'SUPER_ADMIN' | 'ADMIN';
+    mfa?: boolean;
     exp?: number;
   }>(token);
   if (!parsed || parsed.typ !== 'admin_session' || !parsed.sid || typeof parsed.exp !== 'number') {
@@ -359,51 +461,92 @@ export function verifyAdminSessionToken(token: string): AdminSessionContext | nu
     return null;
   }
 
-  const db = getDb();
-  const sessionRow = db
-    .prepare(
-      `SELECT id, admin_user_id, username, display_name, role, expires_at, revoked_at
-       FROM admin_sessions WHERE id = ?`
-    )
-    .get(parsed.sid) as
-    | {
-        id: string;
-        admin_user_id: number | null;
-        username: string;
-        display_name: string;
-        role: 'SUPER_ADMIN' | 'ADMIN';
-        expires_at: number;
-        revoked_at: string | null;
+  const adminSettings = await readCollection('admin-settings');
+  const sessionRow = adminSettings.sessions.find((s) => s.id === parsed.sid);
+
+  if (sessionRow) {
+    if (
+      sessionRow.revoked_at ||
+      Date.now() > sessionRow.expires_at ||
+      sessionRow.admin_user_id === null
+    ) {
+      return null;
+    }
+
+    if (sessionRow.admin_user_id > 0) {
+      const userRow = adminSettings.users.find((u) => u.id === sessionRow.admin_user_id);
+      if (!userRow || userRow.is_active !== 1) {
+        return null;
       }
-    | undefined;
+      return {
+        sessionId: sessionRow.id,
+        adminUserId: sessionRow.admin_user_id,
+        username: sessionRow.username,
+        displayName: sessionRow.display_name,
+        role: sessionRow.role,
+        mfaEnabled: userRow.mfa_enabled === 1,
+        expiresAt: sessionRow.expires_at,
+      };
+    }
 
-  if (!sessionRow || sessionRow.revoked_at || Date.now() > sessionRow.expires_at || sessionRow.admin_user_id === null) {
-    return null;
+    return {
+      sessionId: sessionRow.id,
+      adminUserId: 0,
+      username: sessionRow.username,
+      displayName: sessionRow.display_name,
+      role: sessionRow.role,
+      mfaEnabled: false,
+      expiresAt: sessionRow.expires_at,
+    };
   }
 
-  const userRow = db
-    .prepare('SELECT mfa_enabled, is_active FROM admin_users WHERE id = ?')
-    .get(sessionRow.admin_user_id) as { mfa_enabled: number; is_active: number } | undefined;
-  if (!userRow || userRow.is_active !== 1) {
-    return null;
+  // Fallback for multi-container serverless setups if storage is not yet populated or partitioned
+  if (
+    process.env.VERCEL === '1' &&
+    typeof parsed.uid === 'number' &&
+    typeof parsed.usr === 'string' &&
+    typeof parsed.dsp === 'string' &&
+    (parsed.rol === 'SUPER_ADMIN' || parsed.rol === 'ADMIN')
+  ) {
+    if (parsed.uid > 0) {
+      const localUser = adminSettings.users.find(
+        (u) => u.id === parsed.uid && u.username === parsed.usr
+      );
+      if (localUser && localUser.is_active !== 1) {
+        return null;
+      }
+      return {
+        sessionId: parsed.sid,
+        adminUserId: parsed.uid,
+        username: parsed.usr,
+        displayName: parsed.dsp,
+        role: parsed.rol,
+        mfaEnabled: localUser ? localUser.mfa_enabled === 1 : Boolean(parsed.mfa),
+        expiresAt: parsed.exp,
+      };
+    }
+
+    return {
+      sessionId: parsed.sid,
+      adminUserId: 0,
+      username: parsed.usr,
+      displayName: parsed.dsp,
+      role: parsed.rol,
+      mfaEnabled: false,
+      expiresAt: parsed.exp,
+    };
   }
 
-  return {
-    sessionId: sessionRow.id,
-    adminUserId: sessionRow.admin_user_id,
-    username: sessionRow.username,
-    displayName: sessionRow.display_name,
-    role: sessionRow.role,
-    mfaEnabled: userRow.mfa_enabled === 1,
-    expiresAt: sessionRow.expires_at,
-  };
+  return null;
 }
 
-export function getAdminSessionFromRequest(req: Request): AdminSessionContext | null {
+export async function getAdminSessionFromRequest(
+  req: Request
+): Promise<AdminSessionContext | null> {
   const cookies = parseCookies(req.headers.cookie);
   const cookieToken = cookies[SESSION_COOKIE_NAME];
   if (cookieToken) {
-    const cookieSession = verifyAdminSessionToken(cookieToken);
+    const cookieSession = await verifyAdminSessionToken(cookieToken);
     if (cookieSession) return cookieSession;
   }
 
@@ -418,13 +561,31 @@ export function getAdminSessionFromRequest(req: Request): AdminSessionContext | 
   return null;
 }
 
-export function revokeAdminSessionFromRequest(req: Request): void {
-  const session = getAdminSessionFromRequest(req);
+export async function revokeAdminSessionFromRequest(req: Request): Promise<void> {
+  const session = await getAdminSessionFromRequest(req);
   if (!session) return;
-  const db = getDb();
-  db.prepare('UPDATE admin_sessions SET revoked_at = ? WHERE id = ?').run(
-    new Date().toISOString(),
-    session.sessionId
+
+  const nowIso = new Date().toISOString();
+  await updateCollection(
+    'admin-settings',
+    (draft) => {
+      const existing = draft.sessions.find((s) => s.id === session.sessionId);
+      if (existing) {
+        existing.revoked_at = nowIso;
+      } else {
+        draft.sessions.push({
+          id: session.sessionId,
+          admin_user_id: session.adminUserId,
+          username: session.username,
+          display_name: session.displayName,
+          role: session.role,
+          expires_at: session.expiresAt,
+          created_at: nowIso,
+          revoked_at: nowIso,
+        });
+      }
+    },
+    { skipBackup: true }
   );
 }
 
@@ -439,7 +600,8 @@ export function requireSameOriginForCookieMutation(
     return;
   }
 
-  const host = (req.get('x-forwarded-host') || req.get('host') || '').toLowerCase();
+  const forwardedHost = getNormalizedFirstHeader(req, 'x-forwarded-host');
+  const directHost = (req.get('host') || '').trim().toLowerCase();
   let appUrlHost = '';
   if (process.env.APP_URL) {
     try {
@@ -449,8 +611,12 @@ export function requireSameOriginForCookieMutation(
     }
   }
   const isAllowedHost = (candidateHost: string): boolean => {
-    if (!host && !appUrlHost) return true;
-    return candidateHost === host || (Boolean(appUrlHost) && candidateHost === appUrlHost);
+    if (!forwardedHost && !directHost && !appUrlHost) return true;
+    return (
+      (Boolean(forwardedHost) && candidateHost === forwardedHost) ||
+      (Boolean(directHost) && candidateHost === directHost) ||
+      (Boolean(appUrlHost) && candidateHost === appUrlHost)
+    );
   };
 
   const origin = req.get('origin');
@@ -494,16 +660,24 @@ export function requireSameOriginForCookieMutation(
   res.status(403).json({ error: 'Forbidden: Missing same-origin verification header.' });
 }
 
-export function requireAdminAuth(req: Request, res: Response, next: NextFunction): void {
-  const session = getAdminSessionFromRequest(req);
-  if (!session) {
-    clearAdminSessionCookie(req, res);
-    res.status(401).json({
-      error: 'Admin session expired or invalid. Please sign in again.',
-      code: 'SESSION_EXPIRED',
-    });
-    return;
+export async function requireAdminAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const session = await getAdminSessionFromRequest(req);
+    if (!session) {
+      clearAdminSessionCookie(req, res);
+      res.status(401).json({
+        error: 'Admin session expired or invalid. Please sign in again.',
+        code: 'SESSION_EXPIRED',
+      });
+      return;
+    }
+    req.adminSession = session;
+    next();
+  } catch (err) {
+    next(err);
   }
-  req.adminSession = session;
-  next();
 }

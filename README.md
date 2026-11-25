@@ -100,14 +100,15 @@ Official web platform and live hourly court booking system for **THE GRID by FC 
 Configure secrets via environment variables or hosting secrets panel (see `/.env.example`):
 
 - `PORT` (optional, defaults to `3000`)
+- `ADMIN_USERNAME` (optional username for env-configured admin login; defaults to `admin` or `admin@thegrid.pk` when `ADMIN_PASSCODE` is set)
 - `ADMIN_PASSCODE` (recommended preset passcode for `/admin` across Vercel / serverless deployments; if omitted on persistent Node servers, first visit prompts one-time setup)
-- `SESSION_SECRET` (recommended 16+ characters in production for admin session signing)
+- `SESSION_SECRET` (recommended 16+ characters in production for admin session cookie & Bearer token signing; deterministically derived from `ADMIN_PASSCODE` if omitted)
 - `SQLITE_DB_PATH` (optional custom writable path; defaults to `./data/thegrid.db`, automatically falling back to `/tmp/thegrid-data/thegrid.db` on Vercel)
 - `NODE_ENV` (`development` or `production`)
 
 ## Vercel Deployment Architecture
 
-- `vercel.json`: Routes `/api/*` to the Express Serverless Function (`api/index.ts`) and rewrites SPA client routes (`/`, `/booking`, `/booking/details`, `/admin`) to `/index.html` while preserving static assets.
+- `vercel.json`: Routes `/api/*` to the Express Serverless Function (`api/index.ts`) and rewrites SPA client routes (`/`, `/booking`, `/booking/details`, `/admin`, `/admin/*`) to `/index.html` while preserving static assets.
 - `api/index.ts`: Exports the shared Express API app (`src/server/app.ts`) for Vercel Node `22.x` (`engines.node` in `package.json`).
 - **Important Serverless Storage Note**: When running on stateless Vercel Serverless Functions without an external database, SQLite automatically writes to `/tmp/thegrid-data/thegrid.db`, which is ephemeral across cold starts. For permanent multi-instance persistence across serverless cold starts, host `npm start` on a Node 22 server with persistent volume storage at `./data/thegrid.db` or attach a persistent external database.
 
@@ -117,4 +118,4 @@ Configure secrets via environment variables or hosting secrets panel (see `/.env
 2. **Real-Time Synchronization**: Public booking views subscribe to `GET /api/slots/stream` (Server-Sent Events) alongside immediate central SQLite validation.
 3. **Pakistan Standard Time (`Asia/Karachi`)**: All hourly slots, calendar defaults, and expired-slot checks execute explicitly in `Asia/Karachi`.
 4. **WhatsApp Handoff**: After saving a `PENDING` booking request in SQLite, customers review a pre-filled WhatsApp summary and confirm delivery directly in WhatsApp (`+92 323 8148153`).
-5. **Admin Desk (`/admin`)**: Protected via Argon2 + HTTP-only session cookie / Bearer auth with optional TOTP MFA. Supports booking confirmations, notifications, operating hours/PKR rates, and private Drinks & Inventory sales/P&L tracking.
+5. **Admin Desk (`/admin`)**: Protected via Argon2 / constant-time env passcode + HMAC-signed HTTP-only session cookie & Bearer auth with optional TOTP MFA. Supports booking confirmations, notifications, operating hours/PKR rates, and private Drinks & Inventory sales/P&L tracking across `/admin`, `/admin/hours`, `/admin/drinks`, and `/admin/security`.

@@ -49,6 +49,7 @@ import {
   type DrinksAnalyticsReport,
   type ProductAnalyticsItem,
 } from '@/src/services/api/adminApi';
+import { ApiRequestError } from '@/src/services/api/client';
 import { addDaysToIsoDate, getKarachiTodayStr } from '@/src/utils/date';
 
 type SubTab = 'dashboard' | 'products' | 'sales' | 'expenses' | 'reports';
@@ -169,7 +170,11 @@ function getStockBadge(stock: number, minAlert: number): {
   };
 }
 
-export function AdminDrinksPanel() {
+interface AdminDrinksPanelProps {
+  onSessionExpired?: () => void;
+}
+
+export function AdminDrinksPanel({ onSessionExpired }: AdminDrinksPanelProps) {
   const [subTab, setSubTab] = useState<SubTab>('dashboard');
 
   // Shared filter state for analytics, sales, expenses, reports
@@ -274,13 +279,17 @@ export function AdminDrinksPanel() {
       setExpenses(expensesList);
       setReport(analyticsReport);
     } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        onSessionExpired?.();
+        return;
+      }
       setError(
         err instanceof Error ? err.message : 'Failed to load private drinks inventory data.'
       );
     } finally {
       setLoading(false);
     }
-  }, [filterFrom, filterTo, filterCategory, filterDrinkId]);
+  }, [filterFrom, filterTo, filterCategory, filterDrinkId, onSessionExpired]);
 
   useEffect(() => {
     void loadAllInventoryData();

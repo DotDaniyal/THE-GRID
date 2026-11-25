@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from 'express';
-import { getDb } from '../db/sqlite.ts';
+import { readCollection, updateCollection } from '../storage/jsonStore.ts';
 
 const LOCKOUT_TRACK_WINDOW_MS = 15 * 60 * 1000;
 const LOCKOUT_THRESHOLD = 5;
@@ -47,19 +47,13 @@ export function getLockoutDurationSeconds(failedCount: number): number {
   return 900;
 }
 
-export function checkAuthLockout(
+export async function checkAuthLockout(
   ip: string,
   now = Date.now()
-): { locked: boolean; retryAfterSeconds: number; failedCount: number } {
-  const db = getDb();
+): Promise<{ locked: boolean; retryAfterSeconds: number; failedCount: number }> {
+  const adminSettings = await readCollection('admin-settings');
   const attemptKey = `ip:${ip}`;
-  const row = db
-    .prepare(
-      'SELECT failed_count, first_failed_at, locked_until FROM admin_login_attempts WHERE attempt_key = ?'
-    )
-    .get(attemptKey) as
-    | { failed_count: number; first_failed_at: number; locked_until: number }
-    | undefined;
+  const row = adminSettings.loginAttempts.find((a) => a.attempt_key === attemptKey);
 
   if (!row) {
     return { locked: false, retryAfterSeconds: 0, failedCount: 0 };
@@ -74,58 +68,80 @@ export function checkAuthLockout(
   }
 
   if (now - row.first_failed_at > LOCKOUT_TRACK_WINDOW_MS) {
-    db.prepare('DELETE FROM admin_login_attempts WHERE attempt_key = ?').run(attemptKey);
+    await updateCollection(
+      'admin-settings',
+      (draft) => {
+        draft.loginAttempts = draft.loginAttempts.filter((a) => a.attempt_key !== attemptKey);
+      },
+      { skipBackup: true }
+    );
     return { locked: false, retryAfterSeconds: 0, failedCount: 0 };
   }
 
   return { locked: false, retryAfterSeconds: 0, failedCount: row.failed_count };
 }
 
-export function recordAuthFailure(
+export async function recordAuthFailure(
   ip: string,
   now = Date.now()
-): { locked: boolean; retryAfterSeconds: number; failedCount: number } {
-  const db = getDb();
+): Promise<{ locked: boolean; retryAfterSeconds: number; failedCount: number }> {
   const attemptKey = `ip:${ip}`;
-  const existing = db
-    .prepare(
-      'SELECT failed_count, first_failed_at, locked_until FROM admin_login_attempts WHERE attempt_key = ?'
-    )
-    .get(attemptKey) as
-    | { failed_count: number; first_failed_at: number; locked_until: number }
-    | undefined;
 
-  let nextCount = 1;
-  let firstFailedAt = now;
+  const { result } = await updateCollection(
+    'admin-settings',
+    (draft) => {
+      const existing = draft.loginAttempts.find((a) => a.attempt_key === attemptKey);
+      let nextCount = 1;
+      let firstFailedAt = now;
 
-  if (existing && now - existing.first_failed_at <= LOCKOUT_TRACK_WINDOW_MS) {
-    nextCount = existing.failed_count + 1;
-    firstFailedAt = existing.first_failed_at;
-  }
+      if (existing && now - existing.first_failed_at <= LOCKOUT_TRACK_WINDOW_MS) {
+        nextCount = existing.failed_count + 1;
+        firstFailedAt = existing.first_failed_at;
+      }
 
-  const lockoutSeconds = getLockoutDurationSeconds(nextCount);
-  const lockedUntil = lockoutSeconds > 0 ? now + lockoutSeconds * 1000 : 0;
+      const lockoutSeconds = getLockoutDurationSeconds(nextCount);
+      const lockedUntil = lockoutSeconds > 0 ? now + lockoutSeconds * 1000 : 0;
 
-  db.prepare(
-    `INSERT INTO admin_login_attempts (attempt_key, failed_count, first_failed_at, locked_until, updated_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(attempt_key) DO UPDATE SET
-       failed_count = excluded.failed_count,
-       first_failed_at = excluded.first_failed_at,
-       locked_until = excluded.locked_until,
-       updated_at = excluded.updated_at`
-  ).run(attemptKey, nextCount, firstFailedAt, lockedUntil, now);
+      if (existing) {
+        existing.failed_count = nextCount;
+        existing.first_failed_at = firstFailedAt;
+        existing.locked_until = lockedUntil;
+        existing.updated_at = now;
+      } else {
+        draft.loginAttempts.push({
+          attempt_key: attemptKey,
+          failed_count: nextCount,
+          first_failed_at: firstFailedAt,
+          locked_until: lockedUntil,
+          updated_at: now,
+        });
+      }
 
-  return {
-    locked: lockoutSeconds > 0,
-    retryAfterSeconds: lockoutSeconds,
-    failedCount: nextCount,
-  };
+      return {
+        locked: lockoutSeconds > 0,
+        retryAfterSeconds: lockoutSeconds,
+        failedCount: nextCount,
+      };
+    },
+    { skipBackup: true }
+  );
+
+  return result;
 }
 
-export function clearAuthFailures(ip: string): void {
-  const db = getDb();
-  db.prepare('DELETE FROM admin_login_attempts WHERE attempt_key = ?').run(`ip:${ip}`);
+export async function clearAuthFailures(ip: string): Promise<void> {
+  const attemptKey = `ip:${ip}`;
+  const adminSettings = await readCollection('admin-settings');
+  if (!adminSettings.loginAttempts.some((a) => a.attempt_key === attemptKey)) {
+    return;
+  }
+  await updateCollection(
+    'admin-settings',
+    (draft) => {
+      draft.loginAttempts = draft.loginAttempts.filter((a) => a.attempt_key !== attemptKey);
+    },
+    { skipBackup: true }
+  );
 }
 
 export const bookingRateLimit = createRateLimiter(

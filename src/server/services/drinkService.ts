@@ -1,8 +1,17 @@
-import { getDb } from '../db/sqlite.ts';
-import { getKarachiNow, isValidIsoDate } from '../utils/time.ts';
+import { isValidIsoDate, getKarachiNow } from '../utils/time.ts';
 import { ServiceError } from './bookingService.ts';
+import { readCollection, updateCollection } from '../storage/jsonStore.ts';
+import type {
+  DrinkCategory,
+  DrinkExpenseRecord,
+  DrinkProductRecord,
+  DrinkSaleAuditLogRecord,
+  DrinkSaleRecord,
+  DrinkStockAdjustmentRecord,
+  DrinkStockLevelRecord,
+} from '../storage/types.ts';
 
-export type DrinkCategory = 'cold_drinks' | 'water' | 'hydration_drinks';
+export type { DrinkCategory };
 
 export interface DrinkRow {
   id: number;
@@ -228,16 +237,63 @@ function normalizeSoldAt(rawSoldAt: unknown): { soldAt: string; saleDate: string
   };
 }
 
-export function getAllDrinksAdmin(): DrinkRow[] {
-  const db = getDb();
-  return db
-    .prepare('SELECT * FROM drinks ORDER BY category ASC, name ASC')
-    .all() as unknown as DrinkRow[];
+function combineProductWithStock(
+  product: DrinkProductRecord,
+  stockLevel?: DrinkStockLevelRecord
+): DrinkRow {
+  const currentStock = stockLevel?.current_stock ?? 0;
+  const openingStock = stockLevel?.opening_stock ?? 0;
+  return {
+    id: product.id,
+    name: product.name,
+    category: product.category,
+    brand: product.brand,
+    bottle_size: product.bottle_size,
+    purchase_price_pkr: product.purchase_price_pkr,
+    price_pkr: product.price_pkr,
+    opening_stock: openingStock,
+    current_stock: currentStock,
+    min_stock_alert: product.min_stock_alert,
+    description: product.description,
+    image_url: product.image_url,
+    is_available: currentStock > 0 ? 1 : 0,
+    is_active: product.is_active,
+    created_by: product.created_by,
+    updated_by: product.updated_by,
+    created_at: product.created_at,
+    updated_at: product.updated_at,
+  };
 }
 
-export function createDrink(raw: Record<string, unknown>, actorUsername = 'admin'): DrinkRow {
+export async function getAllDrinksAdmin(): Promise<DrinkRow[]> {
+  const [productsDoc, inventoryDoc] = await Promise.all([
+    readCollection('products'),
+    readCollection('inventory'),
+  ]);
+
+  const stockMap = new Map<number, DrinkStockLevelRecord>();
+  for (const sl of inventoryDoc.stockLevels) {
+    stockMap.set(sl.drink_id, sl);
+  }
+
+  const rows = productsDoc.records.map((p) =>
+    combineProductWithStock(p, stockMap.get(p.id))
+  );
+
+  return rows.sort((a, b) => {
+    if (a.category !== b.category) {
+      return a.category.localeCompare(b.category);
+    }
+    return a.name.localeCompare(b.name);
+  });
+}
+
+export async function createDrink(
+  raw: Record<string, unknown>,
+  actorUsername = 'admin'
+): Promise<DrinkRow> {
   const name = typeof raw.name === 'string' ? raw.name.trim() : '';
-  const category = typeof raw.category === 'string' ? raw.category.trim() : '';
+  const category = (typeof raw.category === 'string' ? raw.category.trim() : '') as DrinkCategory;
   const brand = typeof raw.brand === 'string' ? raw.brand.trim().slice(0, 80) : '';
   const bottleSize =
     typeof raw.bottleSize === 'string'
@@ -268,7 +324,6 @@ export function createDrink(raw: Record<string, unknown>, actorUsername = 'admin
   const description = typeof raw.description === 'string' ? raw.description.trim() || null : null;
   const imageUrl = sanitizeImageUrl(raw.imageUrl !== undefined ? raw.imageUrl : raw.image_url);
   const isActive = raw.isActive === false || raw.is_active === 0 ? 0 : 1;
-  const isAvailable = currentStock > 0 ? 1 : 0;
 
   if (name.length < 2 || name.length > 80) {
     throw new ServiceError(400, 'Product name must be between 2 and 80 characters.');
@@ -280,78 +335,87 @@ export function createDrink(raw: Record<string, unknown>, actorUsername = 'admin
     );
   }
 
-  const db = getDb();
   const nowIso = new Date().toISOString();
 
-  let newId = 0;
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    const info = db
-      .prepare(
-        `INSERT INTO drinks (
-          name, category, brand, bottle_size, purchase_price_pkr, price_pkr,
-          opening_stock, current_stock, min_stock_alert, description, image_url,
-          is_available, is_active, created_by, updated_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        name,
-        category,
-        brand,
-        bottleSize,
-        purchasePricePkr,
-        sellingPricePkr,
-        openingStock,
-        currentStock,
-        minStockAlert,
-        description,
-        imageUrl,
-        isAvailable,
-        isActive,
-        actorUsername,
-        actorUsername,
-        nowIso,
-        nowIso
-      );
+  let createdProduct!: DrinkProductRecord;
 
-    newId = Number(info.lastInsertRowid);
+  await updateCollection('products', (draft) => {
+    const newId = draft.nextId++;
+    createdProduct = {
+      id: newId,
+      name,
+      category,
+      brand,
+      bottle_size: bottleSize,
+      purchase_price_pkr: purchasePricePkr,
+      price_pkr: sellingPricePkr,
+      min_stock_alert: minStockAlert,
+      description,
+      image_url: imageUrl,
+      is_active: isActive,
+      created_by: actorUsername,
+      updated_by: actorUsername,
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+    draft.records.push(createdProduct);
+  });
+
+  let createdStockLevel!: DrinkStockLevelRecord;
+
+  await updateCollection('inventory', (draft) => {
+    createdStockLevel = {
+      drink_id: createdProduct.id,
+      opening_stock: openingStock,
+      current_stock: currentStock,
+      min_stock_alert: minStockAlert,
+      is_available: currentStock > 0 ? 1 : 0,
+      updated_by: actorUsername,
+      updated_at: nowIso,
+    };
+    draft.stockLevels.push(createdStockLevel);
 
     if (currentStock > 0) {
-      db.prepare(
-        `INSERT INTO drink_stock_adjustments (
-          drink_id, adjustment_type, delta_qty, previous_stock, new_stock, reason, created_by, created_at
-        ) VALUES (?, 'OPENING', ?, 0, ?, 'Initial product opening stock', ?, ?)`
-      ).run(newId, currentStock, currentStock, actorUsername, nowIso);
+      draft.adjustments.push({
+        id: draft.nextAdjustmentId++,
+        drink_id: createdProduct.id,
+        adjustment_type: 'OPENING',
+        delta_qty: currentStock,
+        previous_stock: 0,
+        new_stock: currentStock,
+        reason: 'Initial product opening stock',
+        created_by: actorUsername,
+        created_at: nowIso,
+      });
     }
+  });
 
-    db.exec('COMMIT;');
-  } catch (err) {
-    try {
-      db.exec('ROLLBACK;');
-    } catch {
-      // Ignore rollback errors
-    }
-    throw err;
-  }
-
-  return db.prepare('SELECT * FROM drinks WHERE id = ?').get(newId) as unknown as DrinkRow;
+  return combineProductWithStock(createdProduct, createdStockLevel);
 }
 
-export function updateDrink(
+export async function updateDrink(
   id: number,
   raw: Record<string, unknown>,
   actorUsername = 'admin'
-): DrinkRow {
-  const db = getDb();
-  const existing = db
-    .prepare('SELECT * FROM drinks WHERE id = ?')
-    .get(id) as unknown as DrinkRow | undefined;
+): Promise<DrinkRow> {
+  const [productsDoc, inventoryDoc] = await Promise.all([
+    readCollection('products'),
+    readCollection('inventory'),
+  ]);
+
+  const existing = productsDoc.records.find((p) => p.id === id);
   if (!existing) {
     throw new ServiceError(404, 'Product not found.');
   }
 
+  const existingStock = inventoryDoc.stockLevels.find((s) => s.drink_id === id);
+  const currentStockBefore = existingStock?.current_stock ?? 0;
+  const openingStockBefore = existingStock?.opening_stock ?? 0;
+
   const name = typeof raw.name === 'string' ? raw.name.trim() : existing.name;
-  const category = typeof raw.category === 'string' ? raw.category.trim() : existing.category;
+  const category = (
+    typeof raw.category === 'string' ? raw.category.trim() : existing.category
+  ) as DrinkCategory;
   const brand =
     typeof raw.brand === 'string' ? raw.brand.trim().slice(0, 80) : existing.brand;
   const bottleSize =
@@ -374,11 +438,11 @@ export function updateDrink(
   const openingStock =
     raw.openingStock !== undefined || raw.opening_stock !== undefined
       ? parseNonNegInt(raw.openingStock ?? raw.opening_stock, 'Opening stock')
-      : existing.opening_stock;
+      : openingStockBefore;
   const currentStock =
     raw.currentStock !== undefined || raw.current_stock !== undefined
       ? parseNonNegInt(raw.currentStock ?? raw.current_stock, 'Current stock')
-      : existing.current_stock;
+      : currentStockBefore;
   const minStockAlert =
     raw.minStockAlert !== undefined || raw.min_stock_alert !== undefined
       ? parseNonNegInt(raw.minStockAlert ?? raw.min_stock_alert, 'Minimum stock alert')
@@ -405,7 +469,6 @@ export function updateDrink(
         ? 1
         : 0
       : existing.is_active;
-  const isAvailable = currentStock > 0 ? 1 : 0;
 
   if (name.length < 2 || name.length > 80) {
     throw new ServiceError(400, 'Product name must be between 2 and 80 characters.');
@@ -415,69 +478,80 @@ export function updateDrink(
   }
 
   const nowIso = new Date().toISOString();
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    db.prepare(
-      `UPDATE drinks
-       SET name = ?, category = ?, brand = ?, bottle_size = ?,
-           purchase_price_pkr = ?, price_pkr = ?, opening_stock = ?,
-           current_stock = ?, min_stock_alert = ?, description = ?,
-           image_url = ?, is_available = ?, is_active = ?,
-           updated_by = ?, updated_at = ?
-       WHERE id = ?`
-    ).run(
+
+  let updatedProduct!: DrinkProductRecord;
+  await updateCollection('products', (draft) => {
+    const idx = draft.records.findIndex((p) => p.id === id);
+    if (idx === -1) {
+      throw new ServiceError(404, 'Product not found.');
+    }
+    draft.records[idx] = {
+      ...draft.records[idx],
       name,
       category,
       brand,
-      bottleSize,
-      purchasePricePkr,
-      sellingPricePkr,
-      openingStock,
-      currentStock,
-      minStockAlert,
+      bottle_size: bottleSize,
+      purchase_price_pkr: purchasePricePkr,
+      price_pkr: sellingPricePkr,
+      min_stock_alert: minStockAlert,
       description,
-      imageUrl,
-      isAvailable,
-      isActive,
-      actorUsername,
-      nowIso,
-      id
-    );
+      image_url: imageUrl,
+      is_active: isActive,
+      updated_by: actorUsername,
+      updated_at: nowIso,
+    };
+    updatedProduct = draft.records[idx];
+  });
 
-    if (currentStock !== existing.current_stock) {
-      const delta = currentStock - existing.current_stock;
-      db.prepare(
-        `INSERT INTO drink_stock_adjustments (
-          drink_id, adjustment_type, delta_qty, previous_stock, new_stock, reason, created_by, created_at
-        ) VALUES (?, ?, ?, ?, ?, 'Manual stock edit in product form', ?, ?)`
-      ).run(
-        id,
-        delta >= 0 ? 'RESTOCK' : 'REDUCTION',
-        delta,
-        existing.current_stock,
-        currentStock,
-        actorUsername,
-        nowIso
-      );
+  let updatedStock!: DrinkStockLevelRecord;
+  await updateCollection('inventory', (draft) => {
+    let sl = draft.stockLevels.find((s) => s.drink_id === id);
+    const prevStock = sl ? sl.current_stock : 0;
+    if (!sl) {
+      sl = {
+        drink_id: id,
+        opening_stock: openingStock,
+        current_stock: currentStock,
+        min_stock_alert: minStockAlert,
+        is_available: currentStock > 0 ? 1 : 0,
+        updated_by: actorUsername,
+        updated_at: nowIso,
+      };
+      draft.stockLevels.push(sl);
+    } else {
+      sl.opening_stock = openingStock;
+      sl.current_stock = currentStock;
+      sl.min_stock_alert = minStockAlert;
+      sl.is_available = currentStock > 0 ? 1 : 0;
+      sl.updated_by = actorUsername;
+      sl.updated_at = nowIso;
     }
-    db.exec('COMMIT;');
-  } catch (err) {
-    try {
-      db.exec('ROLLBACK;');
-    } catch {
-      // Ignore rollback errors
-    }
-    throw err;
-  }
+    updatedStock = { ...sl };
 
-  return db.prepare('SELECT * FROM drinks WHERE id = ?').get(id) as unknown as DrinkRow;
+    if (currentStock !== prevStock) {
+      const delta = currentStock - prevStock;
+      draft.adjustments.push({
+        id: draft.nextAdjustmentId++,
+        drink_id: id,
+        adjustment_type: delta >= 0 ? 'RESTOCK' : 'REDUCTION',
+        delta_qty: delta,
+        previous_stock: prevStock,
+        new_stock: currentStock,
+        reason: 'Manual stock edit in product form',
+        created_by: actorUsername,
+        created_at: nowIso,
+      });
+    }
+  });
+
+  return combineProductWithStock(updatedProduct, updatedStock);
 }
 
-export function adjustDrinkStock(
+export async function adjustDrinkStock(
   id: number,
   raw: Record<string, unknown>,
   actorUsername = 'admin'
-): { drink: DrinkRow; adjustment: DrinkStockAdjustmentRow } {
+): Promise<{ drink: DrinkRow; adjustment: DrinkStockAdjustmentRow }> {
   const deltaQty = Math.trunc(Number(raw.deltaQty ?? raw.delta_qty));
   const reason =
     typeof raw.reason === 'string' && raw.reason.trim()
@@ -490,501 +564,508 @@ export function adjustDrinkStock(
     throw new ServiceError(400, 'Stock adjustment quantity must be a non-zero integer.');
   }
 
-  const db = getDb();
-  const nowIso = new Date().toISOString();
-  let adjId = 0;
-
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    const existing = db
-      .prepare('SELECT * FROM drinks WHERE id = ?')
-      .get(id) as unknown as DrinkRow | undefined;
-    if (!existing) {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(404, 'Product not found.');
-    }
-
-    const nextStock = existing.current_stock + deltaQty;
-    if (nextStock < 0) {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(
-        400,
-        `Cannot reduce stock below 0 (current stock is ${existing.current_stock}).`
-      );
-    }
-
-    db.prepare(
-      `UPDATE drinks SET current_stock = ?, is_available = ?, updated_by = ?, updated_at = ? WHERE id = ?`
-    ).run(nextStock, nextStock > 0 ? 1 : 0, actorUsername, nowIso, id);
-
-    const adjInfo = db
-      .prepare(
-        `INSERT INTO drink_stock_adjustments (
-          drink_id, adjustment_type, delta_qty, previous_stock, new_stock, reason, created_by, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        id,
-        deltaQty > 0 ? 'RESTOCK' : 'REDUCTION',
-        deltaQty,
-        existing.current_stock,
-        nextStock,
-        reason,
-        actorUsername,
-        nowIso
-      );
-    adjId = Number(adjInfo.lastInsertRowid);
-    db.exec('COMMIT;');
-  } catch (err) {
-    if (err instanceof ServiceError) throw err;
-    try {
-      db.exec('ROLLBACK;');
-    } catch {
-      // Ignore rollback errors
-    }
-    throw err;
+  const productsDoc = await readCollection('products');
+  const product = productsDoc.records.find((p) => p.id === id);
+  if (!product) {
+    throw new ServiceError(404, 'Product not found.');
   }
 
-  const drink = db.prepare('SELECT * FROM drinks WHERE id = ?').get(id) as unknown as DrinkRow;
-  const adjustment = db
-    .prepare('SELECT * FROM drink_stock_adjustments WHERE id = ?')
-    .get(adjId) as unknown as DrinkStockAdjustmentRow;
+  const nowIso = new Date().toISOString();
+  let createdAdjustment!: DrinkStockAdjustmentRecord;
+  let updatedStockLevel!: DrinkStockLevelRecord;
+
+  await updateCollection('inventory', (draft) => {
+    let sl = draft.stockLevels.find((s) => s.drink_id === id);
+    if (!sl) {
+      sl = {
+        drink_id: id,
+        opening_stock: 0,
+        current_stock: 0,
+        min_stock_alert: product.min_stock_alert,
+        is_available: 0,
+        updated_by: actorUsername,
+        updated_at: nowIso,
+      };
+      draft.stockLevels.push(sl);
+    }
+
+    const nextStock = sl.current_stock + deltaQty;
+    if (nextStock < 0) {
+      throw new ServiceError(
+        400,
+        `Cannot reduce stock below 0 (current stock is ${sl.current_stock}).`
+      );
+    }
+
+    const prevStock = sl.current_stock;
+    sl.current_stock = nextStock;
+    sl.is_available = nextStock > 0 ? 1 : 0;
+    sl.updated_by = actorUsername;
+    sl.updated_at = nowIso;
+    updatedStockLevel = { ...sl };
+
+    createdAdjustment = {
+      id: draft.nextAdjustmentId++,
+      drink_id: id,
+      adjustment_type: deltaQty > 0 ? 'RESTOCK' : 'REDUCTION',
+      delta_qty: deltaQty,
+      previous_stock: prevStock,
+      new_stock: nextStock,
+      reason,
+      created_by: actorUsername,
+      created_at: nowIso,
+    };
+    draft.adjustments.push(createdAdjustment);
+  });
+
+  const drink = combineProductWithStock(product, updatedStockLevel);
+  const adjustment: DrinkStockAdjustmentRow = {
+    ...createdAdjustment,
+    drink_name: product.name,
+  };
 
   return { drink, adjustment };
 }
 
-export function deleteDrink(id: number): void {
-  const db = getDb();
-  const existing = db.prepare('SELECT id FROM drinks WHERE id = ?').get(id);
-  if (!existing) {
+export async function deleteDrink(id: number): Promise<void> {
+  const [productsDoc, salesDoc] = await Promise.all([
+    readCollection('products'),
+    readCollection('sales'),
+  ]);
+
+  const product = productsDoc.records.find((p) => p.id === id);
+  if (!product) {
     throw new ServiceError(404, 'Product not found.');
   }
-  const salesCount = db
-    .prepare('SELECT COUNT(*) AS count FROM drink_sales WHERE drink_id = ?')
-    .get(id) as { count: number };
-  if (salesCount.count > 0) {
+
+  const hasSalesHistory = salesDoc.records.some((s) => s.drink_id === id);
+  if (hasSalesHistory) {
     throw new ServiceError(
       409,
       'Cannot delete a product that has recorded sales history. Mark it Inactive instead to preserve accounting records.'
     );
   }
-  db.prepare('DELETE FROM drinks WHERE id = ?').run(id);
+
+  await updateCollection('products', (draft) => {
+    const idx = draft.records.findIndex((p) => p.id === id);
+    if (idx !== -1) {
+      draft.records.splice(idx, 1);
+    }
+  });
+
+  await updateCollection('inventory', (draft) => {
+    const idx = draft.stockLevels.findIndex((s) => s.drink_id === id);
+    if (idx !== -1) {
+      draft.stockLevels.splice(idx, 1);
+    }
+  });
 }
 
-export function getDrinkSales(filters?: {
+export async function getDrinkSales(filters?: {
   from?: string;
   to?: string;
   category?: string;
   drinkId?: number;
   includeCancelled?: boolean;
-}): DrinkSaleRow[] {
-  const db = getDb();
-  const where: string[] = [];
-  const params: Array<string | number> = [];
+}): Promise<DrinkSaleRow[]> {
+  const salesDoc = await readCollection('sales');
+  let filtered = salesDoc.records;
 
   if (filters?.from && isValidIsoDate(filters.from)) {
-    where.push('sale_date >= ?');
-    params.push(filters.from);
+    filtered = filtered.filter((s) => s.sale_date >= filters.from!);
   }
   if (filters?.to && isValidIsoDate(filters.to)) {
-    where.push('sale_date <= ?');
-    params.push(filters.to);
+    filtered = filtered.filter((s) => s.sale_date <= filters.to!);
   }
   if (filters?.category && VALID_CATEGORIES.has(filters.category)) {
-    where.push('category = ?');
-    params.push(filters.category);
+    filtered = filtered.filter((s) => s.category === filters.category);
   }
   if (filters?.drinkId && Number.isFinite(filters.drinkId)) {
-    where.push('drink_id = ?');
-    params.push(filters.drinkId);
+    filtered = filtered.filter((s) => s.drink_id === filters.drinkId);
   }
   if (filters?.includeCancelled === false) {
-    where.push("status = 'COMPLETED'");
+    filtered = filtered.filter((s) => s.status === 'COMPLETED');
   }
 
-  const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
-  return db
-    .prepare(`SELECT * FROM drink_sales ${clause} ORDER BY sale_date DESC, id DESC LIMIT 500`)
-    .all(...params) as unknown as DrinkSaleRow[];
+  filtered.sort((a, b) => {
+    if (a.sale_date !== b.sale_date) {
+      return b.sale_date.localeCompare(a.sale_date);
+    }
+    return b.id - a.id;
+  });
+
+  return filtered.slice(0, 500);
 }
 
-export function createDrinkSale(
+export async function createDrinkSale(
   raw: Record<string, unknown>,
   actorUsername = 'admin'
-): DrinkSaleRow {
+): Promise<DrinkSaleRow> {
   const drinkId = Number(raw.drinkId ?? raw.drink_id);
   const quantity = parsePositiveInt(raw.quantity, 'Quantity sold');
   const { soldAt, saleDate } = normalizeSoldAt(raw.soldAt ?? raw.sold_at);
-  const notes = typeof raw.notes === 'string' && raw.notes.trim() ? raw.notes.trim().slice(0, 250) : null;
+  const notes =
+    typeof raw.notes === 'string' && raw.notes.trim() ? raw.notes.trim().slice(0, 250) : null;
 
   if (!Number.isFinite(drinkId) || drinkId <= 0) {
     throw new ServiceError(400, 'Please select a valid product.');
   }
 
-  const db = getDb();
-  const nowIso = new Date().toISOString();
-  let newSaleId = 0;
+  const [productsDoc, inventoryDoc] = await Promise.all([
+    readCollection('products'),
+    readCollection('inventory'),
+  ]);
 
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    const product = db
-      .prepare('SELECT * FROM drinks WHERE id = ?')
-      .get(drinkId) as unknown as DrinkRow | undefined;
-
-    if (!product) {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(404, 'Selected product not found.');
-    }
-    if (product.is_active !== 1) {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(400, `"${product.name}" is inactive. Activate it before recording a sale.`);
-    }
-    if (quantity > product.current_stock) {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(
-        400,
-        `Insufficient stock for "${product.name}". Available: ${product.current_stock}, Requested: ${quantity}.`
-      );
-    }
-
-    const unitSellingPricePkr =
-      raw.unitSellingPricePkr !== undefined || raw.unit_selling_price_pkr !== undefined
-        ? parseNonNegInt(
-            raw.unitSellingPricePkr ?? raw.unit_selling_price_pkr,
-            'Selling price per unit'
-          )
-        : product.price_pkr;
-    const unitPurchasePricePkr =
-      raw.unitPurchasePricePkr !== undefined || raw.unit_purchase_price_pkr !== undefined
-        ? parseNonNegInt(
-            raw.unitPurchasePricePkr ?? raw.unit_purchase_price_pkr,
-            'Purchase cost per unit'
-          )
-        : product.purchase_price_pkr;
-
-    const totalSalePkr = unitSellingPricePkr * quantity;
-    const totalCostPkr = unitPurchasePricePkr * quantity;
-    const profitPkr = totalSalePkr - totalCostPkr;
-    const nextStock = product.current_stock - quantity;
-
-    const saleInfo = db
-      .prepare(
-        `INSERT INTO drink_sales (
-          drink_id, product_name, category, quantity,
-          unit_selling_price_pkr, total_sale_pkr, unit_purchase_price_pkr, total_cost_pkr, profit_pkr,
-          sold_at, sale_date, notes, status, created_by, updated_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?, ?, ?)`
-      )
-      .run(
-        product.id,
-        product.name,
-        product.category,
-        quantity,
-        unitSellingPricePkr,
-        totalSalePkr,
-        unitPurchasePricePkr,
-        totalCostPkr,
-        profitPkr,
-        soldAt,
-        saleDate,
-        notes,
-        actorUsername,
-        actorUsername,
-        nowIso,
-        nowIso
-      );
-    newSaleId = Number(saleInfo.lastInsertRowid);
-
-    db.prepare(
-      `UPDATE drinks SET current_stock = ?, is_available = ?, updated_by = ?, updated_at = ? WHERE id = ?`
-    ).run(nextStock, nextStock > 0 ? 1 : 0, actorUsername, nowIso, product.id);
-
-    db.prepare(
-      `INSERT INTO drink_stock_adjustments (
-        drink_id, adjustment_type, delta_qty, previous_stock, new_stock, reason, created_by, created_at
-      ) VALUES (?, 'SALE', ?, ?, ?, ?, ?, ?)`
-    ).run(
-      product.id,
-      -quantity,
-      product.current_stock,
-      nextStock,
-      `Sale #${newSaleId} (${quantity} unit${quantity === 1 ? '' : 's'})`,
-      actorUsername,
-      nowIso
+  const product = productsDoc.records.find((p) => p.id === drinkId);
+  if (!product) {
+    throw new ServiceError(404, 'Selected product not found.');
+  }
+  if (product.is_active !== 1) {
+    throw new ServiceError(
+      400,
+      `"${product.name}" is inactive. Activate it before recording a sale.`
     );
-
-    db.prepare(
-      `INSERT INTO drink_sale_audit_logs (sale_id, action, summary, actor_username, created_at)
-       VALUES (?, 'CREATED', ?, ?, ?)`
-    ).run(
-      newSaleId,
-      `Recorded sale of ${quantity} x ${product.name} @ PKR ${unitSellingPricePkr} (Total PKR ${totalSalePkr}, Profit PKR ${profitPkr}).`,
-      actorUsername,
-      nowIso
-    );
-
-    db.exec('COMMIT;');
-  } catch (err) {
-    if (err instanceof ServiceError) throw err;
-    try {
-      db.exec('ROLLBACK;');
-    } catch {
-      // Ignore rollback errors
-    }
-    throw err;
   }
 
-  return db.prepare('SELECT * FROM drink_sales WHERE id = ?').get(newSaleId) as unknown as DrinkSaleRow;
+  const stockLevel = inventoryDoc.stockLevels.find((s) => s.drink_id === drinkId);
+  const currentStock = stockLevel?.current_stock ?? 0;
+  if (quantity > currentStock) {
+    throw new ServiceError(
+      400,
+      `Insufficient stock for "${product.name}". Available: ${currentStock}, Requested: ${quantity}.`
+    );
+  }
+
+  const unitSellingPricePkr =
+    raw.unitSellingPricePkr !== undefined || raw.unit_selling_price_pkr !== undefined
+      ? parseNonNegInt(
+          raw.unitSellingPricePkr ?? raw.unit_selling_price_pkr,
+          'Selling price per unit'
+        )
+      : product.price_pkr;
+  const unitPurchasePricePkr =
+    raw.unitPurchasePricePkr !== undefined || raw.unit_purchase_price_pkr !== undefined
+      ? parseNonNegInt(
+          raw.unitPurchasePricePkr ?? raw.unit_purchase_price_pkr,
+          'Purchase cost per unit'
+        )
+      : product.purchase_price_pkr;
+
+  const totalSalePkr = unitSellingPricePkr * quantity;
+  const totalCostPkr = unitPurchasePricePkr * quantity;
+  const profitPkr = totalSalePkr - totalCostPkr;
+  const nextStock = currentStock - quantity;
+  const nowIso = new Date().toISOString();
+
+  let createdSale!: DrinkSaleRecord;
+
+  await updateCollection('sales', (draft) => {
+    const saleId = draft.nextSaleId++;
+    createdSale = {
+      id: saleId,
+      drink_id: product.id,
+      product_name: product.name,
+      category: product.category,
+      quantity,
+      unit_selling_price_pkr: unitSellingPricePkr,
+      total_sale_pkr: totalSalePkr,
+      unit_purchase_price_pkr: unitPurchasePricePkr,
+      total_cost_pkr: totalCostPkr,
+      profit_pkr: profitPkr,
+      sold_at: soldAt,
+      sale_date: saleDate,
+      notes,
+      status: 'COMPLETED',
+      created_by: actorUsername,
+      updated_by: actorUsername,
+      cancelled_by: null,
+      cancel_reason: null,
+      created_at: nowIso,
+      updated_at: nowIso,
+      cancelled_at: null,
+    };
+    draft.records.push(createdSale);
+
+    draft.auditLogs.push({
+      id: draft.nextAuditLogId++,
+      sale_id: saleId,
+      action: 'CREATED',
+      summary: `Recorded sale of ${quantity} x ${product.name} @ PKR ${unitSellingPricePkr} (Total PKR ${totalSalePkr}, Profit PKR ${profitPkr}).`,
+      actor_username: actorUsername,
+      created_at: nowIso,
+    });
+  });
+
+  await updateCollection('inventory', (draft) => {
+    let sl = draft.stockLevels.find((s) => s.drink_id === product.id);
+    if (!sl) {
+      sl = {
+        drink_id: product.id,
+        opening_stock: 0,
+        current_stock: 0,
+        min_stock_alert: product.min_stock_alert,
+        is_available: 0,
+        updated_by: actorUsername,
+        updated_at: nowIso,
+      };
+      draft.stockLevels.push(sl);
+    }
+    sl.current_stock = nextStock;
+    sl.is_available = nextStock > 0 ? 1 : 0;
+    sl.updated_by = actorUsername;
+    sl.updated_at = nowIso;
+
+    draft.adjustments.push({
+      id: draft.nextAdjustmentId++,
+      drink_id: product.id,
+      adjustment_type: 'SALE',
+      delta_qty: -quantity,
+      previous_stock: currentStock,
+      new_stock: nextStock,
+      reason: `Sale #${createdSale.id} (${quantity} unit${quantity === 1 ? '' : 's'})`,
+      created_by: actorUsername,
+      created_at: nowIso,
+    });
+  });
+
+  return createdSale;
 }
 
-export function updateDrinkSale(
+export async function updateDrinkSale(
   saleId: number,
   raw: Record<string, unknown>,
   actorUsername = 'admin'
-): DrinkSaleRow {
-  const db = getDb();
-  const nowIso = new Date().toISOString();
+): Promise<DrinkSaleRow> {
+  const [salesDoc, productsDoc, inventoryDoc] = await Promise.all([
+    readCollection('sales'),
+    readCollection('products'),
+    readCollection('inventory'),
+  ]);
 
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    const existingSale = db
-      .prepare('SELECT * FROM drink_sales WHERE id = ?')
-      .get(saleId) as unknown as DrinkSaleRow | undefined;
-
-    if (!existingSale) {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(404, 'Sale record not found.');
-    }
-    if (existingSale.status === 'CANCELLED') {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(400, 'Cancelled sales cannot be edited.');
-    }
-
-    const product = db
-      .prepare('SELECT * FROM drinks WHERE id = ?')
-      .get(existingSale.drink_id) as unknown as DrinkRow | undefined;
-    if (!product) {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(404, 'Associated product not found.');
-    }
-
-    const newQuantity =
-      raw.quantity !== undefined ? parsePositiveInt(raw.quantity, 'Quantity sold') : existingSale.quantity;
-    const unitSellingPricePkr =
-      raw.unitSellingPricePkr !== undefined || raw.unit_selling_price_pkr !== undefined
-        ? parseNonNegInt(
-            raw.unitSellingPricePkr ?? raw.unit_selling_price_pkr,
-            'Selling price per unit'
-          )
-        : existingSale.unit_selling_price_pkr;
-    const unitPurchasePricePkr =
-      raw.unitPurchasePricePkr !== undefined || raw.unit_purchase_price_pkr !== undefined
-        ? parseNonNegInt(
-            raw.unitPurchasePricePkr ?? raw.unit_purchase_price_pkr,
-            'Purchase cost per unit'
-          )
-        : existingSale.unit_purchase_price_pkr;
-
-    const { soldAt, saleDate } =
-      raw.soldAt !== undefined || raw.sold_at !== undefined
-        ? normalizeSoldAt(raw.soldAt ?? raw.sold_at)
-        : { soldAt: existingSale.sold_at, saleDate: existingSale.sale_date };
-    const notes =
-      raw.notes !== undefined
-        ? typeof raw.notes === 'string' && raw.notes.trim()
-          ? raw.notes.trim().slice(0, 250)
-          : null
-        : existingSale.notes;
-
-    // If newQuantity > oldQuantity, we need more stock; if less, stock returns
-    const stockDelta = existingSale.quantity - newQuantity;
-    const nextStock = product.current_stock + stockDelta;
-    if (nextStock < 0) {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(
-        400,
-        `Insufficient remaining stock to increase quantity to ${newQuantity}. Max possible: ${product.current_stock + existingSale.quantity}.`
-      );
-    }
-
-    const totalSalePkr = unitSellingPricePkr * newQuantity;
-    const totalCostPkr = unitPurchasePricePkr * newQuantity;
-    const profitPkr = totalSalePkr - totalCostPkr;
-
-    db.prepare(
-      `UPDATE drink_sales
-       SET quantity = ?, unit_selling_price_pkr = ?, total_sale_pkr = ?,
-           unit_purchase_price_pkr = ?, total_cost_pkr = ?, profit_pkr = ?,
-           sold_at = ?, sale_date = ?, notes = ?, updated_by = ?, updated_at = ?
-       WHERE id = ?`
-    ).run(
-      newQuantity,
-      unitSellingPricePkr,
-      totalSalePkr,
-      unitPurchasePricePkr,
-      totalCostPkr,
-      profitPkr,
-      soldAt,
-      saleDate,
-      notes,
-      actorUsername,
-      nowIso,
-      saleId
-    );
-
-    if (stockDelta !== 0) {
-      db.prepare(
-        `UPDATE drinks SET current_stock = ?, is_available = ?, updated_by = ?, updated_at = ? WHERE id = ?`
-      ).run(nextStock, nextStock > 0 ? 1 : 0, actorUsername, nowIso, product.id);
-
-      db.prepare(
-        `INSERT INTO drink_stock_adjustments (
-          drink_id, adjustment_type, delta_qty, previous_stock, new_stock, reason, created_by, created_at
-        ) VALUES (?, 'SALE_EDIT', ?, ?, ?, ?, ?, ?)`
-      ).run(
-        product.id,
-        stockDelta,
-        product.current_stock,
-        nextStock,
-        `Edited Sale #${saleId}: qty ${existingSale.quantity} -> ${newQuantity}`,
-        actorUsername,
-        nowIso
-      );
-    }
-
-    db.prepare(
-      `INSERT INTO drink_sale_audit_logs (sale_id, action, summary, actor_username, created_at)
-       VALUES (?, 'EDITED', ?, ?, ?)`
-    ).run(
-      saleId,
-      `Edited sale #${saleId}: qty ${existingSale.quantity}->${newQuantity}, total PKR ${existingSale.total_sale_pkr}->PKR ${totalSalePkr}.`,
-      actorUsername,
-      nowIso
-    );
-
-    db.exec('COMMIT;');
-  } catch (err) {
-    if (err instanceof ServiceError) throw err;
-    try {
-      db.exec('ROLLBACK;');
-    } catch {
-      // Ignore rollback errors
-    }
-    throw err;
+  const existingSale = salesDoc.records.find((s) => s.id === saleId);
+  if (!existingSale) {
+    throw new ServiceError(404, 'Sale record not found.');
+  }
+  if (existingSale.status === 'CANCELLED') {
+    throw new ServiceError(400, 'Cancelled sales cannot be edited.');
   }
 
-  return db.prepare('SELECT * FROM drink_sales WHERE id = ?').get(saleId) as unknown as DrinkSaleRow;
+  const product = productsDoc.records.find((p) => p.id === existingSale.drink_id);
+  if (!product) {
+    throw new ServiceError(404, 'Associated product not found.');
+  }
+
+  const stockLevel = inventoryDoc.stockLevels.find((s) => s.drink_id === product.id);
+  const currentStock = stockLevel?.current_stock ?? 0;
+
+  const newQuantity =
+    raw.quantity !== undefined
+      ? parsePositiveInt(raw.quantity, 'Quantity sold')
+      : existingSale.quantity;
+  const unitSellingPricePkr =
+    raw.unitSellingPricePkr !== undefined || raw.unit_selling_price_pkr !== undefined
+      ? parseNonNegInt(
+          raw.unitSellingPricePkr ?? raw.unit_selling_price_pkr,
+          'Selling price per unit'
+        )
+      : existingSale.unit_selling_price_pkr;
+  const unitPurchasePricePkr =
+    raw.unitPurchasePricePkr !== undefined || raw.unit_purchase_price_pkr !== undefined
+      ? parseNonNegInt(
+          raw.unitPurchasePricePkr ?? raw.unit_purchase_price_pkr,
+          'Purchase cost per unit'
+        )
+      : existingSale.unit_purchase_price_pkr;
+
+  const { soldAt, saleDate } =
+    raw.soldAt !== undefined || raw.sold_at !== undefined
+      ? normalizeSoldAt(raw.soldAt ?? raw.sold_at)
+      : { soldAt: existingSale.sold_at, saleDate: existingSale.sale_date };
+  const notes =
+    raw.notes !== undefined
+      ? typeof raw.notes === 'string' && raw.notes.trim()
+        ? raw.notes.trim().slice(0, 250)
+        : null
+      : existingSale.notes;
+
+  const stockDelta = existingSale.quantity - newQuantity;
+  const nextStock = currentStock + stockDelta;
+  if (nextStock < 0) {
+    throw new ServiceError(
+      400,
+      `Insufficient remaining stock to increase quantity to ${newQuantity}. Max possible: ${
+        currentStock + existingSale.quantity
+      }.`
+    );
+  }
+
+  const totalSalePkr = unitSellingPricePkr * newQuantity;
+  const totalCostPkr = unitPurchasePricePkr * newQuantity;
+  const profitPkr = totalSalePkr - totalCostPkr;
+  const nowIso = new Date().toISOString();
+
+  let updatedSale!: DrinkSaleRecord;
+
+  await updateCollection('sales', (draft) => {
+    const s = draft.records.find((rec) => rec.id === saleId);
+    if (!s) {
+      throw new ServiceError(404, 'Sale record not found.');
+    }
+    s.quantity = newQuantity;
+    s.unit_selling_price_pkr = unitSellingPricePkr;
+    s.total_sale_pkr = totalSalePkr;
+    s.unit_purchase_price_pkr = unitPurchasePricePkr;
+    s.total_cost_pkr = totalCostPkr;
+    s.profit_pkr = profitPkr;
+    s.sold_at = soldAt;
+    s.sale_date = saleDate;
+    s.notes = notes;
+    s.updated_by = actorUsername;
+    s.updated_at = nowIso;
+    updatedSale = { ...s };
+
+    draft.auditLogs.push({
+      id: draft.nextAuditLogId++,
+      sale_id: saleId,
+      action: 'EDITED',
+      summary: `Edited sale #${saleId}: qty ${existingSale.quantity}->${newQuantity}, total PKR ${existingSale.total_sale_pkr}->PKR ${totalSalePkr}.`,
+      actor_username: actorUsername,
+      created_at: nowIso,
+    });
+  });
+
+  if (stockDelta !== 0) {
+    await updateCollection('inventory', (draft) => {
+      const sl = draft.stockLevels.find((s) => s.drink_id === product.id);
+      if (sl) {
+        sl.current_stock = nextStock;
+        sl.is_available = nextStock > 0 ? 1 : 0;
+        sl.updated_by = actorUsername;
+        sl.updated_at = nowIso;
+      }
+      draft.adjustments.push({
+        id: draft.nextAdjustmentId++,
+        drink_id: product.id,
+        adjustment_type: 'SALE_EDIT',
+        delta_qty: stockDelta,
+        previous_stock: currentStock,
+        new_stock: nextStock,
+        reason: `Edited Sale #${saleId}: qty ${existingSale.quantity} -> ${newQuantity}`,
+        created_by: actorUsername,
+        created_at: nowIso,
+      });
+    });
+  }
+
+  return updatedSale;
 }
 
-export function cancelDrinkSale(
+export async function cancelDrinkSale(
   saleId: number,
   reason: string | null,
   actorUsername = 'admin'
-): DrinkSaleRow {
-  const db = getDb();
-  const nowIso = new Date().toISOString();
+): Promise<DrinkSaleRow> {
+  const salesDoc = await readCollection('sales');
+  const existingSale = salesDoc.records.find((s) => s.id === saleId);
+  if (!existingSale) {
+    throw new ServiceError(404, 'Sale record not found.');
+  }
+  if (existingSale.status === 'CANCELLED') {
+    throw new ServiceError(400, 'This sale has already been cancelled.');
+  }
+
   const cleanReason =
     typeof reason === 'string' && reason.trim()
       ? reason.trim().slice(0, 200)
       : 'Sale cancelled by admin';
 
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    const existingSale = db
-      .prepare('SELECT * FROM drink_sales WHERE id = ?')
-      .get(saleId) as unknown as DrinkSaleRow | undefined;
+  const nowIso = new Date().toISOString();
+  let cancelledSale!: DrinkSaleRecord;
 
-    if (!existingSale) {
-      db.exec('ROLLBACK;');
+  await updateCollection('sales', (draft) => {
+    const s = draft.records.find((rec) => rec.id === saleId);
+    if (!s) {
       throw new ServiceError(404, 'Sale record not found.');
     }
-    if (existingSale.status === 'CANCELLED') {
-      db.exec('ROLLBACK;');
-      throw new ServiceError(400, 'This sale has already been cancelled.');
+    s.status = 'CANCELLED';
+    s.cancelled_by = actorUsername;
+    s.cancel_reason = cleanReason;
+    s.cancelled_at = nowIso;
+    s.updated_by = actorUsername;
+    s.updated_at = nowIso;
+    cancelledSale = { ...s };
+
+    draft.auditLogs.push({
+      id: draft.nextAuditLogId++,
+      sale_id: saleId,
+      action: 'CANCELLED',
+      summary: `Cancelled sale #${saleId} (${existingSale.quantity} x ${existingSale.product_name}) and restored stock. Reason: ${cleanReason}`,
+      actor_username: actorUsername,
+      created_at: nowIso,
+    });
+  });
+
+  await updateCollection('inventory', (draft) => {
+    const sl = draft.stockLevels.find((s) => s.drink_id === existingSale.drink_id);
+    if (sl) {
+      const restoredStock = sl.current_stock + existingSale.quantity;
+      const prevStock = sl.current_stock;
+      sl.current_stock = restoredStock;
+      sl.is_available = restoredStock > 0 ? 1 : 0;
+      sl.updated_by = actorUsername;
+      sl.updated_at = nowIso;
+
+      draft.adjustments.push({
+        id: draft.nextAdjustmentId++,
+        drink_id: existingSale.drink_id,
+        adjustment_type: 'SALE_CANCEL',
+        delta_qty: existingSale.quantity,
+        previous_stock: prevStock,
+        new_stock: restoredStock,
+        reason: `Cancelled Sale #${saleId}: ${cleanReason}`,
+        created_by: actorUsername,
+        created_at: nowIso,
+      });
     }
+  });
 
-    const product = db
-      .prepare('SELECT * FROM drinks WHERE id = ?')
-      .get(existingSale.drink_id) as unknown as DrinkRow | undefined;
-
-    db.prepare(
-      `UPDATE drink_sales
-       SET status = 'CANCELLED', cancelled_by = ?, cancel_reason = ?, cancelled_at = ?, updated_by = ?, updated_at = ?
-       WHERE id = ?`
-    ).run(actorUsername, cleanReason, nowIso, actorUsername, nowIso, saleId);
-
-    if (product) {
-      const restoredStock = product.current_stock + existingSale.quantity;
-      db.prepare(
-        `UPDATE drinks SET current_stock = ?, is_available = ?, updated_by = ?, updated_at = ? WHERE id = ?`
-      ).run(restoredStock, restoredStock > 0 ? 1 : 0, actorUsername, nowIso, product.id);
-
-      db.prepare(
-        `INSERT INTO drink_stock_adjustments (
-          drink_id, adjustment_type, delta_qty, previous_stock, new_stock, reason, created_by, created_at
-        ) VALUES (?, 'SALE_CANCEL', ?, ?, ?, ?, ?, ?)`
-      ).run(
-        product.id,
-        existingSale.quantity,
-        product.current_stock,
-        restoredStock,
-        `Cancelled Sale #${saleId}: ${cleanReason}`,
-        actorUsername,
-        nowIso
-      );
-    }
-
-    db.prepare(
-      `INSERT INTO drink_sale_audit_logs (sale_id, action, summary, actor_username, created_at)
-       VALUES (?, 'CANCELLED', ?, ?, ?)`
-    ).run(
-      saleId,
-      `Cancelled sale #${saleId} (${existingSale.quantity} x ${existingSale.product_name}) and restored stock. Reason: ${cleanReason}`,
-      actorUsername,
-      nowIso
-    );
-
-    db.exec('COMMIT;');
-  } catch (err) {
-    if (err instanceof ServiceError) throw err;
-    try {
-      db.exec('ROLLBACK;');
-    } catch {
-      // Ignore rollback errors
-    }
-    throw err;
-  }
-
-  return db.prepare('SELECT * FROM drink_sales WHERE id = ?').get(saleId) as unknown as DrinkSaleRow;
+  return cancelledSale;
 }
 
-export function getDrinkExpenses(filters?: { from?: string; to?: string }): DrinkExpenseRow[] {
-  const db = getDb();
-  const where: string[] = [];
-  const params: string[] = [];
+export async function getDrinkExpenses(filters?: {
+  from?: string;
+  to?: string;
+}): Promise<DrinkExpenseRow[]> {
+  const expensesDoc = await readCollection('expenses');
+  let records = expensesDoc.records;
+
   if (filters?.from && isValidIsoDate(filters.from)) {
-    where.push('expense_date >= ?');
-    params.push(filters.from);
+    records = records.filter((e) => e.expense_date >= filters.from!);
   }
   if (filters?.to && isValidIsoDate(filters.to)) {
-    where.push('expense_date <= ?');
-    params.push(filters.to);
+    records = records.filter((e) => e.expense_date <= filters.to!);
   }
-  const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
-  return db
-    .prepare(`SELECT * FROM drink_expenses ${clause} ORDER BY expense_date DESC, id DESC LIMIT 300`)
-    .all(...params) as unknown as DrinkExpenseRow[];
+
+  records.sort((a, b) => {
+    if (a.expense_date !== b.expense_date) {
+      return b.expense_date.localeCompare(a.expense_date);
+    }
+    return b.id - a.id;
+  });
+
+  return records.slice(0, 300);
 }
 
-export function createDrinkExpense(
+export async function createDrinkExpense(
   raw: Record<string, unknown>,
   actorUsername = 'admin'
-): DrinkExpenseRow {
+): Promise<DrinkExpenseRow> {
   const title = typeof raw.title === 'string' ? raw.title.trim() : '';
   const amountPkr = parsePositiveInt(raw.amountPkr ?? raw.amount_pkr, 'Expense amount');
-  const rawDate = typeof (raw.expenseDate ?? raw.expense_date) === 'string'
-    ? String(raw.expenseDate ?? raw.expense_date).trim()
-    : getKarachiNow().dateStr;
+  const rawDate =
+    typeof (raw.expenseDate ?? raw.expense_date) === 'string'
+      ? String(raw.expenseDate ?? raw.expense_date).trim()
+      : getKarachiNow().dateStr;
   const description =
     typeof raw.description === 'string' && raw.description.trim()
       ? raw.description.trim().slice(0, 250)
@@ -997,92 +1078,102 @@ export function createDrinkExpense(
     throw new ServiceError(400, 'Invalid expense date.');
   }
 
-  const db = getDb();
   const nowIso = new Date().toISOString();
-  const info = db
-    .prepare(
-      `INSERT INTO drink_expenses (title, amount_pkr, expense_date, description, created_by, updated_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(title, amountPkr, rawDate, description, actorUsername, actorUsername, nowIso, nowIso);
+  let createdExpense!: DrinkExpenseRecord;
 
-  const id = Number(info.lastInsertRowid);
-  return db.prepare('SELECT * FROM drink_expenses WHERE id = ?').get(id) as unknown as DrinkExpenseRow;
+  await updateCollection('expenses', (draft) => {
+    const id = draft.nextId++;
+    createdExpense = {
+      id,
+      title,
+      amount_pkr: amountPkr,
+      expense_date: rawDate,
+      description,
+      created_by: actorUsername,
+      updated_by: actorUsername,
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+    draft.records.push(createdExpense);
+  });
+
+  return createdExpense;
 }
 
-export function deleteDrinkExpense(id: number): void {
-  const db = getDb();
-  const existing = db.prepare('SELECT id FROM drink_expenses WHERE id = ?').get(id);
-  if (!existing) {
-    throw new ServiceError(404, 'Expense record not found.');
-  }
-  db.prepare('DELETE FROM drink_expenses WHERE id = ?').run(id);
+export async function deleteDrinkExpense(id: number): Promise<void> {
+  await updateCollection('expenses', (draft) => {
+    const idx = draft.records.findIndex((e) => e.id === id);
+    if (idx === -1) {
+      throw new ServiceError(404, 'Expense record not found.');
+    }
+    draft.records.splice(idx, 1);
+  });
 }
 
-export function getDrinksAnalyticsAndReports(filters?: {
+export async function getDrinksAnalyticsAndReports(filters?: {
   from?: string;
   to?: string;
   category?: string;
   drinkId?: number;
-}): DrinksAnalyticsReport {
-  const db = getDb();
+}): Promise<DrinksAnalyticsReport> {
+  const [productsDoc, inventoryDoc, salesDoc, expensesDoc] = await Promise.all([
+    readCollection('products'),
+    readCollection('inventory'),
+    readCollection('sales'),
+    readCollection('expenses'),
+  ]);
+
   const from = filters?.from && isValidIsoDate(filters.from) ? filters.from : null;
   const to = filters?.to && isValidIsoDate(filters.to) ? filters.to : null;
-  const category = filters?.category && VALID_CATEGORIES.has(filters.category) ? filters.category : null;
-  const drinkId = filters?.drinkId && Number.isFinite(filters.drinkId) ? Number(filters.drinkId) : null;
+  const category =
+    filters?.category && VALID_CATEGORIES.has(filters.category) ? filters.category : null;
+  const drinkId =
+    filters?.drinkId && Number.isFinite(filters.drinkId) ? Number(filters.drinkId) : null;
 
-  const prodWhere: string[] = [];
-  const prodParams: Array<string | number> = [];
+  const stockMap = new Map<number, DrinkStockLevelRecord>();
+  for (const sl of inventoryDoc.stockLevels) {
+    stockMap.set(sl.drink_id, sl);
+  }
+
+  let products = productsDoc.records.map((p) =>
+    combineProductWithStock(p, stockMap.get(p.id))
+  );
+
   if (category) {
-    prodWhere.push('category = ?');
-    prodParams.push(category);
+    products = products.filter((p) => p.category === category);
   }
   if (drinkId) {
-    prodWhere.push('id = ?');
-    prodParams.push(drinkId);
+    products = products.filter((p) => p.id === drinkId);
   }
-  const prodClause = prodWhere.length > 0 ? `WHERE ${prodWhere.join(' AND ')}` : '';
-  const products = db
-    .prepare(`SELECT * FROM drinks ${prodClause} ORDER BY category ASC, name ASC`)
-    .all(...prodParams) as unknown as DrinkRow[];
 
-  const saleWhere: string[] = ["status = 'COMPLETED'"];
-  const saleParams: Array<string | number> = [];
+  products.sort((a, b) => {
+    if (a.category !== b.category) {
+      return a.category.localeCompare(b.category);
+    }
+    return a.name.localeCompare(b.name);
+  });
+
+  let sales = salesDoc.records.filter((s) => s.status === 'COMPLETED');
   if (from) {
-    saleWhere.push('sale_date >= ?');
-    saleParams.push(from);
+    sales = sales.filter((s) => s.sale_date >= from);
   }
   if (to) {
-    saleWhere.push('sale_date <= ?');
-    saleParams.push(to);
+    sales = sales.filter((s) => s.sale_date <= to);
   }
   if (category) {
-    saleWhere.push('category = ?');
-    saleParams.push(category);
+    sales = sales.filter((s) => s.category === category);
   }
   if (drinkId) {
-    saleWhere.push('drink_id = ?');
-    saleParams.push(drinkId);
+    sales = sales.filter((s) => s.drink_id === drinkId);
   }
-  const saleClause = `WHERE ${saleWhere.join(' AND ')}`;
-  const sales = db
-    .prepare(`SELECT * FROM drink_sales ${saleClause}`)
-    .all(...saleParams) as unknown as DrinkSaleRow[];
 
-  const expWhere: string[] = [];
-  const expParams: string[] = [];
+  let expenses = expensesDoc.records;
   if (from) {
-    expWhere.push('expense_date >= ?');
-    expParams.push(from);
+    expenses = expenses.filter((e) => e.expense_date >= from);
   }
   if (to) {
-    expWhere.push('expense_date <= ?');
-    expParams.push(to);
+    expenses = expenses.filter((e) => e.expense_date <= to);
   }
-  const expClause = expWhere.length > 0 ? `WHERE ${expWhere.join(' AND ')}` : '';
-  const expenses = db
-    .prepare(`SELECT * FROM drink_expenses ${expClause}`)
-    .all(...expParams) as unknown as DrinkExpenseRow[];
 
   const salesByProduct = new Map<
     number,
@@ -1198,18 +1289,22 @@ export function getDrinksAnalyticsAndReports(filters?: {
     };
   });
 
-  const recentAdjustments = db
-    .prepare(
-      `SELECT a.*, d.name AS drink_name
-       FROM drink_stock_adjustments a
-       LEFT JOIN drinks d ON a.drink_id = d.id
-       ORDER BY a.id DESC LIMIT 50`
-    )
-    .all() as unknown as DrinkStockAdjustmentRow[];
+  const productNameMap = new Map<number, string>();
+  for (const p of productsDoc.records) {
+    productNameMap.set(p.id, p.name);
+  }
 
-  const recentSaleLogs = db
-    .prepare('SELECT * FROM drink_sale_audit_logs ORDER BY id DESC LIMIT 50')
-    .all() as unknown as DrinkSaleAuditLogRow[];
+  const recentAdjustments: DrinkStockAdjustmentRow[] = inventoryDoc.adjustments
+    .slice(-50)
+    .reverse()
+    .map((a) => ({
+      ...a,
+      drink_name: productNameMap.get(a.drink_id) || 'Unknown Drink',
+    }));
+
+  const recentSaleLogs: DrinkSaleAuditLogRow[] = salesDoc.auditLogs
+    .slice(-50)
+    .reverse();
 
   return {
     filters: { from, to, category, drinkId },
