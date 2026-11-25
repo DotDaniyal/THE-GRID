@@ -28,7 +28,7 @@ export function getAdminPathForTab(tab: AdminTab): string {
   if (tab === 'hours') return '/admin/hours';
   if (tab === 'drinks') return '/admin/drinks';
   if (tab === 'security') return '/admin/security';
-  return '/admin';
+  return '/admin/dashboard';
 }
 
 export const ROUTE_META: Record<AppRoute, RouteMeta> = {

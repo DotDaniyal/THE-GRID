@@ -6,6 +6,8 @@ import { ApiRequestError } from '@/src/services/api/client';
 interface AdminLoginCardProps {
   setupRequired: boolean;
   authMode: 'named_accounts' | 'legacy_passcode_fallback' | 'setup_required';
+  storageConfigured?: boolean;
+  storageMessage?: string | null;
   externalError: string | null;
   statusMessage: string | null;
   onAuthenticated: (session: {
@@ -19,6 +21,8 @@ interface AdminLoginCardProps {
 export function AdminLoginCard({
   setupRequired,
   authMode,
+  storageConfigured = true,
+  storageMessage = null,
   externalError,
   statusMessage,
   onAuthenticated,
@@ -108,11 +112,19 @@ export function AdminLoginCard({
           });
         }
       } catch (err) {
-        if (err instanceof ApiRequestError && err.status === 429 && err.retryAfterSeconds) {
-          setLockoutSeconds(err.retryAfterSeconds);
-          setChallengeToken(null);
+        if (err instanceof ApiRequestError) {
+          if (err.status === 429 && err.retryAfterSeconds) {
+            setLockoutSeconds(err.retryAfterSeconds);
+            setChallengeToken(null);
+          }
+          setLocalError(
+            err.status === 401
+              ? 'Invalid verification code. Please try again.'
+              : err.message
+          );
+        } else {
+          setLocalError(err instanceof Error ? err.message : 'Invalid sign-in details. Please try again.');
         }
-        setLocalError('Invalid sign-in details. Please try again.');
       } finally {
         setSubmitting(false);
       }
@@ -187,11 +199,27 @@ export function AdminLoginCard({
                 : challengeToken
                 ? 'Enter the 6-digit verification code from your authenticator app.'
                 : authMode === 'legacy_passcode_fallback'
-                ? 'Sign in with your administrator username (e.g. admin) and configured passcode.'
+                ? 'Sign in with your administrator username and configured passcode.'
                 : 'Sign in with your administrator username and password.'}
             </p>
           </div>
         </div>
+
+        {!storageConfigured && (
+          <div
+            role="alert"
+            aria-live="polite"
+            className="rounded-lg border border-amber-400/45 bg-amber-950/50 px-3.5 py-2.5 text-xs text-amber-200 space-y-1"
+          >
+            <div className="font-bold uppercase tracking-wide text-amber-300">
+              Server Storage Configuration Needed
+            </div>
+            <p>
+              {storageMessage ||
+                'Persistent storage is not configured in this deployment. Configure Vercel Blob (BLOB_READ_WRITE_TOKEN) or Upstash Redis in project environment variables.'}
+            </p>
+          </div>
+        )}
 
         {statusMessage && (
           <div

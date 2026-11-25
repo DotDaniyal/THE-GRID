@@ -5,6 +5,7 @@ import {
   SLOT_DURATION_MINUTES,
   VENUE_NAME,
 } from '../config/constants.ts';
+import { appendAuditLogOnDraft } from '../middleware/auth.ts';
 import { emitSlotUpdate, type SlotSyncEvent } from '../events/bookingEvents.ts';
 import { readCollection, updateCollection, withSlotLock } from '../storage/jsonStore.ts';
 import type {
@@ -65,6 +66,7 @@ export interface CreatedBookingRecord {
   customerEmail: string;
   countryCode: string;
   customerPhone: string;
+  customerNotes?: string | null;
   additionalGuestsCount: number;
   totalAmountPkr: number;
   status: 'PENDING';
@@ -113,9 +115,19 @@ export function applyExpiredPendingBookingsOnDraft(
     if (isBookingHoldExpired(record, nowIso, legacyCutoffIso)) {
       record.status = 'CANCELLED';
       record.hold_expires_at = null;
+      record.cancelled_at = nowIso;
+      record.cancelled_by = 'system';
       record.admin_notes =
         record.admin_notes ?? 'Auto-released after 30-minute hold expiry';
       record.updated_at = nowIso;
+
+      appendAuditLogOnDraft(bookingsCol, {
+        action: 'BOOKING_EXPIRED',
+        actor: 'system',
+        targetId: record.id,
+        summary: `Hold expired and slot ${record.booking_date} ${record.start_time} auto-released (${record.id}).`,
+        createdAt: nowIso,
+      });
 
       events.push({
         type: 'slot_changed',
@@ -283,6 +295,8 @@ export async function createBookingRequest(
     typeof rawBody.countryCode === 'string' ? rawBody.countryCode.trim() : '+92';
   const rawPhone =
     typeof rawBody.customerPhone === 'string' ? rawBody.customerPhone.trim() : '';
+  const customerNotes =
+    typeof rawBody.customerNotes === 'string' ? rawBody.customerNotes.trim().slice(0, 300) : '';
   const bookingDate =
     typeof rawBody.bookingDate === 'string' ? rawBody.bookingDate.trim() : '';
   const startTime =
@@ -406,6 +420,7 @@ export async function createBookingRequest(
           customer_email: customerEmail,
           country_code: countryCode,
           customer_phone: phoneResult.formatted,
+          customer_notes: customerNotes || null,
           participants_json: participantsJson,
           additional_guests_count: additionalGuestsCount,
           total_amount_pkr: totalAmountPkr,
@@ -414,9 +429,21 @@ export async function createBookingRequest(
           hold_expires_at: holdExpiresAt,
           confirmed_at: null,
           confirmed_by: null,
+          rejected_at: null,
+          rejected_by: null,
+          cancelled_at: null,
+          cancelled_by: null,
           status_token: statusToken,
           created_at: nowIso,
           updated_at: nowIso,
+        });
+
+        appendAuditLogOnDraft(draft, {
+          action: 'BOOKING_CREATED',
+          actor: customerName,
+          targetId: bookingId,
+          summary: `New ${bookingType} request ${bookingId} for ${bookingDate} ${slot.display_name} (PKR ${totalAmountPkr.toLocaleString()}).`,
+          createdAt: nowIso,
         });
 
         const notifId = draft.nextNotificationId;
@@ -472,6 +499,7 @@ export async function createBookingRequest(
     customerEmail,
     countryCode,
     customerPhone: phoneResult.formatted,
+    customerNotes: customerNotes || null,
     additionalGuestsCount,
     totalAmountPkr,
     status: 'PENDING',

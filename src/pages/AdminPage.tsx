@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import {
+  Activity,
   Bell,
   CalendarClock,
   ClipboardList,
@@ -30,11 +31,37 @@ import {
 import { ApiRequestError, clearInMemoryAdminSessionToken } from '@/src/services/api/client';
 import type {
   AdminAccountSummary,
+  AdminActivityItem,
   AdminBookingRow,
+  AdminDashboardStats,
   AdminNotification,
   BookingStatus,
   OperatingHourConfig,
 } from '@/src/types/booking';
+
+const EMPTY_STATS: AdminDashboardStats = {
+  totalBookings: 0,
+  pendingBookings: 0,
+  confirmedBookings: 0,
+  rejectedBookings: 0,
+  cancelledBookings: 0,
+  upcomingBookings: 0,
+  todaysBookings: 0,
+  confirmedRevenuePkr: 0,
+};
+
+function formatActivityTime(isoValue: string): string {
+  const parsed = new Date(isoValue);
+  if (Number.isNaN(parsed.getTime())) return isoValue;
+  return parsed.toLocaleString('en-PK', {
+    timeZone: 'Asia/Karachi',
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true,
+  });
+}
 
 export function AdminPage() {
   const [authStatusLoading, setAuthStatusLoading] = useState(true);
@@ -42,6 +69,8 @@ export function AdminPage() {
   const [authMode, setAuthMode] = useState<
     'named_accounts' | 'legacy_passcode_fallback' | 'setup_required'
   >('named_accounts');
+  const [storageConfigured, setStorageConfigured] = useState(true);
+  const [storageMessage, setStorageMessage] = useState<string | null>(null);
   const [authenticated, setAuthenticated] = useState(false);
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
   const [currentAccount, setCurrentAccount] = useState<AdminAccountSummary | null>(null);
@@ -53,8 +82,11 @@ export function AdminPage() {
     typeof window !== 'undefined' ? parseAdminTabFromPath(window.location.pathname) : 'bookings'
   );
   const [bookings, setBookings] = useState<AdminBookingRow[]>([]);
+  const [stats, setStats] = useState<AdminDashboardStats>(EMPTY_STATS);
+  const [recentActivity, setRecentActivity] = useState<AdminActivityItem[]>([]);
   const [notifications, setNotifications] = useState<AdminNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [hours, setHours] = useState<OperatingHourConfig[]>([]);
   const [loadingData, setLoadingData] = useState(false);
   const [dataError, setDataError] = useState<string | null>(null);
@@ -87,11 +119,14 @@ export function AdminPage() {
     setExpiresAt(null);
     setCurrentAccount(null);
     setBookings([]);
+    setStats(EMPTY_STATS);
+    setRecentActivity([]);
     setNotifications([]);
     setUnreadCount(0);
+    setNotificationsOpen(false);
     setHours([]);
-    if (typeof window !== 'undefined' && window.location.pathname.startsWith('/admin/')) {
-      window.history.replaceState({}, '', '/admin');
+    if (typeof window !== 'undefined' && window.location.pathname !== '/admin/login') {
+      window.history.replaceState({}, '', '/admin/login');
     }
     if (message) {
       if (isError) {
@@ -109,11 +144,22 @@ export function AdminPage() {
       const status = await getAdminAuthStatus();
       setSetupRequired(Boolean(status.setupRequired));
       setAuthMode(status.authMode);
+      setStorageConfigured(status.storageConfigured ?? true);
+      setStorageMessage(status.storageMessage ?? null);
       setAuthenticated(Boolean(status.authenticated));
       setExpiresAt(status.expiresAt);
       setCurrentAccount(status.account);
-      if (!status.authenticated && typeof window !== 'undefined' && window.location.pathname.startsWith('/admin/')) {
-        window.history.replaceState({}, '', '/admin');
+      if (typeof window !== 'undefined') {
+        const cleanPath = window.location.pathname.replace(/\/+$/, '') || '/';
+        if (!status.authenticated) {
+          if (cleanPath !== '/admin/login') {
+            window.history.replaceState({}, '', '/admin/login');
+          }
+        } else if (cleanPath === '/admin' || cleanPath === '/admin/login') {
+          const targetPath = getAdminPathForTab('bookings');
+          window.history.replaceState({}, '', targetPath);
+          setActiveTab('bookings');
+        }
       }
     } catch {
       setAuthError('Unable to check admin authentication status.');
@@ -153,6 +199,8 @@ export function AdminPage() {
       try {
         const dashboard = await fetchAdminDashboard();
         setBookings(dashboard.bookings);
+        setStats(dashboard.stats);
+        setRecentActivity(dashboard.recentActivity);
         setNotifications(dashboard.notifications);
         setUnreadCount(dashboard.unreadCount);
         setHours(dashboard.hours);
@@ -208,12 +256,16 @@ export function AdminPage() {
     await refreshAuthStatus();
   };
 
-  const handleUpdateBookingStatus = async (bookingId: string, status: BookingStatus) => {
+  const handleUpdateBookingStatus = async (
+    bookingId: string,
+    status: BookingStatus,
+    adminNotes?: string
+  ) => {
     if (!authenticated) return;
     setUpdatingId(bookingId);
     setDataError(null);
     try {
-      const updated = await updateBookingStatus(bookingId, status);
+      const updated = await updateBookingStatus(bookingId, status, adminNotes);
       setBookings((prev) =>
         prev.map((b) => (b.id === bookingId ? updated : b))
       );
@@ -274,6 +326,8 @@ export function AdminPage() {
       <AdminLoginCard
         setupRequired={setupRequired}
         authMode={authMode}
+        storageConfigured={storageConfigured}
+        storageMessage={storageMessage}
         externalError={authError}
         statusMessage={authStatusMessage}
         onAuthenticated={(session) => {
@@ -295,8 +349,8 @@ export function AdminPage() {
     );
   }
 
-  const pendingCount = bookings.filter((b) => b.status === 'PENDING').length;
-  const confirmedCount = bookings.filter((b) => b.status === 'CONFIRMED').length;
+  const pendingCount = stats.pendingBookings;
+  const confirmedCount = stats.confirmedBookings;
   const expiryLabel = expiresAt
     ? new Date(expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : null;
@@ -344,6 +398,25 @@ export function AdminPage() {
       ? 'Drinks & Inventory'
       : 'Accounts & Security';
 
+  const summaryCards: Array<{
+    label: string;
+    value: string | number;
+    tone: string;
+  }> = [
+    { label: 'Total Bookings', value: stats.totalBookings, tone: 'text-white' },
+    { label: 'Pending Requests', value: stats.pendingBookings, tone: 'text-amber-300' },
+    { label: 'Confirmed', value: stats.confirmedBookings, tone: 'text-[#c4d835]' },
+    { label: 'Rejected', value: stats.rejectedBookings, tone: 'text-rose-300' },
+    { label: 'Cancelled', value: stats.cancelledBookings, tone: 'text-slate-300' },
+    { label: "Today's Bookings", value: stats.todaysBookings, tone: 'text-white' },
+    { label: 'Upcoming Active', value: stats.upcomingBookings, tone: 'text-[#c4d835]' },
+    {
+      label: 'Confirmed Revenue',
+      value: `PKR ${stats.confirmedRevenuePkr.toLocaleString()}`,
+      tone: 'text-[#c4d835]',
+    },
+  ];
+
   return (
     <div className="min-h-screen pt-24 pb-20 bg-[#0C153B] text-white">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 space-y-6">
@@ -371,6 +444,20 @@ export function AdminPage() {
           <div className="flex flex-wrap items-center gap-2.5">
             <button
               type="button"
+              onClick={() => setNotificationsOpen((prev) => !prev)}
+              className="relative inline-flex items-center gap-1.5 px-4 py-2 min-h-[40px] text-xs font-semibold text-white bg-[#16235C] hover:border-[#c4d835] border border-white/15 rounded-md cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c4d835]"
+            >
+              <Bell className="w-3.5 h-3.5 text-[#c4d835]" />
+              <span>Notifications</span>
+              {unreadCount > 0 && (
+                <span className="font-mono-tabular px-1.5 py-0.5 text-[10px] font-extrabold rounded bg-[#c4d835] text-[#0E1845]">
+                  {unreadCount}
+                </span>
+              )}
+            </button>
+
+            <button
+              type="button"
               onClick={() => void loadAdminData()}
               disabled={loadingData}
               className="inline-flex items-center gap-1.5 px-4 py-2 min-h-[40px] text-xs font-semibold text-white bg-[#16235C] hover:border-[#c4d835] border border-white/15 rounded-md cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c4d835]"
@@ -389,26 +476,65 @@ export function AdminPage() {
           </div>
         </div>
 
-        {unreadCount > 0 && (
-          <div className="rounded-xl border border-[#c4d835]/45 bg-[#192869] p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-start gap-3">
-              <Bell className="w-5 h-5 text-[#c4d835] shrink-0 mt-0.5" />
-              <div>
-                <div className="text-sm font-semibold text-white">
-                  {unreadCount} unread booking {unreadCount === 1 ? 'request' : 'requests'}
+        {(notificationsOpen || unreadCount > 0) && (
+          <div className="rounded-xl border border-[#c4d835]/40 bg-[#192869] p-4 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <Bell className="w-5 h-5 text-[#c4d835] shrink-0 mt-0.5" />
+                <div>
+                  <div className="text-sm font-semibold text-white">
+                    {unreadCount > 0
+                      ? `${unreadCount} unread booking ${unreadCount === 1 ? 'request' : 'requests'}`
+                      : 'Booking Notifications'}
+                  </div>
+                  {!notificationsOpen && notifications[0] && (
+                    <p className="text-xs text-slate-300 mt-0.5">{notifications[0].message}</p>
+                  )}
                 </div>
-                {notifications[0] && (
-                  <p className="text-xs text-slate-300 mt-0.5">{notifications[0].message}</p>
+              </div>
+              <div className="flex items-center gap-2 self-start sm:self-auto">
+                {unreadCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => void handleMarkNotificationsRead()}
+                    className="px-4 py-2 min-h-[36px] text-xs font-bold text-[#0E1845] bg-[#c4d835] hover:bg-[#d4e157] rounded-md cursor-pointer"
+                  >
+                    Mark All Read
+                  </button>
                 )}
+                <button
+                  type="button"
+                  onClick={() => setNotificationsOpen((prev) => !prev)}
+                  className="px-3 py-2 min-h-[36px] text-xs font-semibold text-slate-200 bg-white/5 hover:bg-white/10 border border-white/15 rounded-md cursor-pointer"
+                >
+                  {notificationsOpen ? 'Hide List' : 'View All'}
+                </button>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => void handleMarkNotificationsRead()}
-              className="px-4 py-2 min-h-[38px] text-xs font-bold text-[#0E1845] bg-[#c4d835] hover:bg-[#d4e157] rounded-md cursor-pointer self-start sm:self-auto"
-            >
-              Mark All Read
-            </button>
+
+            {notificationsOpen && (
+              <div className="border-t border-white/10 pt-3 space-y-2 max-h-60 overflow-y-auto">
+                {notifications.length === 0 ? (
+                  <p className="text-xs text-slate-300">No notifications recorded yet.</p>
+                ) : (
+                  notifications.map((n) => (
+                    <div
+                      key={n.id}
+                      className={`rounded-lg px-3 py-2 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-1 border ${
+                        n.is_read === 0
+                          ? 'bg-[#0B1338] border-[#c4d835]/40 text-white'
+                          : 'bg-[#0B1338]/55 border-white/10 text-slate-300'
+                      }`}
+                    >
+                      <span>{n.message}</span>
+                      <span className="font-mono-tabular text-[11px] text-slate-400 shrink-0">
+                        {formatActivityTime(n.created_at)}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -486,7 +612,7 @@ export function AdminPage() {
               </div>
               <div className="flex items-center justify-between text-slate-400">
                 <span>Total Bookings</span>
-                <span className="font-mono-tabular font-bold text-white">{bookings.length}</span>
+                <span className="font-mono-tabular font-bold text-white">{stats.totalBookings}</span>
               </div>
             </div>
           </aside>
@@ -503,11 +629,67 @@ export function AdminPage() {
             )}
 
             {activeTab === 'bookings' && (
-              <AdminBookingsList
-                bookings={bookings}
-                updatingId={updatingId}
-                onUpdateStatus={handleUpdateBookingStatus}
-              />
+              <>
+                <section aria-label="Booking Summary Statistics" className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  {summaryCards.map((card) => (
+                    <div
+                      key={card.label}
+                      className="rounded-xl border border-white/12 bg-[#121D52]/80 p-4"
+                    >
+                      <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                        {card.label}
+                      </div>
+                      <div className={`mt-1.5 font-mono-tabular text-xl font-extrabold ${card.tone}`}>
+                        {card.value}
+                      </div>
+                    </div>
+                  ))}
+                </section>
+
+                <AdminBookingsList
+                  bookings={bookings}
+                  updatingId={updatingId}
+                  onUpdateStatus={handleUpdateBookingStatus}
+                />
+
+                <section
+                  aria-label="Recent Booking and Admin Activity"
+                  className="rounded-xl border border-white/12 bg-[#121D52]/80 p-5 space-y-3"
+                >
+                  <div className="flex items-center gap-2 border-b border-white/10 pb-3">
+                    <Activity className="w-4 h-4 text-[#c4d835]" />
+                    <h2 className="text-sm font-bold uppercase tracking-wider text-white">
+                      Recent Activity & Audit Log
+                    </h2>
+                  </div>
+
+                  {recentActivity.length === 0 ? (
+                    <p className="text-xs text-slate-400">No admin or booking activity logged yet.</p>
+                  ) : (
+                    <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                      {recentActivity.slice(0, 15).map((entry) => (
+                        <div
+                          key={entry.id}
+                          className="rounded-lg border border-white/10 bg-[#0B1338] px-3.5 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-xs"
+                        >
+                          <div className="space-y-0.5">
+                            <div className="text-slate-100 font-medium">{entry.summary}</div>
+                            <div className="text-[11px] text-slate-400">
+                              Actor: <span className="text-slate-200">{entry.actor}</span> · Action:{' '}
+                              <span className="font-mono-tabular text-[#c4d835]">
+                                {entry.action}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="font-mono-tabular text-[11px] text-slate-400 shrink-0">
+                            {formatActivityTime(entry.created_at)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              </>
             )}
 
             {activeTab === 'hours' && (

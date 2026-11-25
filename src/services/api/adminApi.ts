@@ -5,8 +5,10 @@ import {
 } from '@/src/services/api/client';
 import type {
   AdminAccountSummary,
+  AdminActivityItem,
   AdminAuthStatus,
   AdminBookingRow,
+  AdminDashboardStats,
   AdminNotification,
   BookingStatus,
   OperatingHourConfig,
@@ -91,37 +93,59 @@ export async function logoutAdmin(): Promise<void> {
 
 export async function fetchAdminDashboard(): Promise<{
   bookings: AdminBookingRow[];
+  stats: AdminDashboardStats;
   notifications: AdminNotification[];
   unreadCount: number;
+  recentActivity: AdminActivityItem[];
   hours: OperatingHourConfig[];
 }> {
   const [bookingsRes, hoursRes] = await Promise.all([
     apiRequest<{
       bookings?: AdminBookingRow[];
+      stats?: AdminDashboardStats;
       notifications?: AdminNotification[];
       unreadCount?: number;
+      recentActivity?: AdminActivityItem[];
     }>('/api/admin/bookings'),
     apiRequest<{ hours?: OperatingHourConfig[] }>('/api/admin/operating-hours'),
   ]);
 
+  const bookings = bookingsRes.bookings ?? [];
   return {
-    bookings: bookingsRes.bookings ?? [],
+    bookings,
+    stats: bookingsRes.stats ?? {
+      totalBookings: bookings.length,
+      pendingBookings: bookings.filter((b) => b.status === 'PENDING').length,
+      confirmedBookings: bookings.filter((b) => b.status === 'CONFIRMED').length,
+      rejectedBookings: bookings.filter((b) => b.status === 'REJECTED').length,
+      cancelledBookings: bookings.filter((b) => b.status === 'CANCELLED').length,
+      upcomingBookings: 0,
+      todaysBookings: 0,
+      confirmedRevenuePkr: bookings
+        .filter((b) => b.status === 'CONFIRMED')
+        .reduce((sum, b) => sum + (b.total_amount_pkr || 0), 0),
+    },
     notifications: bookingsRes.notifications ?? [],
     unreadCount: bookingsRes.unreadCount ?? 0,
+    recentActivity: bookingsRes.recentActivity ?? [],
     hours: hoursRes.hours ?? [],
   };
 }
 
 export async function updateBookingStatus(
   bookingId: string,
-  status: BookingStatus
+  status: BookingStatus,
+  adminNotes?: string
 ): Promise<AdminBookingRow> {
   const data = await apiRequest<{ booking?: AdminBookingRow }>(
     `/api/admin/bookings/${encodeURIComponent(bookingId)}/status`,
     {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status }),
+      body: JSON.stringify({
+        status,
+        ...(adminNotes !== undefined ? { adminNotes } : {}),
+      }),
     }
   );
   if (!data.booking) {

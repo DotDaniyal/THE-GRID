@@ -3,8 +3,10 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import {
+  BlobAccessError,
   BlobNotFoundError,
   BlobPreconditionFailedError,
+  del as blobDel,
   get as blobGet,
   put as blobPut,
 } from '@vercel/blob';
@@ -336,7 +338,7 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
   readonly mode = 'vercel_blob' as const;
   readonly persistent = true;
   private readonly token: string;
-  private readonly access: 'private' | 'public';
+  private access: 'private' | 'public';
   private readonly upstash: { url: string; token: string } | null;
 
   constructor(token: string) {
@@ -353,6 +355,11 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
     return `thegrid/backups/${name}-latest.json`;
   }
 
+  private lockPathname(slotKey: string): string {
+    const safeKey = slotKey.replace(/[^a-zA-Z0-9._-]/g, '_');
+    return `thegrid/locks/${safeKey}.json`;
+  }
+
   private getTarget(pathname: string): string {
     const override = process.env.VERCEL_BLOB_API_URL?.trim();
     if (override) {
@@ -361,35 +368,50 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
     return pathname;
   }
 
+  private isAccessMismatchError(err: unknown): boolean {
+    if (err instanceof BlobAccessError) return true;
+    const msg = err instanceof Error ? err.message.toLowerCase() : '';
+    return (
+      msg.includes('public access') ||
+      msg.includes('private access') ||
+      msg.includes('public store') ||
+      msg.includes('private store')
+    );
+  }
+
+  private async withAccessFallback<T>(
+    operation: (access: 'private' | 'public') => Promise<T>
+  ): Promise<T> {
+    try {
+      return await operation(this.access);
+    } catch (err) {
+      if (this.isAccessMismatchError(err)) {
+        const alternate = this.access === 'private' ? 'public' : 'private';
+        const result = await operation(alternate);
+        this.access = alternate;
+        if (alternate === 'public') {
+          console.warn(
+            'Vercel Blob store is configured as public; using public store mode automatically. A private Vercel Blob store is recommended for production.'
+          );
+        }
+        return result;
+      }
+      throw err;
+    }
+  }
+
   async readCollection<K extends CollectionName>(
     name: K
   ): Promise<ReadCollectionResult<K>> {
+    let primaryResult: Awaited<ReturnType<typeof blobGet>> = null;
     try {
-      const result = await blobGet(this.getTarget(this.pathname(name)), {
-        access: this.access,
-        useCache: false,
-        token: this.token,
-      });
-
-      if (!result || result.statusCode !== 200 || !result.stream) {
-        return {
-          data: createDefaultCollection(name),
-          version: null,
-          exists: false,
-        };
-      }
-
-      const raw = await new Response(result.stream).text();
-      const parsed = JSON.parse(raw) as unknown;
-      if (!validateCollectionDocument(name, parsed)) {
-        throw new Error(`Invalid JSON schema in Vercel Blob for "${name}".`);
-      }
-
-      return {
-        data: parsed,
-        version: result.blob.etag,
-        exists: true,
-      };
+      primaryResult = await this.withAccessFallback((access) =>
+        blobGet(this.getTarget(this.pathname(name)), {
+          access,
+          useCache: false,
+          token: this.token,
+        })
+      );
     } catch (err: unknown) {
       if (err instanceof BlobNotFoundError) {
         return {
@@ -398,29 +420,57 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
           exists: false,
         };
       }
-      // Fallback: if primary blob is corrupted, try latest backup blob
-      try {
-        const backup = await blobGet(this.getTarget(this.backupPathname(name)), {
-          access: this.access,
-          useCache: false,
-          token: this.token,
-        });
-        if (backup && backup.statusCode === 200 && backup.stream) {
-          const backupRaw = await new Response(backup.stream).text();
-          const backupParsed = JSON.parse(backupRaw) as unknown;
-          if (validateCollectionDocument(name, backupParsed)) {
-            return {
-              data: backupParsed,
-              version: null,
-              exists: false,
-            };
-          }
-        }
-      } catch {
-        // Ignore backup lookup failure
-      }
       throw err;
     }
+
+    if (!primaryResult || primaryResult.statusCode !== 200 || !primaryResult.stream) {
+      return {
+        data: createDefaultCollection(name),
+        version: null,
+        exists: false,
+      };
+    }
+
+    const primaryEtag = primaryResult.blob.etag || null;
+    const raw = await new Response(primaryResult.stream).text();
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (validateCollectionDocument(name, parsed)) {
+        return {
+          data: parsed,
+          version: primaryEtag,
+          exists: true,
+        };
+      }
+    } catch {
+      // Primary blob JSON is corrupted; fall through to backup recovery
+    }
+
+    // Only attempt backup recovery when primary blob contents failed validation/parsing
+    try {
+      const backup = await this.withAccessFallback((access) =>
+        blobGet(this.getTarget(this.backupPathname(name)), {
+          access,
+          useCache: false,
+          token: this.token,
+        })
+      );
+      if (backup && backup.statusCode === 200 && backup.stream) {
+        const backupRaw = await new Response(backup.stream).text();
+        const backupParsed = JSON.parse(backupRaw) as unknown;
+        if (validateCollectionDocument(name, backupParsed)) {
+          return {
+            data: backupParsed,
+            version: primaryEtag,
+            exists: Boolean(primaryEtag),
+          };
+        }
+      }
+    } catch {
+      // Ignore backup lookup failure if backup doesn't exist
+    }
+
+    throw new Error(`Invalid JSON schema in Vercel Blob for "${name}".`);
   }
 
   async writeCollection<K extends CollectionName>(
@@ -437,26 +487,30 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
     JSON.parse(serialized);
 
     try {
-      const putResult = await blobPut(this.pathname(name), serialized, {
-        access: this.access,
-        addRandomSuffix: false,
-        contentType: 'application/json',
-        cacheControlMaxAge: 60,
-        token: this.token,
-        ...(expectedVersion
-          ? { allowOverwrite: true, ifMatch: expectedVersion }
-          : { allowOverwrite: false }),
-      });
+      const putResult = await this.withAccessFallback((access) =>
+        blobPut(this.pathname(name), serialized, {
+          access,
+          addRandomSuffix: false,
+          contentType: 'application/json',
+          cacheControlMaxAge: 0,
+          token: this.token,
+          ...(expectedVersion
+            ? { allowOverwrite: true, ifMatch: expectedVersion }
+            : { allowOverwrite: false }),
+        })
+      );
 
       if (!options?.skipBackup && data.revision > 0) {
-        await blobPut(this.backupPathname(name), serialized, {
-          access: this.access,
-          addRandomSuffix: false,
-          allowOverwrite: true,
-          contentType: 'application/json',
-          cacheControlMaxAge: 60,
-          token: this.token,
-        }).catch(() => undefined);
+        await this.withAccessFallback((access) =>
+          blobPut(this.backupPathname(name), serialized, {
+            access,
+            addRandomSuffix: false,
+            allowOverwrite: true,
+            contentType: 'application/json',
+            cacheControlMaxAge: 0,
+            token: this.token,
+          })
+        ).catch(() => undefined);
       }
 
       return { version: putResult.etag || String(data.revision) };
@@ -476,13 +530,105 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
   }
 
   async acquireSlotLock(slotKey: string, ttlMs = 8000): Promise<string | null> {
-    if (!this.upstash) return 'blob-etag-lock';
-    return acquireUpstashSlotLock(this.upstash, slotKey, ttlMs);
+    if (this.upstash) {
+      return acquireUpstashSlotLock(this.upstash, slotKey, ttlMs);
+    }
+
+    const lockPath = this.lockPathname(slotKey);
+    const lockToken = crypto.randomBytes(12).toString('hex');
+    const now = Date.now();
+    const payload = JSON.stringify({
+      token: lockToken,
+      expiresAt: now + ttlMs,
+    });
+
+    try {
+      await this.withAccessFallback((access) =>
+        blobPut(lockPath, payload, {
+          access,
+          addRandomSuffix: false,
+          allowOverwrite: false,
+          contentType: 'application/json',
+          cacheControlMaxAge: 0,
+          token: this.token,
+        })
+      );
+      return lockToken;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message.toLowerCase() : '';
+      const isConflict =
+        err instanceof BlobPreconditionFailedError ||
+        msg.includes('already exists') ||
+        msg.includes('overwrite') ||
+        msg.includes('412') ||
+        msg.includes('409');
+      if (!isConflict) {
+        throw err;
+      }
+
+      // Check if an existing lock has expired (e.g. crashed Lambda container)
+      try {
+        const existing = await this.withAccessFallback((access) =>
+          blobGet(this.getTarget(lockPath), {
+            access,
+            useCache: false,
+            token: this.token,
+          })
+        );
+        if (!existing || existing.statusCode !== 200 || !existing.stream) {
+          return null;
+        }
+        const existingBody = JSON.parse(await new Response(existing.stream).text()) as {
+          expiresAt?: number;
+        };
+        if (typeof existingBody.expiresAt === 'number' && Date.now() > existingBody.expiresAt) {
+          await this.withAccessFallback((access) =>
+            blobPut(lockPath, payload, {
+              access,
+              addRandomSuffix: false,
+              allowOverwrite: true,
+              ifMatch: existing.blob.etag,
+              contentType: 'application/json',
+              cacheControlMaxAge: 0,
+              token: this.token,
+            })
+          );
+          return lockToken;
+        }
+      } catch {
+        // Active lock held or raced by another container
+      }
+      return null;
+    }
   }
 
-  async releaseSlotLock(slotKey: string, token: string): Promise<void> {
-    if (!this.upstash || token === 'blob-etag-lock') return;
-    await releaseUpstashSlotLock(this.upstash, slotKey, token);
+  async releaseSlotLock(slotKey: string, lockToken: string): Promise<void> {
+    if (this.upstash) {
+      await releaseUpstashSlotLock(this.upstash, slotKey, lockToken);
+      return;
+    }
+
+    const lockPath = this.lockPathname(slotKey);
+    try {
+      const existing = await this.withAccessFallback((access) =>
+        blobGet(this.getTarget(lockPath), {
+          access,
+          useCache: false,
+          token: this.token,
+        })
+      );
+      if (!existing || existing.statusCode !== 200 || !existing.stream) {
+        return;
+      }
+      const existingBody = JSON.parse(await new Response(existing.stream).text()) as {
+        token?: string;
+      };
+      if (existingBody.token === lockToken) {
+        await blobDel(this.getTarget(lockPath), { token: this.token }).catch(() => undefined);
+      }
+    } catch {
+      // Lock already expired or released
+    }
   }
 }
 

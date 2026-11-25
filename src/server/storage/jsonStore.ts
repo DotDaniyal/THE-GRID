@@ -129,8 +129,11 @@ export async function ensureStoreInitialized(): Promise<void> {
 
     // External Vercel production store (Vercel Blob or Upstash Redis)
     // Only seed missing collections on first boot; never overwrite existing production records.
-    const settingsRead = await driver.readCollection('settings');
-    if (!settingsRead.exists) {
+    const [settingsRead, adminRead] = await Promise.all([
+      driver.readCollection('settings'),
+      driver.readCollection('admin-settings'),
+    ]);
+    if (!settingsRead.exists || !adminRead.exists) {
       const seed = seedFromBundledLocalJsonOrSqlite();
       for (const colName of ALL_COLLECTIONS) {
         const current = await driver.readCollection(colName);

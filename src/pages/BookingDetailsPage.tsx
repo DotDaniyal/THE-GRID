@@ -64,6 +64,7 @@ export function BookingDetailsPage({
   const [customerEmail, setCustomerEmail] = useState('');
   const [countryCode, setCountryCode] = useState('+92');
   const [customerPhone, setCustomerPhone] = useState('');
+  const [customerNotes, setCustomerNotes] = useState('');
   const [bookingType, setBookingType] = useState<BookingType>('individual');
   const [participants, setParticipants] = useState<SharedParticipant[]>(DEFAULT_PARTICIPANTS);
   const [additionalGuestsCount, setAdditionalGuestsCount] = useState(0);
@@ -239,6 +240,7 @@ export function BookingDetailsPage({
         customerEmail: customerEmail.trim(),
         countryCode,
         customerPhone: customerPhone.trim(),
+        customerNotes: customerNotes.trim() || undefined,
         bookingType,
         bookingDate: activeSelection.bookingDate,
         startTime: activeSelection.slot.startTime,
@@ -541,6 +543,21 @@ export function BookingDetailsPage({
                   {visibleFieldErrors.customerPhone}
                 </p>
               )}
+            </div>
+
+            <div className="sm:col-span-2">
+              <label htmlFor="bd-notes" className="block text-xs font-semibold text-slate-200 mb-1.5">
+                Customer Notes (Optional)
+              </label>
+              <textarea
+                id="bd-notes"
+                rows={2}
+                maxLength={300}
+                value={customerNotes}
+                onChange={(e) => setCustomerNotes(e.target.value)}
+                placeholder="Team name, preferred bib colors, or arrival note..."
+                className="w-full px-3.5 py-2.5 text-sm text-white bg-[#0B1338]/90 border border-white/20 rounded-lg focus:outline-none focus:border-[#c4d835] focus-visible:ring-2 focus-visible:ring-[#c4d835]"
+              />
             </div>
           </div>
 

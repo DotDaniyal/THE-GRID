@@ -1,13 +1,18 @@
 import crypto from 'node:crypto';
 import argon2 from 'argon2';
 import type { NextFunction, Request, Response } from 'express';
-import { readCollection, updateCollection } from '../storage/jsonStore.ts';
-import type { AdminUserRecord } from '../storage/types.ts';
+import { getStorageStatus, readCollection, updateCollection } from '../storage/jsonStore.ts';
+import type {
+  AdminAuditAction,
+  AdminSettingsCollection,
+  AdminUserRecord,
+} from '../storage/types.ts';
 import { verifyTotpCode } from '../utils/totp.ts';
 
 export const SESSION_COOKIE_NAME = 'thegrid_admin_session';
 const DEFAULT_SESSION_TTL_MINUTES = 240; // 4 hours
 const MFA_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const MAX_AUDIT_LOGS = 500;
 
 let cachedFallbackSecret: string | null = null;
 const DUMMY_PASSWORD_HASH =
@@ -33,6 +38,17 @@ declare global {
   }
 }
 
+function stripSurroundingQuotes(raw: string | undefined): string {
+  const trimmed = (raw || '').trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
 export function getSessionTtlMinutes(): number {
   const parsed = Number(process.env.ADMIN_SESSION_TTL_MINUTES);
   if (Number.isFinite(parsed) && parsed >= 5 && parsed <= 1440) {
@@ -42,11 +58,16 @@ export function getSessionTtlMinutes(): number {
 }
 
 function getEnvAdminPasscode(): string {
-  return process.env.ADMIN_PASSCODE?.trim() || '';
+  return (
+    stripSurroundingQuotes(process.env.ADMIN_PASSCODE) ||
+    stripSurroundingQuotes(process.env.ADMIN_PASSWORD)
+  );
 }
 
 function getEnvAdminUsername(): string | null {
-  const configured = process.env.ADMIN_USERNAME?.trim();
+  const configured =
+    stripSurroundingQuotes(process.env.ADMIN_USERNAME) ||
+    stripSurroundingQuotes(process.env.ADMIN_USER);
   return configured ? normalizeAdminUsername(configured) : null;
 }
 
@@ -56,10 +77,61 @@ function constantTimeStringEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(digestA, digestB);
 }
 
+export function appendAuditLogOnDraft(
+  draft: { auditLogs?: AdminSettingsCollection['auditLogs'] },
+  entry: {
+    action: AdminAuditAction;
+    actor: string;
+    targetId?: string | null;
+    summary: string;
+    createdAt?: string;
+  }
+): void {
+  if (!Array.isArray(draft.auditLogs)) {
+    draft.auditLogs = [];
+  }
+  draft.auditLogs.push({
+    id: `AUD-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+    action: entry.action,
+    actor: entry.actor,
+    target_id: entry.targetId ?? null,
+    summary: entry.summary,
+    created_at: entry.createdAt ?? new Date().toISOString(),
+  });
+  if (draft.auditLogs.length > MAX_AUDIT_LOGS) {
+    draft.auditLogs = draft.auditLogs.slice(-MAX_AUDIT_LOGS);
+  }
+}
+
+export async function recordAdminSecurityAudit(entry: {
+  action: AdminAuditAction;
+  actor: string;
+  targetId?: string | null;
+  summary: string;
+}): Promise<void> {
+  try {
+    await updateCollection(
+      'admin-settings',
+      (draft) => {
+        appendAuditLogOnDraft(draft, entry);
+      },
+      { skipBackup: true }
+    );
+  } catch {
+    // Do not break primary auth flow if non-persistent or secondary audit fails
+  }
+}
+
 async function getSessionSecret(): Promise<string> {
-  const envSecret = process.env.SESSION_SECRET?.trim();
-  if (envSecret && envSecret.length >= 16) {
+  const envSecret = stripSurroundingQuotes(process.env.SESSION_SECRET);
+  if (envSecret.length >= 16) {
     return envSecret;
+  }
+  if (envSecret.length >= 8) {
+    return crypto
+      .createHmac('sha256', 'thegrid-admin-session-secret-v1')
+      .update(envSecret)
+      .digest('hex');
   }
 
   // Deterministic cross-container key when running on Vercel with ADMIN_PASSCODE
@@ -75,26 +147,28 @@ async function getSessionSecret(): Promise<string> {
     return cachedFallbackSecret;
   }
 
-  try {
-    const adminSettings = await readCollection('admin-settings');
-    if (adminSettings.appMeta?.session_secret) {
-      cachedFallbackSecret = adminSettings.appMeta.session_secret;
-      return cachedFallbackSecret;
-    }
+  const adminSettings = await readCollection('admin-settings');
+  if (adminSettings.appMeta?.session_secret) {
+    cachedFallbackSecret = adminSettings.appMeta.session_secret;
+    return cachedFallbackSecret;
+  }
 
-    const generated = crypto.randomBytes(32).toString('hex');
+  const generated = crypto.randomBytes(32).toString('hex');
+  try {
     const { result: storedSecret } = await updateCollection('admin-settings', (draft) => {
       if (!draft.appMeta.session_secret) {
         draft.appMeta.session_secret = generated;
       }
       return draft.appMeta.session_secret;
     });
-    cachedFallbackSecret = storedSecret || generated;
-    return cachedFallbackSecret;
+    if (storedSecret) {
+      cachedFallbackSecret = storedSecret;
+      return cachedFallbackSecret;
+    }
   } catch {
-    cachedFallbackSecret = crypto.randomBytes(32).toString('hex');
-    return cachedFallbackSecret;
+    // Only return ephemeral secret for this call without permanently poisoning cache
   }
+  return generated;
 }
 
 export async function hashPassword(password: string): Promise<string> {
@@ -171,13 +245,29 @@ export async function getAdminAuthOverview(): Promise<{
   setupRequired: boolean;
   authMode: 'named_accounts' | 'legacy_passcode_fallback' | 'setup_required';
   hasNamedAccounts: boolean;
+  storageConfigured: boolean;
+  storageMessage: string | null;
 }> {
+  const storage = getStorageStatus();
+  if (!storage.persistent) {
+    return {
+      setupRequired: false,
+      authMode: getEnvAdminPasscode() ? 'legacy_passcode_fallback' : 'setup_required',
+      hasNamedAccounts: false,
+      storageConfigured: false,
+      storageMessage:
+        'Persistent external JSON storage is not configured for Vercel production. Connect Vercel Blob (BLOB_READ_WRITE_TOKEN) or Upstash Redis in Vercel Environment Variables.',
+    };
+  }
+
   let hasNamedAccounts = false;
+  let storageMessage: string | null = null;
   try {
     const adminSettings = await readCollection('admin-settings');
     hasNamedAccounts = adminSettings.users.some((u) => u.is_active === 1);
-  } catch {
-    hasNamedAccounts = false;
+  } catch (err) {
+    storageMessage =
+      err instanceof Error ? err.message : 'Unable to read administrator store.';
   }
 
   const hasEnvPasscode = Boolean(getEnvAdminPasscode());
@@ -187,6 +277,8 @@ export async function getAdminAuthOverview(): Promise<{
       setupRequired: false,
       authMode: 'named_accounts',
       hasNamedAccounts: true,
+      storageConfigured: true,
+      storageMessage,
     };
   }
 
@@ -195,6 +287,8 @@ export async function getAdminAuthOverview(): Promise<{
       setupRequired: false,
       authMode: 'legacy_passcode_fallback',
       hasNamedAccounts: false,
+      storageConfigured: true,
+      storageMessage,
     };
   }
 
@@ -202,6 +296,8 @@ export async function getAdminAuthOverview(): Promise<{
     setupRequired: true,
     authMode: 'setup_required',
     hasNamedAccounts: false,
+    storageConfigured: true,
+    storageMessage,
   };
 }
 

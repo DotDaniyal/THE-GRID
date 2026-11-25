@@ -30,6 +30,7 @@ export interface BookingRecord {
   customer_email: string;
   country_code: string;
   customer_phone: string;
+  customer_notes?: string | null;
   participants_json: string | null;
   additional_guests_count: number;
   total_amount_pkr: number;
@@ -38,9 +39,38 @@ export interface BookingRecord {
   hold_expires_at: string | null;
   confirmed_at: string | null;
   confirmed_by: string | null;
+  rejected_at?: string | null;
+  rejected_by?: string | null;
+  cancelled_at?: string | null;
+  cancelled_by?: string | null;
   status_token: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export type AdminAuditAction =
+  | 'ADMIN_SETUP'
+  | 'ADMIN_LOGIN_SUCCESS'
+  | 'ADMIN_LOGIN_FAILED'
+  | 'ADMIN_LOGOUT'
+  | 'ADMIN_ACCOUNT_CREATED'
+  | 'ADMIN_MFA_ENABLED'
+  | 'ADMIN_MFA_DISABLED'
+  | 'BOOKING_CREATED'
+  | 'BOOKING_CONFIRMED'
+  | 'BOOKING_REJECTED'
+  | 'BOOKING_CANCELLED'
+  | 'BOOKING_PENDING_RESTORED'
+  | 'BOOKING_EXPIRED'
+  | 'OPERATING_HOURS_UPDATED';
+
+export interface AdminAuditLogRecord {
+  id: string;
+  action: AdminAuditAction;
+  actor: string;
+  target_id?: string | null;
+  summary: string;
+  created_at: string;
 }
 
 export interface AdminNotificationRecord {
@@ -191,6 +221,7 @@ export interface BookingsCollection extends BaseCollectionMeta {
   nextNotificationId: number;
   records: BookingRecord[];
   notifications: AdminNotificationRecord[];
+  auditLogs?: AdminAuditLogRecord[];
 }
 
 export interface CustomersCollection extends BaseCollectionMeta {
@@ -234,6 +265,7 @@ export interface AdminSettingsCollection extends BaseCollectionMeta {
   users: AdminUserRecord[];
   sessions: AdminSessionRecord[];
   loginAttempts: AdminLoginAttemptRecord[];
+  auditLogs?: AdminAuditLogRecord[];
 }
 
 export interface CollectionMap {

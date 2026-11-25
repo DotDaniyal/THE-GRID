@@ -31,6 +31,7 @@ export interface CreateBookingPayload {
   customerEmail: string;
   countryCode: string;
   customerPhone: string;
+  customerNotes?: string;
   bookingType: BookingType;
   bookingDate: string;
   startTime: string;
@@ -53,6 +54,7 @@ export interface CreatedBooking {
   customerEmail: string;
   countryCode: string;
   customerPhone: string;
+  customerNotes?: string | null;
   additionalGuestsCount: number;
   totalAmountPkr: number;
   status: BookingStatus;
@@ -85,6 +87,7 @@ export interface AdminBookingRow {
   customer_email: string;
   country_code: string;
   customer_phone: string;
+  customer_notes?: string | null;
   participants_json: string | null;
   additional_guests_count: number;
   total_amount_pkr: number;
@@ -93,8 +96,32 @@ export interface AdminBookingRow {
   hold_expires_at?: string | null;
   confirmed_at?: string | null;
   confirmed_by?: string | null;
+  rejected_at?: string | null;
+  rejected_by?: string | null;
+  cancelled_at?: string | null;
+  cancelled_by?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface AdminDashboardStats {
+  totalBookings: number;
+  pendingBookings: number;
+  confirmedBookings: number;
+  rejectedBookings: number;
+  cancelledBookings: number;
+  upcomingBookings: number;
+  todaysBookings: number;
+  confirmedRevenuePkr: number;
+}
+
+export interface AdminActivityItem {
+  id: string;
+  action: string;
+  actor: string;
+  target_id?: string | null;
+  summary: string;
+  created_at: string;
 }
 
 export interface AdminNotification {
@@ -128,6 +155,8 @@ export interface AdminAuthStatus {
   authenticated: boolean;
   setupRequired: boolean;
   authMode: 'named_accounts' | 'legacy_passcode_fallback' | 'setup_required';
+  storageConfigured?: boolean;
+  storageMessage?: string | null;
   expiresAt: number | null;
   account: AdminAccountSummary | null;
   mfaMigrationRecommended: boolean;

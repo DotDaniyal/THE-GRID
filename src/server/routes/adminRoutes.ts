@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import {
+  appendAuditLogOnDraft,
   authenticateAdminCredentials,
   clearAdminSessionCookie,
   createAdminSession,
@@ -10,6 +11,7 @@ import {
   hashPassword,
   issueMfaChallengeToken,
   normalizeAdminUsername,
+  recordAdminSecurityAudit,
   requireAdminAuth,
   requireSameOriginForCookieMutation,
   revokeAdminSessionFromRequest,
@@ -80,6 +82,8 @@ adminRouter.get('/auth-status', async (req, res) => {
         authenticated: false,
         setupRequired: overview.setupRequired,
         authMode: overview.authMode,
+        storageConfigured: overview.storageConfigured,
+        storageMessage: overview.storageMessage,
         expiresAt: null,
         account: null,
         mfaMigrationRecommended: false,
@@ -92,6 +96,8 @@ adminRouter.get('/auth-status', async (req, res) => {
       authenticated: true,
       setupRequired: false,
       authMode: overview.authMode,
+      storageConfigured: overview.storageConfigured,
+      storageMessage: overview.storageMessage,
       expiresAt: session.expiresAt,
       account: {
         id: session.adminUserId ?? 0,
@@ -156,6 +162,12 @@ adminRouter.post('/setup', authRateLimit, requireSameOriginForCookieMutation, as
         is_active: 1,
         created_at: nowIso,
         last_login_at: nowIso,
+      });
+      appendAuditLogOnDraft(draft, {
+        action: 'ADMIN_SETUP',
+        actor: username,
+        summary: `Primary administrator account "${username}" configured.`,
+        createdAt: nowIso,
       });
       return id;
     });
@@ -234,6 +246,11 @@ adminRouter.post('/login', adminLoginLimiter, authRateLimit, requireSameOriginFo
       const verifiedUser = await verifyUserMfaCode(userId, mfaCode);
       if (!verifiedUser) {
         const failure = await recordAuthFailure(ip);
+        await recordAdminSecurityAudit({
+          action: 'ADMIN_LOGIN_FAILED',
+          actor: `uid:${userId}`,
+          summary: `Failed MFA verification attempt from ${ip}.`,
+        });
         if (failure.locked) {
           res.setHeader('Retry-After', String(failure.retryAfterSeconds));
           res.status(429).json({
@@ -252,6 +269,11 @@ adminRouter.post('/login', adminLoginLimiter, authRateLimit, requireSameOriginFo
         (draft) => {
           const u = draft.users.find((x) => x.id === verifiedUser.id);
           if (u) u.last_login_at = new Date().toISOString();
+          appendAuditLogOnDraft(draft, {
+            action: 'ADMIN_LOGIN_SUCCESS',
+            actor: verifiedUser.username,
+            summary: `Admin "${verifiedUser.username}" signed in with MFA.`,
+          });
         },
         { skipBackup: true }
       );
@@ -289,6 +311,11 @@ adminRouter.post('/login', adminLoginLimiter, authRateLimit, requireSameOriginFo
     const authResult = await authenticateAdminCredentials(username, password);
     if (!authResult.ok) {
       const failure = await recordAuthFailure(ip);
+      await recordAdminSecurityAudit({
+        action: 'ADMIN_LOGIN_FAILED',
+        actor: normalizeAdminUsername(username) || 'unknown',
+        summary: `Failed login attempt for "${normalizeAdminUsername(username) || 'unknown'}" from ${ip}.`,
+      });
       if (failure.locked) {
         res.setHeader('Retry-After', String(failure.retryAfterSeconds));
         res.status(429).json({
@@ -313,16 +340,21 @@ adminRouter.post('/login', adminLoginLimiter, authRateLimit, requireSameOriginFo
     }
 
     await clearAuthFailures(ip);
-    if (user.id > 0) {
-      await updateCollection(
-        'admin-settings',
-        (draft) => {
+    await updateCollection(
+      'admin-settings',
+      (draft) => {
+        if (user.id > 0) {
           const u = draft.users.find((x) => x.id === user.id);
           if (u) u.last_login_at = new Date().toISOString();
-        },
-        { skipBackup: true }
-      );
-    }
+        }
+        appendAuditLogOnDraft(draft, {
+          action: 'ADMIN_LOGIN_SUCCESS',
+          actor: user.username,
+          summary: `Admin "${user.username}" signed in.`,
+        });
+      },
+      { skipBackup: true }
+    );
 
     const session = await createAdminSession({
       adminUserId: user.id,
@@ -360,7 +392,15 @@ adminRouter.post('/login', adminLoginLimiter, authRateLimit, requireSameOriginFo
 
 adminRouter.post('/logout', requireSameOriginForCookieMutation, async (req, res) => {
   try {
+    const existingSession = await getAdminSessionFromRequest(req);
     await revokeAdminSessionFromRequest(req);
+    if (existingSession) {
+      await recordAdminSecurityAudit({
+        action: 'ADMIN_LOGOUT',
+        actor: existingSession.username,
+        summary: `Admin "${existingSession.username}" signed out.`,
+      });
+    }
   } catch (err) {
     console.error('Admin logout revocation error:', err);
   }
@@ -448,7 +488,8 @@ adminRouter.put(
     }
 
     try {
-      const hours = await updateOperatingHours(updates);
+      const actor = req.adminSession?.username ?? 'admin';
+      const hours = await updateOperatingHours(updates, actor);
       res.json({ hours });
     } catch (err: unknown) {
       if (err instanceof ServiceError || err instanceof StorageConfigurationError) {
@@ -536,6 +577,13 @@ adminRouter.post(
           created_at: nowIso,
           last_login_at: null,
         });
+        appendAuditLogOnDraft(draft, {
+          action: 'ADMIN_ACCOUNT_CREATED',
+          actor: req.adminSession?.username ?? 'admin',
+          targetId: username,
+          summary: `Created named admin "${username}" (${role}).`,
+          createdAt: nowIso,
+        });
         return {
           id,
           username,
@@ -617,6 +665,11 @@ adminRouter.post(
           throw new ServiceError(400, 'Invalid 6-digit authenticator code. Please try again.');
         }
         user.mfa_enabled = 1;
+        appendAuditLogOnDraft(draft, {
+          action: 'ADMIN_MFA_ENABLED',
+          actor: session.username,
+          summary: `Enabled 2FA MFA for "${session.username}".`,
+        });
       });
 
       res.json({ mfaEnabled: true });
@@ -657,6 +710,11 @@ adminRouter.post(
         if (target) {
           target.mfa_enabled = 0;
           target.mfa_secret = null;
+          appendAuditLogOnDraft(draft, {
+            action: 'ADMIN_MFA_DISABLED',
+            actor: session.username,
+            summary: `Disabled 2FA MFA for "${session.username}".`,
+          });
         }
       });
 

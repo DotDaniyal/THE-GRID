@@ -375,6 +375,12 @@ export function BookingConfirmationCard({
               : `PKR ${advancePkr.toLocaleString()} now · PKR ${booking.totalAmountPkr.toLocaleString()} total`}
           </dd>
         </div>
+        {booking.customerNotes && (
+          <div className="sm:col-span-2">
+            <dt className="text-xs uppercase tracking-wider text-slate-400">Customer Notes</dt>
+            <dd className="mt-1 text-xs sm:text-sm text-slate-200">{booking.customerNotes}</dd>
+          </div>
+        )}
       </dl>
 
       <div className="rounded-lg border border-[#c4d835]/30 bg-[#1B2B72]/60 p-4 text-xs sm:text-sm text-slate-200 leading-relaxed space-y-1.5">
