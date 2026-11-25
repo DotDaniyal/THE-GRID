@@ -14,6 +14,17 @@ import { getKarachiNow } from '../utils/time.ts';
 
 export const publicBookingRouter = Router();
 
+publicBookingRouter.get('/', (_req, res) => {
+  res.json({
+    name: 'THE GRID API',
+    status: 'online',
+    venue: VENUE_NAME,
+    courtNumber: COURT_NUMBER,
+    health: '/api/health',
+    slots: '/api/slots',
+  });
+});
+
 publicBookingRouter.get('/health', (_req, res) => {
   const storage = getStorageStatus();
   res.json({

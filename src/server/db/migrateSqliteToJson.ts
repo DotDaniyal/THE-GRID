@@ -1,7 +1,13 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+let DatabaseSyncClass: any = null;
+try {
+  const sqliteMod = await import('node:sqlite');
+  DatabaseSyncClass = sqliteMod.DatabaseSync;
+} catch {
+  DatabaseSyncClass = null;
+}
 import { LocalJsonFileDriver, resolveLocalDataDir } from '../storage/drivers.ts';
 import {
   ALL_COLLECTIONS,
@@ -106,7 +112,10 @@ function buildCustomersFromBookings(bookings: BookingRecord[]): CustomerRecord[]
 }
 
 export function extractCollectionsFromSqlite(sqlitePath: string): CollectionMap {
-  const db = new DatabaseSync(sqlitePath, { readOnly: true });
+  if (!DatabaseSyncClass) {
+    throw new Error('SQLite operations are not supported on this Node runtime.');
+  }
+  const db = new DatabaseSyncClass(sqlitePath, { readOnly: true });
   const nowIso = new Date().toISOString();
 
   const tableExists = (name: string): boolean => {
