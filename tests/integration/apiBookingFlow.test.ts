@@ -56,10 +56,18 @@ test('GET /api/health reports single-court THE GRID configuration', async () => 
     ok: boolean;
     courtNumber: number;
     venue: string;
+    storage: {
+      mode: string;
+      persistent: boolean;
+      configured: boolean;
+      accessible: boolean;
+    };
   };
   assert.equal(body.ok, true);
   assert.equal(body.courtNumber, 1);
   assert.equal(body.venue, 'THE GRID - Main Futsal Court');
+  assert.equal(body.storage.configured, true);
+  assert.equal(body.storage.accessible, true);
 });
 
 test('GET /api/slots validates dates and returns configured active single-court slots', async () => {
@@ -808,6 +816,28 @@ test('Vercel Blob multi-container JSON persistence, ETag concurrency protection,
       return;
     }
 
+    if (req.method === 'POST' && reqUrl.pathname.endsWith('/delete')) {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(Buffer.from(c)));
+      req.on('end', () => {
+        try {
+          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+            urls?: string[];
+          };
+          for (const u of parsed.urls ?? []) {
+            const p = new URL(u, 'http://127.0.0.1').pathname.replace(/^\/+/, '');
+            blobs.delete(p);
+          }
+        } catch {
+          // Ignore malformed delete payload
+        }
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json');
+        res.end('{}');
+      });
+      return;
+    }
+
     res.statusCode = 404;
     res.end();
   });
@@ -1075,6 +1105,10 @@ test('Vercel without persistent storage credentials rejects writes with 503 inst
     assert.equal(writeRes.status, 503);
     const errBody = await writeRes.json();
     assert.match(errBody.error, /Persistent external JSON storage is not configured/i);
+
+    const authStatus = await (await fetch(url + '/api/admin/auth-status')).json();
+    assert.equal(authStatus.storageConfigured, false);
+    assert.match(authStatus.storageMessage, /Persistent external JSON storage is not configured/i);
     srv.close();
   `;
 
@@ -1082,4 +1116,195 @@ test('Vercel without persistent storage credentials rejects writes with 503 inst
     cwd: process.cwd(),
     stdio: 'pipe',
   });
+});
+
+test('Vercel api/index handler restores rewritten __path URLs without 404 for slots, health, and admin login', async () => {
+  const { default: vercelHandler, normalizeVercelApiRequestUrl } = await import(
+    '../../api/index.ts'
+  );
+
+  assert.equal(
+    normalizeVercelApiRequestUrl({
+      url: '/api/index?__path=slots&date=2026-11-26',
+      headers: {},
+    }),
+    '/api/slots?date=2026-11-26'
+  );
+  assert.equal(
+    normalizeVercelApiRequestUrl({
+      url: '/api/index?__path=admin/login',
+      headers: {},
+    }),
+    '/api/admin/login'
+  );
+  assert.equal(
+    normalizeVercelApiRequestUrl({
+      url: '/api/index.ts',
+      headers: { 'x-vercel-original-uri': '/api/slots?date=2026-11-26' },
+    }),
+    '/api/slots?date=2026-11-26'
+  );
+
+  const rewriteProxyServer = http.createServer((req, res) => {
+    // Simulate Vercel's vercel.json rewrite: /api/(.*) -> /api/index?__path=$1
+    if (req.url && req.url.startsWith('/api')) {
+      const parsed = new URL(req.url, 'http://127.0.0.1');
+      if (parsed.pathname === '/api') {
+        req.url = `/api/index${parsed.search}`;
+      } else if (parsed.pathname.startsWith('/api/')) {
+        const sub = parsed.pathname.slice('/api/'.length);
+        parsed.searchParams.set('__path', sub);
+        req.url = `/api/index?${parsed.searchParams.toString()}`;
+      }
+    }
+    return vercelHandler(req as never, res as never);
+  });
+
+  await new Promise<void>((resolve) => rewriteProxyServer.listen(0, '127.0.0.1', resolve));
+  const proxyPort = (rewriteProxyServer.address() as { port: number }).port;
+  const proxyUrl = `http://127.0.0.1:${proxyPort}`;
+
+  try {
+    const healthRes = await fetch(`${proxyUrl}/api/health`);
+    assert.equal(healthRes.status, 200);
+    const healthJson = (await healthRes.json()) as {
+      ok: boolean;
+      storage: { configured: boolean; accessible: boolean };
+    };
+    assert.equal(healthJson.ok, true);
+    assert.equal(healthJson.storage.configured, true);
+    assert.equal(healthJson.storage.accessible, true);
+
+    const slotsRes = await fetch(`${proxyUrl}/api/slots?date=2026-11-26`);
+    assert.equal(slotsRes.status, 200);
+    const slotsJson = (await slotsRes.json()) as { slots: unknown[] };
+    assert.ok(slotsJson.slots.length > 0);
+
+    const badLoginRes = await fetch(`${proxyUrl}/api/admin/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-Forwarded-For': '203.0.113.55',
+      },
+      body: JSON.stringify({ username: 'leadadmin@thegrid.pk', password: 'wrong-password' }),
+    });
+    assert.equal(badLoginRes.status, 401);
+
+    const goodLoginRes = await fetch(`${proxyUrl}/api/admin/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-Forwarded-For': '203.0.113.55',
+      },
+      body: JSON.stringify({
+        username: 'leadadmin@thegrid.pk',
+        password: 'RoversGrid2026!Strong',
+      }),
+    });
+    assert.equal(goodLoginRes.status, 200);
+
+    const unknownApiRes = await fetch(`${proxyUrl}/api/does-not-exist`);
+    assert.equal(unknownApiRes.status, 404);
+    const unknownApiJson = (await unknownApiRes.json()) as { code: string };
+    assert.equal(unknownApiJson.code, 'API_ROUTE_NOT_FOUND');
+  } finally {
+    rewriteProxyServer.closeAllConnections?.();
+    await new Promise<void>((resolve) => rewriteProxyServer.close(() => resolve()));
+  }
+});
+
+test('Booking customerNotes, REJECTED release + history preservation, and admin dashboard stats & audit log work cleanly', async () => {
+  const NOTES_DATE = '2027-10-12';
+  const createRes = await fetch(`${baseUrl}/api/bookings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      customerName: 'Notes Player',
+      customerEmail: 'notes@thegrid.pk',
+      countryCode: '+92',
+      customerPhone: '03217778899',
+      customerNotes: 'Need bibs and extra match ball please',
+      bookingDate: NOTES_DATE,
+      startTime: '21:00',
+      bookingType: 'individual',
+      additionalGuestsCount: 0,
+      policiesAccepted: true,
+    }),
+  });
+  assert.equal(createRes.status, 201);
+  const created = (await createRes.json()) as {
+    booking: { id: string; customerNotes: string | null };
+  };
+  assert.equal(created.booking.customerNotes, 'Need bibs and extra match ball please');
+
+  const loginRes = await fetch(`${baseUrl}/api/admin/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-Forwarded-For': '203.0.113.77',
+    },
+    body: JSON.stringify({
+      username: 'leadadmin@thegrid.pk',
+      password: 'RoversGrid2026!Strong',
+    }),
+  });
+  assert.equal(loginRes.status, 200);
+  const cookiePair = extractCookiePair(loginRes.headers.get('set-cookie'));
+
+  // Reject the booking -> releases the slot and records rejected_at/rejected_by + stats + audit log
+  const rejectRes = await fetch(`${baseUrl}/api/admin/bookings/${created.booking.id}/status`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookiePair,
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    body: JSON.stringify({ status: 'REJECTED', adminNotes: 'Advance screenshot unreadable' }),
+  });
+  assert.equal(rejectRes.status, 200);
+  const rejected = (await rejectRes.json()) as {
+    booking: {
+      status: string;
+      customer_notes: string | null;
+      admin_notes: string | null;
+      rejected_at: string | null;
+      rejected_by: string | null;
+    };
+  };
+  assert.equal(rejected.booking.status, 'REJECTED');
+  assert.equal(rejected.booking.customer_notes, 'Need bibs and extra match ball please');
+  assert.equal(rejected.booking.admin_notes, 'Advance screenshot unreadable');
+  assert.ok(rejected.booking.rejected_at);
+  assert.equal(rejected.booking.rejected_by, 'leadadmin@thegrid.pk');
+
+  // Slot returns to AVAILABLE immediately after REJECTED
+  const slotsAfterReject = (await (await fetch(`${baseUrl}/api/slots?date=${NOTES_DATE}`)).json()) as {
+    slots: Array<{ startTime: string; isAvailable: boolean; status: string }>;
+  };
+  const slot21 = slotsAfterReject.slots.find((s) => s.startTime === '21:00');
+  assert.equal(slot21?.status, 'AVAILABLE');
+  assert.equal(slot21?.isAvailable, true);
+
+  // Dashboard returns 8 summary stats & recentActivity including BOOKING_REJECTED
+  const dashRes = await fetch(`${baseUrl}/api/admin/bookings`, {
+    headers: { Cookie: cookiePair },
+  });
+  assert.equal(dashRes.status, 200);
+  const dash = (await dashRes.json()) as {
+    stats: {
+      totalBookings: number;
+      rejectedBookings: number;
+    };
+    recentActivity: Array<{ action: string; target_id?: string | null }>;
+  };
+  assert.ok(dash.stats.totalBookings >= 1);
+  assert.ok(dash.stats.rejectedBookings >= 1);
+  assert.ok(
+    dash.recentActivity.some(
+      (a) => a.action === 'BOOKING_REJECTED' && a.target_id === created.booking.id
+    )
+  );
 });

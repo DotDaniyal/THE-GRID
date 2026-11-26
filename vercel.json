@@ -49,11 +49,11 @@
   "rewrites": [
     {
       "source": "/api",
-      "destination": "/api/index.ts"
+      "destination": "/api/index"
     },
     {
       "source": "/api/(.*)",
-      "destination": "/api/index.ts"
+      "destination": "/api/index?__path=$1"
     },
     {
       "source": "/((?!api(?:/|$)|assets/|brand/|gallery/|robots\\.txt|sitemap\\.xml).*)",

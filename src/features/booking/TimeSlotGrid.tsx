@@ -43,6 +43,8 @@ export function TimeSlotGrid({
           <p className="mt-0.5 text-xs sm:text-sm text-slate-300">
             {loading
               ? 'Checking real-time court availability...'
+              : error
+              ? 'Unable to load court availability right now.'
               : `${availableCount} available · ${bookedCount} booked · 60-minute slots (PKT)`}
           </p>
         </div>

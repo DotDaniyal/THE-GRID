@@ -9,7 +9,7 @@ import {
   ServiceError,
 } from '../services/bookingService.ts';
 import { StorageConfigurationError } from '../storage/drivers.ts';
-import { getStorageStatus } from '../storage/jsonStore.ts';
+import { getStorageStatus, readCollection } from '../storage/jsonStore.ts';
 import { getKarachiNow } from '../utils/time.ts';
 
 export const publicBookingRouter = Router();
@@ -25,8 +25,20 @@ publicBookingRouter.get('/', (_req, res) => {
   });
 });
 
-publicBookingRouter.get('/health', (_req, res) => {
+publicBookingRouter.get('/health', async (_req, res) => {
   const storage = getStorageStatus();
+  const configured = storage.persistent || storage.mode === 'local_json';
+  let accessible = false;
+
+  if (configured) {
+    try {
+      const settings = await readCollection('settings');
+      accessible = Array.isArray(settings.operatingHours);
+    } catch {
+      accessible = false;
+    }
+  }
+
   res.json({
     ok: true,
     karachiNow: getKarachiNow(),
@@ -35,6 +47,8 @@ publicBookingRouter.get('/health', (_req, res) => {
     storage: {
       mode: storage.mode,
       persistent: storage.persistent,
+      configured,
+      accessible,
     },
   });
 });

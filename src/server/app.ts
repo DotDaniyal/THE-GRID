@@ -29,6 +29,13 @@ export function createApiApp(): express.Express {
   app.use('/api', publicBookingRouter);
   app.use('/api/admin', adminRouter);
 
+  app.use('/api', (req, res) => {
+    res.status(404).json({
+      error: `API route not found: ${req.method} ${req.originalUrl || req.url}`,
+      code: 'API_ROUTE_NOT_FOUND',
+    });
+  });
+
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     console.error('Unhandled API error:', err);
     if (!res.headersSent) {
