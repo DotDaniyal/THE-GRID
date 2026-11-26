@@ -18,6 +18,10 @@ export function createApiApp(): express.Express {
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
     }
+    if (req.path === '/health' || req.path === '/admin/auth-status') {
+      next();
+      return;
+    }
     try {
       await ensureStoreInitialized();
       next();

@@ -1,6 +1,6 @@
 import { isValidIsoDate, getKarachiNow } from '../utils/time.ts';
 import { ServiceError } from './bookingService.ts';
-import { readCollection, updateCollection } from '../storage/jsonStore.ts';
+import { readCollection, updateCollection, withNamedLock } from '../storage/jsonStore.ts';
 import type {
   DrinkCategory,
   DrinkExpenseRecord,
@@ -335,62 +335,72 @@ export async function createDrink(
     );
   }
 
-  const nowIso = new Date().toISOString();
+  return withNamedLock('drinks:tx', async () => {
+    const nowIso = new Date().toISOString();
 
-  let createdProduct!: DrinkProductRecord;
+    let createdProduct!: DrinkProductRecord;
 
-  await updateCollection('products', (draft) => {
-    const newId = draft.nextId++;
-    createdProduct = {
-      id: newId,
-      name,
-      category,
-      brand,
-      bottle_size: bottleSize,
-      purchase_price_pkr: purchasePricePkr,
-      price_pkr: sellingPricePkr,
-      min_stock_alert: minStockAlert,
-      description,
-      image_url: imageUrl,
-      is_active: isActive,
-      created_by: actorUsername,
-      updated_by: actorUsername,
-      created_at: nowIso,
-      updated_at: nowIso,
-    };
-    draft.records.push(createdProduct);
-  });
-
-  let createdStockLevel!: DrinkStockLevelRecord;
-
-  await updateCollection('inventory', (draft) => {
-    createdStockLevel = {
-      drink_id: createdProduct.id,
-      opening_stock: openingStock,
-      current_stock: currentStock,
-      min_stock_alert: minStockAlert,
-      is_available: currentStock > 0 ? 1 : 0,
-      updated_by: actorUsername,
-      updated_at: nowIso,
-    };
-    draft.stockLevels.push(createdStockLevel);
-
-    if (currentStock > 0) {
-      draft.adjustments.push({
-        id: draft.nextAdjustmentId++,
-        drink_id: createdProduct.id,
-        adjustment_type: 'OPENING',
-        delta_qty: currentStock,
-        previous_stock: 0,
-        new_stock: currentStock,
-        reason: 'Initial product opening stock',
+    await updateCollection('products', (draft) => {
+      const newId = draft.nextId++;
+      createdProduct = {
+        id: newId,
+        name,
+        category,
+        brand,
+        bottle_size: bottleSize,
+        purchase_price_pkr: purchasePricePkr,
+        price_pkr: sellingPricePkr,
+        min_stock_alert: minStockAlert,
+        description,
+        image_url: imageUrl,
+        is_active: isActive,
         created_by: actorUsername,
+        updated_by: actorUsername,
         created_at: nowIso,
-      });
-    }
-  });
+        updated_at: nowIso,
+      };
+      draft.records.push(createdProduct);
+    });
 
-  return combineProductWithStock(createdProduct, createdStockLevel);
+    let createdStockLevel!: DrinkStockLevelRecord;
+
+    try {
+      await updateCollection('inventory', (draft) => {
+        createdStockLevel = {
+          drink_id: createdProduct.id,
+          opening_stock: openingStock,
+          current_stock: currentStock,
+          min_stock_alert: minStockAlert,
+          is_available: currentStock > 0 ? 1 : 0,
+          updated_by: actorUsername,
+          updated_at: nowIso,
+        };
+        draft.stockLevels.push(createdStockLevel);
+
+        if (currentStock > 0) {
+          draft.adjustments.push({
+            id: draft.nextAdjustmentId++,
+            drink_id: createdProduct.id,
+            adjustment_type: 'OPENING',
+            delta_qty: currentStock,
+            previous_stock: 0,
+            new_stock: currentStock,
+            reason: 'Initial product opening stock',
+            created_by: actorUsername,
+            created_at: nowIso,
+          });
+        }
+      });
+    } catch (err) {
+      await updateCollection('products', (draft) => {
+        const idx = draft.records.findIndex((p) => p.id === createdProduct.id);
+        if (idx !== -1) draft.records.splice(idx, 1);
+      }).catch(() => undefined);
+      throw err;
+    }
+
+    return combineProductWithStock(createdProduct, createdStockLevel);
+  });
 }
 
 export async function updateDrink(
@@ -398,153 +408,155 @@ export async function updateDrink(
   raw: Record<string, unknown>,
   actorUsername = 'admin'
 ): Promise<DrinkRow> {
-  const [productsDoc, inventoryDoc] = await Promise.all([
-    readCollection('products'),
-    readCollection('inventory'),
-  ]);
+  return withNamedLock('drinks:tx', async () => {
+    const [productsDoc, inventoryDoc] = await Promise.all([
+      readCollection('products'),
+      readCollection('inventory'),
+    ]);
 
-  const existing = productsDoc.records.find((p) => p.id === id);
-  if (!existing) {
-    throw new ServiceError(404, 'Product not found.');
-  }
-
-  const existingStock = inventoryDoc.stockLevels.find((s) => s.drink_id === id);
-  const currentStockBefore = existingStock?.current_stock ?? 0;
-  const openingStockBefore = existingStock?.opening_stock ?? 0;
-
-  const name = typeof raw.name === 'string' ? raw.name.trim() : existing.name;
-  const category = (
-    typeof raw.category === 'string' ? raw.category.trim() : existing.category
-  ) as DrinkCategory;
-  const brand =
-    typeof raw.brand === 'string' ? raw.brand.trim().slice(0, 80) : existing.brand;
-  const bottleSize =
-    typeof raw.bottleSize === 'string'
-      ? raw.bottleSize.trim().slice(0, 40)
-      : typeof raw.bottle_size === 'string'
-      ? raw.bottle_size.trim().slice(0, 40)
-      : existing.bottle_size;
-  const purchasePricePkr =
-    raw.purchasePricePkr !== undefined || raw.purchase_price_pkr !== undefined
-      ? parseNonNegInt(raw.purchasePricePkr ?? raw.purchase_price_pkr, 'Purchase price')
-      : existing.purchase_price_pkr;
-  const sellingPricePkr =
-    raw.sellingPricePkr !== undefined || raw.pricePkr !== undefined || raw.price_pkr !== undefined
-      ? parsePositiveInt(
-          raw.sellingPricePkr ?? raw.pricePkr ?? raw.price_pkr,
-          'Selling price'
-        )
-      : existing.price_pkr;
-  const openingStock =
-    raw.openingStock !== undefined || raw.opening_stock !== undefined
-      ? parseNonNegInt(raw.openingStock ?? raw.opening_stock, 'Opening stock')
-      : openingStockBefore;
-  const currentStock =
-    raw.currentStock !== undefined || raw.current_stock !== undefined
-      ? parseNonNegInt(raw.currentStock ?? raw.current_stock, 'Current stock')
-      : currentStockBefore;
-  const minStockAlert =
-    raw.minStockAlert !== undefined || raw.min_stock_alert !== undefined
-      ? parseNonNegInt(raw.minStockAlert ?? raw.min_stock_alert, 'Minimum stock alert')
-      : existing.min_stock_alert;
-  const description =
-    raw.description !== undefined
-      ? typeof raw.description === 'string'
-        ? raw.description.trim() || null
-        : null
-      : existing.description;
-  const imageUrl =
-    raw.imageUrl !== undefined
-      ? sanitizeImageUrl(raw.imageUrl)
-      : raw.image_url !== undefined
-      ? sanitizeImageUrl(raw.image_url)
-      : existing.image_url;
-  const isActive =
-    raw.isActive !== undefined
-      ? raw.isActive
-        ? 1
-        : 0
-      : raw.is_active !== undefined
-      ? raw.is_active
-        ? 1
-        : 0
-      : existing.is_active;
-
-  if (name.length < 2 || name.length > 80) {
-    throw new ServiceError(400, 'Product name must be between 2 and 80 characters.');
-  }
-  if (!VALID_CATEGORIES.has(category)) {
-    throw new ServiceError(400, 'Invalid category.');
-  }
-
-  const nowIso = new Date().toISOString();
-
-  let updatedProduct!: DrinkProductRecord;
-  await updateCollection('products', (draft) => {
-    const idx = draft.records.findIndex((p) => p.id === id);
-    if (idx === -1) {
+    const existing = productsDoc.records.find((p) => p.id === id);
+    if (!existing) {
       throw new ServiceError(404, 'Product not found.');
     }
-    draft.records[idx] = {
-      ...draft.records[idx],
-      name,
-      category,
-      brand,
-      bottle_size: bottleSize,
-      purchase_price_pkr: purchasePricePkr,
-      price_pkr: sellingPricePkr,
-      min_stock_alert: minStockAlert,
-      description,
-      image_url: imageUrl,
-      is_active: isActive,
-      updated_by: actorUsername,
-      updated_at: nowIso,
-    };
-    updatedProduct = draft.records[idx];
-  });
 
-  let updatedStock!: DrinkStockLevelRecord;
-  await updateCollection('inventory', (draft) => {
-    let sl = draft.stockLevels.find((s) => s.drink_id === id);
-    const prevStock = sl ? sl.current_stock : 0;
-    if (!sl) {
-      sl = {
-        drink_id: id,
-        opening_stock: openingStock,
-        current_stock: currentStock,
+    const existingStock = inventoryDoc.stockLevels.find((s) => s.drink_id === id);
+    const currentStockBefore = existingStock?.current_stock ?? 0;
+    const openingStockBefore = existingStock?.opening_stock ?? 0;
+
+    const name = typeof raw.name === 'string' ? raw.name.trim() : existing.name;
+    const category = (
+      typeof raw.category === 'string' ? raw.category.trim() : existing.category
+    ) as DrinkCategory;
+    const brand =
+      typeof raw.brand === 'string' ? raw.brand.trim().slice(0, 80) : existing.brand;
+    const bottleSize =
+      typeof raw.bottleSize === 'string'
+        ? raw.bottleSize.trim().slice(0, 40)
+        : typeof raw.bottle_size === 'string'
+        ? raw.bottle_size.trim().slice(0, 40)
+        : existing.bottle_size;
+    const purchasePricePkr =
+      raw.purchasePricePkr !== undefined || raw.purchase_price_pkr !== undefined
+        ? parseNonNegInt(raw.purchasePricePkr ?? raw.purchase_price_pkr, 'Purchase price')
+        : existing.purchase_price_pkr;
+    const sellingPricePkr =
+      raw.sellingPricePkr !== undefined || raw.pricePkr !== undefined || raw.price_pkr !== undefined
+        ? parsePositiveInt(
+            raw.sellingPricePkr ?? raw.pricePkr ?? raw.price_pkr,
+            'Selling price'
+          )
+        : existing.price_pkr;
+    const openingStock =
+      raw.openingStock !== undefined || raw.opening_stock !== undefined
+        ? parseNonNegInt(raw.openingStock ?? raw.opening_stock, 'Opening stock')
+        : openingStockBefore;
+    const currentStock =
+      raw.currentStock !== undefined || raw.current_stock !== undefined
+        ? parseNonNegInt(raw.currentStock ?? raw.current_stock, 'Current stock')
+        : currentStockBefore;
+    const minStockAlert =
+      raw.minStockAlert !== undefined || raw.min_stock_alert !== undefined
+        ? parseNonNegInt(raw.minStockAlert ?? raw.min_stock_alert, 'Minimum stock alert')
+        : existing.min_stock_alert;
+    const description =
+      raw.description !== undefined
+        ? typeof raw.description === 'string'
+          ? raw.description.trim() || null
+          : null
+        : existing.description;
+    const imageUrl =
+      raw.imageUrl !== undefined
+        ? sanitizeImageUrl(raw.imageUrl)
+        : raw.image_url !== undefined
+        ? sanitizeImageUrl(raw.image_url)
+        : existing.image_url;
+    const isActive =
+      raw.isActive !== undefined
+        ? raw.isActive
+          ? 1
+          : 0
+        : raw.is_active !== undefined
+        ? raw.is_active
+          ? 1
+          : 0
+        : existing.is_active;
+
+    if (name.length < 2 || name.length > 80) {
+      throw new ServiceError(400, 'Product name must be between 2 and 80 characters.');
+    }
+    if (!VALID_CATEGORIES.has(category)) {
+      throw new ServiceError(400, 'Invalid category.');
+    }
+
+    const nowIso = new Date().toISOString();
+
+    let updatedProduct!: DrinkProductRecord;
+    await updateCollection('products', (draft) => {
+      const idx = draft.records.findIndex((p) => p.id === id);
+      if (idx === -1) {
+        throw new ServiceError(404, 'Product not found.');
+      }
+      draft.records[idx] = {
+        ...draft.records[idx],
+        name,
+        category,
+        brand,
+        bottle_size: bottleSize,
+        purchase_price_pkr: purchasePricePkr,
+        price_pkr: sellingPricePkr,
         min_stock_alert: minStockAlert,
-        is_available: currentStock > 0 ? 1 : 0,
+        description,
+        image_url: imageUrl,
+        is_active: isActive,
         updated_by: actorUsername,
         updated_at: nowIso,
       };
-      draft.stockLevels.push(sl);
-    } else {
-      sl.opening_stock = openingStock;
-      sl.current_stock = currentStock;
-      sl.min_stock_alert = minStockAlert;
-      sl.is_available = currentStock > 0 ? 1 : 0;
-      sl.updated_by = actorUsername;
-      sl.updated_at = nowIso;
-    }
-    updatedStock = { ...sl };
+      updatedProduct = draft.records[idx];
+    });
 
-    if (currentStock !== prevStock) {
-      const delta = currentStock - prevStock;
-      draft.adjustments.push({
-        id: draft.nextAdjustmentId++,
-        drink_id: id,
-        adjustment_type: delta >= 0 ? 'RESTOCK' : 'REDUCTION',
-        delta_qty: delta,
-        previous_stock: prevStock,
-        new_stock: currentStock,
-        reason: 'Manual stock edit in product form',
-        created_by: actorUsername,
-        created_at: nowIso,
-      });
-    }
+    let updatedStock!: DrinkStockLevelRecord;
+    await updateCollection('inventory', (draft) => {
+      let sl = draft.stockLevels.find((s) => s.drink_id === id);
+      const prevStock = sl ? sl.current_stock : 0;
+      if (!sl) {
+        sl = {
+          drink_id: id,
+          opening_stock: openingStock,
+          current_stock: currentStock,
+          min_stock_alert: minStockAlert,
+          is_available: currentStock > 0 ? 1 : 0,
+          updated_by: actorUsername,
+          updated_at: nowIso,
+        };
+        draft.stockLevels.push(sl);
+      } else {
+        sl.opening_stock = openingStock;
+        sl.current_stock = currentStock;
+        sl.min_stock_alert = minStockAlert;
+        sl.is_available = currentStock > 0 ? 1 : 0;
+        sl.updated_by = actorUsername;
+        sl.updated_at = nowIso;
+      }
+      updatedStock = { ...sl };
+
+      if (currentStock !== prevStock) {
+        const delta = currentStock - prevStock;
+        draft.adjustments.push({
+          id: draft.nextAdjustmentId++,
+          drink_id: id,
+          adjustment_type: delta >= 0 ? 'RESTOCK' : 'REDUCTION',
+          delta_qty: delta,
+          previous_stock: prevStock,
+          new_stock: currentStock,
+          reason: 'Manual stock edit in product form',
+          created_by: actorUsername,
+          created_at: nowIso,
+        });
+      }
+    });
+
+    return combineProductWithStock(updatedProduct, updatedStock);
   });
-
-  return combineProductWithStock(updatedProduct, updatedStock);
 }
 
 export async function adjustDrinkStock(
@@ -564,100 +576,104 @@ export async function adjustDrinkStock(
     throw new ServiceError(400, 'Stock adjustment quantity must be a non-zero integer.');
   }
 
-  const productsDoc = await readCollection('products');
-  const product = productsDoc.records.find((p) => p.id === id);
-  if (!product) {
-    throw new ServiceError(404, 'Product not found.');
-  }
+  return withNamedLock('drinks:tx', async () => {
+    const productsDoc = await readCollection('products');
+    const product = productsDoc.records.find((p) => p.id === id);
+    if (!product) {
+      throw new ServiceError(404, 'Product not found.');
+    }
 
-  const nowIso = new Date().toISOString();
-  let createdAdjustment!: DrinkStockAdjustmentRecord;
-  let updatedStockLevel!: DrinkStockLevelRecord;
+    const nowIso = new Date().toISOString();
+    let createdAdjustment!: DrinkStockAdjustmentRecord;
+    let updatedStockLevel!: DrinkStockLevelRecord;
 
-  await updateCollection('inventory', (draft) => {
-    let sl = draft.stockLevels.find((s) => s.drink_id === id);
-    if (!sl) {
-      sl = {
+    await updateCollection('inventory', (draft) => {
+      let sl = draft.stockLevels.find((s) => s.drink_id === id);
+      if (!sl) {
+        sl = {
+          drink_id: id,
+          opening_stock: 0,
+          current_stock: 0,
+          min_stock_alert: product.min_stock_alert,
+          is_available: 0,
+          updated_by: actorUsername,
+          updated_at: nowIso,
+        };
+        draft.stockLevels.push(sl);
+      }
+
+      const nextStock = sl.current_stock + deltaQty;
+      if (nextStock < 0) {
+        throw new ServiceError(
+          400,
+          `Cannot reduce stock below 0 (current stock is ${sl.current_stock}).`
+        );
+      }
+
+      const prevStock = sl.current_stock;
+      sl.current_stock = nextStock;
+      sl.is_available = nextStock > 0 ? 1 : 0;
+      sl.updated_by = actorUsername;
+      sl.updated_at = nowIso;
+      updatedStockLevel = { ...sl };
+
+      createdAdjustment = {
+        id: draft.nextAdjustmentId++,
         drink_id: id,
-        opening_stock: 0,
-        current_stock: 0,
-        min_stock_alert: product.min_stock_alert,
-        is_available: 0,
-        updated_by: actorUsername,
-        updated_at: nowIso,
+        adjustment_type: deltaQty > 0 ? 'RESTOCK' : 'REDUCTION',
+        delta_qty: deltaQty,
+        previous_stock: prevStock,
+        new_stock: nextStock,
+        reason,
+        created_by: actorUsername,
+        created_at: nowIso,
       };
-      draft.stockLevels.push(sl);
-    }
+      draft.adjustments.push(createdAdjustment);
+    });
 
-    const nextStock = sl.current_stock + deltaQty;
-    if (nextStock < 0) {
-      throw new ServiceError(
-        400,
-        `Cannot reduce stock below 0 (current stock is ${sl.current_stock}).`
-      );
-    }
-
-    const prevStock = sl.current_stock;
-    sl.current_stock = nextStock;
-    sl.is_available = nextStock > 0 ? 1 : 0;
-    sl.updated_by = actorUsername;
-    sl.updated_at = nowIso;
-    updatedStockLevel = { ...sl };
-
-    createdAdjustment = {
-      id: draft.nextAdjustmentId++,
-      drink_id: id,
-      adjustment_type: deltaQty > 0 ? 'RESTOCK' : 'REDUCTION',
-      delta_qty: deltaQty,
-      previous_stock: prevStock,
-      new_stock: nextStock,
-      reason,
-      created_by: actorUsername,
-      created_at: nowIso,
+    const drink = combineProductWithStock(product, updatedStockLevel);
+    const adjustment: DrinkStockAdjustmentRow = {
+      ...createdAdjustment,
+      drink_name: product.name,
     };
-    draft.adjustments.push(createdAdjustment);
+
+    return { drink, adjustment };
   });
-
-  const drink = combineProductWithStock(product, updatedStockLevel);
-  const adjustment: DrinkStockAdjustmentRow = {
-    ...createdAdjustment,
-    drink_name: product.name,
-  };
-
-  return { drink, adjustment };
 }
 
 export async function deleteDrink(id: number): Promise<void> {
-  const [productsDoc, salesDoc] = await Promise.all([
-    readCollection('products'),
-    readCollection('sales'),
-  ]);
+  return withNamedLock('drinks:tx', async () => {
+    const [productsDoc, salesDoc] = await Promise.all([
+      readCollection('products'),
+      readCollection('sales'),
+    ]);
 
-  const product = productsDoc.records.find((p) => p.id === id);
-  if (!product) {
-    throw new ServiceError(404, 'Product not found.');
-  }
-
-  const hasSalesHistory = salesDoc.records.some((s) => s.drink_id === id);
-  if (hasSalesHistory) {
-    throw new ServiceError(
-      409,
-      'Cannot delete a product that has recorded sales history. Mark it Inactive instead to preserve accounting records.'
-    );
-  }
-
-  await updateCollection('products', (draft) => {
-    const idx = draft.records.findIndex((p) => p.id === id);
-    if (idx !== -1) {
-      draft.records.splice(idx, 1);
+    const product = productsDoc.records.find((p) => p.id === id);
+    if (!product) {
+      throw new ServiceError(404, 'Product not found.');
     }
-  });
 
-  await updateCollection('inventory', (draft) => {
-    const idx = draft.stockLevels.findIndex((s) => s.drink_id === id);
-    if (idx !== -1) {
-      draft.stockLevels.splice(idx, 1);
+    const hasSalesHistory = salesDoc.records.some((s) => s.drink_id === id);
+    if (hasSalesHistory) {
+      throw new ServiceError(
+        409,
+        'Cannot delete a product that has recorded sales history. Mark it Inactive instead to preserve accounting records.'
+      );
     }
+
+    await updateCollection('products', (draft) => {
+      const idx = draft.records.findIndex((p) => p.id === id);
+      if (idx !== -1) {
+        draft.records.splice(idx, 1);
+      }
+    });
+
+    await updateCollection('inventory', (draft) => {
+      const idx = draft.stockLevels.findIndex((s) => s.drink_id === id);
+      if (idx !== -1) {
+        draft.stockLevels.splice(idx, 1);
+      }
+    });
   });
 }
 
@@ -711,124 +727,146 @@ export async function createDrinkSale(
     throw new ServiceError(400, 'Please select a valid product.');
   }
 
-  const [productsDoc, inventoryDoc] = await Promise.all([
-    readCollection('products'),
-    readCollection('inventory'),
-  ]);
-
-  const product = productsDoc.records.find((p) => p.id === drinkId);
-  if (!product) {
-    throw new ServiceError(404, 'Selected product not found.');
-  }
-  if (product.is_active !== 1) {
-    throw new ServiceError(
-      400,
-      `"${product.name}" is inactive. Activate it before recording a sale.`
-    );
-  }
-
-  const stockLevel = inventoryDoc.stockLevels.find((s) => s.drink_id === drinkId);
-  const currentStock = stockLevel?.current_stock ?? 0;
-  if (quantity > currentStock) {
-    throw new ServiceError(
-      400,
-      `Insufficient stock for "${product.name}". Available: ${currentStock}, Requested: ${quantity}.`
-    );
-  }
-
-  const unitSellingPricePkr =
-    raw.unitSellingPricePkr !== undefined || raw.unit_selling_price_pkr !== undefined
-      ? parseNonNegInt(
-          raw.unitSellingPricePkr ?? raw.unit_selling_price_pkr,
-          'Selling price per unit'
-        )
-      : product.price_pkr;
-  const unitPurchasePricePkr =
-    raw.unitPurchasePricePkr !== undefined || raw.unit_purchase_price_pkr !== undefined
-      ? parseNonNegInt(
-          raw.unitPurchasePricePkr ?? raw.unit_purchase_price_pkr,
-          'Purchase cost per unit'
-        )
-      : product.purchase_price_pkr;
-
-  const totalSalePkr = unitSellingPricePkr * quantity;
-  const totalCostPkr = unitPurchasePricePkr * quantity;
-  const profitPkr = totalSalePkr - totalCostPkr;
-  const nextStock = currentStock - quantity;
-  const nowIso = new Date().toISOString();
-
-  let createdSale!: DrinkSaleRecord;
-
-  await updateCollection('sales', (draft) => {
-    const saleId = draft.nextSaleId++;
-    createdSale = {
-      id: saleId,
-      drink_id: product.id,
-      product_name: product.name,
-      category: product.category,
-      quantity,
-      unit_selling_price_pkr: unitSellingPricePkr,
-      total_sale_pkr: totalSalePkr,
-      unit_purchase_price_pkr: unitPurchasePricePkr,
-      total_cost_pkr: totalCostPkr,
-      profit_pkr: profitPkr,
-      sold_at: soldAt,
-      sale_date: saleDate,
-      notes,
-      status: 'COMPLETED',
-      created_by: actorUsername,
-      updated_by: actorUsername,
-      cancelled_by: null,
-      cancel_reason: null,
-      created_at: nowIso,
-      updated_at: nowIso,
-      cancelled_at: null,
-    };
-    draft.records.push(createdSale);
-
-    draft.auditLogs.push({
-      id: draft.nextAuditLogId++,
-      sale_id: saleId,
-      action: 'CREATED',
-      summary: `Recorded sale of ${quantity} x ${product.name} @ PKR ${unitSellingPricePkr} (Total PKR ${totalSalePkr}, Profit PKR ${profitPkr}).`,
-      actor_username: actorUsername,
-      created_at: nowIso,
-    });
-  });
-
-  await updateCollection('inventory', (draft) => {
-    let sl = draft.stockLevels.find((s) => s.drink_id === product.id);
-    if (!sl) {
-      sl = {
-        drink_id: product.id,
-        opening_stock: 0,
-        current_stock: 0,
-        min_stock_alert: product.min_stock_alert,
-        is_available: 0,
-        updated_by: actorUsername,
-        updated_at: nowIso,
-      };
-      draft.stockLevels.push(sl);
+  return withNamedLock('drinks:tx', async () => {
+    const productsDoc = await readCollection('products');
+    const product = productsDoc.records.find((p) => p.id === drinkId);
+    if (!product) {
+      throw new ServiceError(404, 'Selected product not found.');
     }
-    sl.current_stock = nextStock;
-    sl.is_available = nextStock > 0 ? 1 : 0;
-    sl.updated_by = actorUsername;
-    sl.updated_at = nowIso;
+    if (product.is_active !== 1) {
+      throw new ServiceError(
+        400,
+        `"${product.name}" is inactive. Activate it before recording a sale.`
+      );
+    }
 
-    draft.adjustments.push({
-      id: draft.nextAdjustmentId++,
-      drink_id: product.id,
-      adjustment_type: 'SALE',
-      delta_qty: -quantity,
-      previous_stock: currentStock,
-      new_stock: nextStock,
-      reason: `Sale #${createdSale.id} (${quantity} unit${quantity === 1 ? '' : 's'})`,
-      created_by: actorUsername,
-      created_at: nowIso,
+    const unitSellingPricePkr =
+      raw.unitSellingPricePkr !== undefined || raw.unit_selling_price_pkr !== undefined
+        ? parseNonNegInt(
+            raw.unitSellingPricePkr ?? raw.unit_selling_price_pkr,
+            'Selling price per unit'
+          )
+        : product.price_pkr;
+    const unitPurchasePricePkr =
+      raw.unitPurchasePricePkr !== undefined || raw.unit_purchase_price_pkr !== undefined
+        ? parseNonNegInt(
+            raw.unitPurchasePricePkr ?? raw.unit_purchase_price_pkr,
+            'Purchase cost per unit'
+          )
+        : product.purchase_price_pkr;
+
+    const totalSalePkr = unitSellingPricePkr * quantity;
+    const totalCostPkr = unitPurchasePricePkr * quantity;
+    const profitPkr = totalSalePkr - totalCostPkr;
+    const nowIso = new Date().toISOString();
+
+    let deductionAdjustmentId = 0;
+
+    // Atomically validate and deduct stock inside inventory CAS updater first
+    await updateCollection('inventory', (draft) => {
+      let sl = draft.stockLevels.find((s) => s.drink_id === product.id);
+      const currentStock = sl?.current_stock ?? 0;
+      if (quantity > currentStock) {
+        throw new ServiceError(
+          400,
+          `Insufficient stock for "${product.name}". Available: ${currentStock}, Requested: ${quantity}.`
+        );
+      }
+
+      const nextStock = currentStock - quantity;
+      if (!sl) {
+        sl = {
+          drink_id: product.id,
+          opening_stock: 0,
+          current_stock: nextStock,
+          min_stock_alert: product.min_stock_alert,
+          is_available: nextStock > 0 ? 1 : 0,
+          updated_by: actorUsername,
+          updated_at: nowIso,
+        };
+        draft.stockLevels.push(sl);
+      } else {
+        sl.current_stock = nextStock;
+        sl.is_available = nextStock > 0 ? 1 : 0;
+        sl.updated_by = actorUsername;
+        sl.updated_at = nowIso;
+      }
+
+      deductionAdjustmentId = draft.nextAdjustmentId++;
+      draft.adjustments.push({
+        id: deductionAdjustmentId,
+        drink_id: product.id,
+        adjustment_type: 'SALE',
+        delta_qty: -quantity,
+        previous_stock: currentStock,
+        new_stock: nextStock,
+        reason: `Sale recorded (${quantity} unit${quantity === 1 ? '' : 's'})`,
+        created_by: actorUsername,
+        created_at: nowIso,
+      });
     });
-  });
 
-  return createdSale;
+    let createdSale!: DrinkSaleRecord;
+    try {
+      await updateCollection('sales', (draft) => {
+        const saleId = draft.nextSaleId++;
+        createdSale = {
+          id: saleId,
+          drink_id: product.id,
+          product_name: product.name,
+          category: product.category,
+          quantity,
+          unit_selling_price_pkr: unitSellingPricePkr,
+          total_sale_pkr: totalSalePkr,
+          unit_purchase_price_pkr: unitPurchasePricePkr,
+          total_cost_pkr: totalCostPkr,
+          profit_pkr: profitPkr,
+          sold_at: soldAt,
+          sale_date: saleDate,
+          notes,
+          status: 'COMPLETED',
+          created_by: actorUsername,
+          updated_by: actorUsername,
+          cancelled_by: null,
+          cancel_reason: null,
+          created_at: nowIso,
+          updated_at: nowIso,
+          cancelled_at: null,
+        };
+        draft.records.push(createdSale);
+
+        draft.auditLogs.push({
+          id: draft.nextAuditLogId++,
+          sale_id: saleId,
+          action: 'CREATED',
+          summary: `Recorded sale of ${quantity} x ${product.name} @ PKR ${unitSellingPricePkr} (Total PKR ${totalSalePkr}, Profit PKR ${profitPkr}).`,
+          actor_username: actorUsername,
+          created_at: nowIso,
+        });
+      });
+    } catch (err) {
+      // Compensate inventory deduction if saving sales.json failed
+      await updateCollection(
+        'inventory',
+        (draft) => {
+          const sl = draft.stockLevels.find((s) => s.drink_id === product.id);
+          if (sl) {
+            sl.current_stock += quantity;
+            sl.is_available = sl.current_stock > 0 ? 1 : 0;
+            sl.updated_at = new Date().toISOString();
+          }
+          const adjIdx = draft.adjustments.findIndex((a) => a.id === deductionAdjustmentId);
+          if (adjIdx !== -1) {
+            draft.adjustments.splice(adjIdx, 1);
+          }
+        },
+        { skipBackup: true }
+      ).catch(() => undefined);
+      throw err;
+    }
+
+    return createdSale;
+  });
 }
 
 export async function updateDrinkSale(
@@ -836,128 +874,126 @@ export async function updateDrinkSale(
   raw: Record<string, unknown>,
   actorUsername = 'admin'
 ): Promise<DrinkSaleRow> {
-  const [salesDoc, productsDoc, inventoryDoc] = await Promise.all([
-    readCollection('sales'),
-    readCollection('products'),
-    readCollection('inventory'),
-  ]);
+  return withNamedLock('drinks:tx', async () => {
+    const [salesDoc, productsDoc] = await Promise.all([
+      readCollection('sales'),
+      readCollection('products'),
+    ]);
 
-  const existingSale = salesDoc.records.find((s) => s.id === saleId);
-  if (!existingSale) {
-    throw new ServiceError(404, 'Sale record not found.');
-  }
-  if (existingSale.status === 'CANCELLED') {
-    throw new ServiceError(400, 'Cancelled sales cannot be edited.');
-  }
-
-  const product = productsDoc.records.find((p) => p.id === existingSale.drink_id);
-  if (!product) {
-    throw new ServiceError(404, 'Associated product not found.');
-  }
-
-  const stockLevel = inventoryDoc.stockLevels.find((s) => s.drink_id === product.id);
-  const currentStock = stockLevel?.current_stock ?? 0;
-
-  const newQuantity =
-    raw.quantity !== undefined
-      ? parsePositiveInt(raw.quantity, 'Quantity sold')
-      : existingSale.quantity;
-  const unitSellingPricePkr =
-    raw.unitSellingPricePkr !== undefined || raw.unit_selling_price_pkr !== undefined
-      ? parseNonNegInt(
-          raw.unitSellingPricePkr ?? raw.unit_selling_price_pkr,
-          'Selling price per unit'
-        )
-      : existingSale.unit_selling_price_pkr;
-  const unitPurchasePricePkr =
-    raw.unitPurchasePricePkr !== undefined || raw.unit_purchase_price_pkr !== undefined
-      ? parseNonNegInt(
-          raw.unitPurchasePricePkr ?? raw.unit_purchase_price_pkr,
-          'Purchase cost per unit'
-        )
-      : existingSale.unit_purchase_price_pkr;
-
-  const { soldAt, saleDate } =
-    raw.soldAt !== undefined || raw.sold_at !== undefined
-      ? normalizeSoldAt(raw.soldAt ?? raw.sold_at)
-      : { soldAt: existingSale.sold_at, saleDate: existingSale.sale_date };
-  const notes =
-    raw.notes !== undefined
-      ? typeof raw.notes === 'string' && raw.notes.trim()
-        ? raw.notes.trim().slice(0, 250)
-        : null
-      : existingSale.notes;
-
-  const stockDelta = existingSale.quantity - newQuantity;
-  const nextStock = currentStock + stockDelta;
-  if (nextStock < 0) {
-    throw new ServiceError(
-      400,
-      `Insufficient remaining stock to increase quantity to ${newQuantity}. Max possible: ${
-        currentStock + existingSale.quantity
-      }.`
-    );
-  }
-
-  const totalSalePkr = unitSellingPricePkr * newQuantity;
-  const totalCostPkr = unitPurchasePricePkr * newQuantity;
-  const profitPkr = totalSalePkr - totalCostPkr;
-  const nowIso = new Date().toISOString();
-
-  let updatedSale!: DrinkSaleRecord;
-
-  await updateCollection('sales', (draft) => {
-    const s = draft.records.find((rec) => rec.id === saleId);
-    if (!s) {
+    const existingSale = salesDoc.records.find((s) => s.id === saleId);
+    if (!existingSale) {
       throw new ServiceError(404, 'Sale record not found.');
     }
-    s.quantity = newQuantity;
-    s.unit_selling_price_pkr = unitSellingPricePkr;
-    s.total_sale_pkr = totalSalePkr;
-    s.unit_purchase_price_pkr = unitPurchasePricePkr;
-    s.total_cost_pkr = totalCostPkr;
-    s.profit_pkr = profitPkr;
-    s.sold_at = soldAt;
-    s.sale_date = saleDate;
-    s.notes = notes;
-    s.updated_by = actorUsername;
-    s.updated_at = nowIso;
-    updatedSale = { ...s };
+    if (existingSale.status === 'CANCELLED') {
+      throw new ServiceError(400, 'Cancelled sales cannot be edited.');
+    }
 
-    draft.auditLogs.push({
-      id: draft.nextAuditLogId++,
-      sale_id: saleId,
-      action: 'EDITED',
-      summary: `Edited sale #${saleId}: qty ${existingSale.quantity}->${newQuantity}, total PKR ${existingSale.total_sale_pkr}->PKR ${totalSalePkr}.`,
-      actor_username: actorUsername,
-      created_at: nowIso,
-    });
-  });
+    const product = productsDoc.records.find((p) => p.id === existingSale.drink_id);
+    if (!product) {
+      throw new ServiceError(404, 'Associated product not found.');
+    }
 
-  if (stockDelta !== 0) {
-    await updateCollection('inventory', (draft) => {
-      const sl = draft.stockLevels.find((s) => s.drink_id === product.id);
-      if (sl) {
-        sl.current_stock = nextStock;
-        sl.is_available = nextStock > 0 ? 1 : 0;
-        sl.updated_by = actorUsername;
-        sl.updated_at = nowIso;
+    const newQuantity =
+      raw.quantity !== undefined
+        ? parsePositiveInt(raw.quantity, 'Quantity sold')
+        : existingSale.quantity;
+    const unitSellingPricePkr =
+      raw.unitSellingPricePkr !== undefined || raw.unit_selling_price_pkr !== undefined
+        ? parseNonNegInt(
+            raw.unitSellingPricePkr ?? raw.unit_selling_price_pkr,
+            'Selling price per unit'
+          )
+        : existingSale.unit_selling_price_pkr;
+    const unitPurchasePricePkr =
+      raw.unitPurchasePricePkr !== undefined || raw.unit_purchase_price_pkr !== undefined
+        ? parseNonNegInt(
+            raw.unitPurchasePricePkr ?? raw.unit_purchase_price_pkr,
+            'Purchase cost per unit'
+          )
+        : existingSale.unit_purchase_price_pkr;
+
+    const { soldAt, saleDate } =
+      raw.soldAt !== undefined || raw.sold_at !== undefined
+        ? normalizeSoldAt(raw.soldAt ?? raw.sold_at)
+        : { soldAt: existingSale.sold_at, saleDate: existingSale.sale_date };
+    const notes =
+      raw.notes !== undefined
+        ? typeof raw.notes === 'string' && raw.notes.trim()
+          ? raw.notes.trim().slice(0, 250)
+          : null
+        : existingSale.notes;
+
+    const stockDelta = existingSale.quantity - newQuantity;
+    const totalSalePkr = unitSellingPricePkr * newQuantity;
+    const totalCostPkr = unitPurchasePricePkr * newQuantity;
+    const profitPkr = totalSalePkr - totalCostPkr;
+    const nowIso = new Date().toISOString();
+
+    if (stockDelta !== 0) {
+      await updateCollection('inventory', (draft) => {
+        const sl = draft.stockLevels.find((s) => s.drink_id === product.id);
+        const currentStock = sl?.current_stock ?? 0;
+        const nextStock = currentStock + stockDelta;
+        if (nextStock < 0) {
+          throw new ServiceError(
+            400,
+            `Insufficient remaining stock to increase quantity to ${newQuantity}. Max possible: ${
+              currentStock + existingSale.quantity
+            }.`
+          );
+        }
+        if (sl) {
+          sl.current_stock = nextStock;
+          sl.is_available = nextStock > 0 ? 1 : 0;
+          sl.updated_by = actorUsername;
+          sl.updated_at = nowIso;
+        }
+        draft.adjustments.push({
+          id: draft.nextAdjustmentId++,
+          drink_id: product.id,
+          adjustment_type: 'SALE_EDIT',
+          delta_qty: stockDelta,
+          previous_stock: currentStock,
+          new_stock: nextStock,
+          reason: `Edited Sale #${saleId}: qty ${existingSale.quantity} -> ${newQuantity}`,
+          created_by: actorUsername,
+          created_at: nowIso,
+        });
+      });
+    }
+
+    let updatedSale!: DrinkSaleRecord;
+
+    await updateCollection('sales', (draft) => {
+      const s = draft.records.find((rec) => rec.id === saleId);
+      if (!s) {
+        throw new ServiceError(404, 'Sale record not found.');
       }
-      draft.adjustments.push({
-        id: draft.nextAdjustmentId++,
-        drink_id: product.id,
-        adjustment_type: 'SALE_EDIT',
-        delta_qty: stockDelta,
-        previous_stock: currentStock,
-        new_stock: nextStock,
-        reason: `Edited Sale #${saleId}: qty ${existingSale.quantity} -> ${newQuantity}`,
-        created_by: actorUsername,
+      s.quantity = newQuantity;
+      s.unit_selling_price_pkr = unitSellingPricePkr;
+      s.total_sale_pkr = totalSalePkr;
+      s.unit_purchase_price_pkr = unitPurchasePricePkr;
+      s.total_cost_pkr = totalCostPkr;
+      s.profit_pkr = profitPkr;
+      s.sold_at = soldAt;
+      s.sale_date = saleDate;
+      s.notes = notes;
+      s.updated_by = actorUsername;
+      s.updated_at = nowIso;
+      updatedSale = { ...s };
+
+      draft.auditLogs.push({
+        id: draft.nextAuditLogId++,
+        sale_id: saleId,
+        action: 'EDITED',
+        summary: `Edited sale #${saleId}: qty ${existingSale.quantity}->${newQuantity}, total PKR ${existingSale.total_sale_pkr}->PKR ${totalSalePkr}.`,
+        actor_username: actorUsername,
         created_at: nowIso,
       });
     });
-  }
 
-  return updatedSale;
+    return updatedSale;
+  });
 }
 
 export async function cancelDrinkSale(
@@ -965,71 +1001,67 @@ export async function cancelDrinkSale(
   reason: string | null,
   actorUsername = 'admin'
 ): Promise<DrinkSaleRow> {
-  const salesDoc = await readCollection('sales');
-  const existingSale = salesDoc.records.find((s) => s.id === saleId);
-  if (!existingSale) {
-    throw new ServiceError(404, 'Sale record not found.');
-  }
-  if (existingSale.status === 'CANCELLED') {
-    throw new ServiceError(400, 'This sale has already been cancelled.');
-  }
+  return withNamedLock('drinks:tx', async () => {
+    const cleanReason =
+      typeof reason === 'string' && reason.trim()
+        ? reason.trim().slice(0, 200)
+        : 'Sale cancelled by admin';
 
-  const cleanReason =
-    typeof reason === 'string' && reason.trim()
-      ? reason.trim().slice(0, 200)
-      : 'Sale cancelled by admin';
+    const nowIso = new Date().toISOString();
+    let cancelledSale!: DrinkSaleRecord;
 
-  const nowIso = new Date().toISOString();
-  let cancelledSale!: DrinkSaleRecord;
+    await updateCollection('sales', (draft) => {
+      const s = draft.records.find((rec) => rec.id === saleId);
+      if (!s) {
+        throw new ServiceError(404, 'Sale record not found.');
+      }
+      if (s.status === 'CANCELLED') {
+        throw new ServiceError(400, 'This sale has already been cancelled.');
+      }
+      s.status = 'CANCELLED';
+      s.cancelled_by = actorUsername;
+      s.cancel_reason = cleanReason;
+      s.cancelled_at = nowIso;
+      s.updated_by = actorUsername;
+      s.updated_at = nowIso;
+      cancelledSale = { ...s };
 
-  await updateCollection('sales', (draft) => {
-    const s = draft.records.find((rec) => rec.id === saleId);
-    if (!s) {
-      throw new ServiceError(404, 'Sale record not found.');
-    }
-    s.status = 'CANCELLED';
-    s.cancelled_by = actorUsername;
-    s.cancel_reason = cleanReason;
-    s.cancelled_at = nowIso;
-    s.updated_by = actorUsername;
-    s.updated_at = nowIso;
-    cancelledSale = { ...s };
-
-    draft.auditLogs.push({
-      id: draft.nextAuditLogId++,
-      sale_id: saleId,
-      action: 'CANCELLED',
-      summary: `Cancelled sale #${saleId} (${existingSale.quantity} x ${existingSale.product_name}) and restored stock. Reason: ${cleanReason}`,
-      actor_username: actorUsername,
-      created_at: nowIso,
-    });
-  });
-
-  await updateCollection('inventory', (draft) => {
-    const sl = draft.stockLevels.find((s) => s.drink_id === existingSale.drink_id);
-    if (sl) {
-      const restoredStock = sl.current_stock + existingSale.quantity;
-      const prevStock = sl.current_stock;
-      sl.current_stock = restoredStock;
-      sl.is_available = restoredStock > 0 ? 1 : 0;
-      sl.updated_by = actorUsername;
-      sl.updated_at = nowIso;
-
-      draft.adjustments.push({
-        id: draft.nextAdjustmentId++,
-        drink_id: existingSale.drink_id,
-        adjustment_type: 'SALE_CANCEL',
-        delta_qty: existingSale.quantity,
-        previous_stock: prevStock,
-        new_stock: restoredStock,
-        reason: `Cancelled Sale #${saleId}: ${cleanReason}`,
-        created_by: actorUsername,
+      draft.auditLogs.push({
+        id: draft.nextAuditLogId++,
+        sale_id: saleId,
+        action: 'CANCELLED',
+        summary: `Cancelled sale #${saleId} (${s.quantity} x ${s.product_name}) and restored stock. Reason: ${cleanReason}`,
+        actor_username: actorUsername,
         created_at: nowIso,
       });
-    }
-  });
+    });
 
-  return cancelledSale;
+    await updateCollection('inventory', (draft) => {
+      const sl = draft.stockLevels.find((s) => s.drink_id === cancelledSale.drink_id);
+      if (sl) {
+        const restoredStock = sl.current_stock + cancelledSale.quantity;
+        const prevStock = sl.current_stock;
+        sl.current_stock = restoredStock;
+        sl.is_available = restoredStock > 0 ? 1 : 0;
+        sl.updated_by = actorUsername;
+        sl.updated_at = nowIso;
+
+        draft.adjustments.push({
+          id: draft.nextAdjustmentId++,
+          drink_id: cancelledSale.drink_id,
+          adjustment_type: 'SALE_CANCEL',
+          delta_qty: cancelledSale.quantity,
+          previous_stock: prevStock,
+          new_stock: restoredStock,
+          reason: `Cancelled Sale #${saleId}: ${cleanReason}`,
+          created_by: actorUsername,
+          created_at: nowIso,
+        });
+      }
+    });
+
+    return cancelledSale;
+  });
 }
 
 export async function getDrinkExpenses(filters?: {

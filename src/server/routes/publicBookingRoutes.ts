@@ -9,7 +9,7 @@ import {
   ServiceError,
 } from '../services/bookingService.ts';
 import { StorageConfigurationError } from '../storage/drivers.ts';
-import { getStorageStatus, readCollection } from '../storage/jsonStore.ts';
+import { verifyStorageHealth } from '../storage/jsonStore.ts';
 import { getKarachiNow } from '../utils/time.ts';
 
 export const publicBookingRouter = Router();
@@ -26,29 +26,24 @@ publicBookingRouter.get('/', (_req, res) => {
 });
 
 publicBookingRouter.get('/health', async (_req, res) => {
-  const storage = getStorageStatus();
-  const configured = storage.persistent || storage.mode === 'local_json';
-  let accessible = false;
+  const storageHealth = await verifyStorageHealth({ force: true });
 
-  if (configured) {
-    try {
-      const settings = await readCollection('settings');
-      accessible = Array.isArray(settings.operatingHours);
-    } catch {
-      accessible = false;
-    }
-  }
-
-  res.json({
-    ok: true,
+  res.status(storageHealth.verified ? 200 : 503).json({
+    ok: storageHealth.verified,
     karachiNow: getKarachiNow(),
     courtNumber: COURT_NUMBER,
     venue: VENUE_NAME,
     storage: {
-      mode: storage.mode,
-      persistent: storage.persistent,
-      configured,
-      accessible,
+      mode: storageHealth.mode,
+      persistent: storageHealth.persistent,
+      configured: storageHealth.configured,
+      readable: storageHealth.readable,
+      writable: storageHealth.writable,
+      accessible: storageHealth.accessible,
+      verified: storageHealth.verified,
+      accessMode: storageHealth.accessMode,
+      checkedAt: storageHealth.checkedAt,
+      ...(storageHealth.error ? { error: storageHealth.error } : {}),
     },
   });
 });

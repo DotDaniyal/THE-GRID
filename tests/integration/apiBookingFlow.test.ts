@@ -49,7 +49,7 @@ function extractCookiePair(setCookieHeader: string | null): string {
   return firstSegment;
 }
 
-test('GET /api/health reports single-court THE GRID configuration', async () => {
+test('GET /api/health reports single-court THE GRID configuration and verified local read/write storage', async () => {
   const res = await fetch(`${baseUrl}/api/health`);
   assert.equal(res.status, 200);
   const body = (await res.json()) as {
@@ -60,14 +60,32 @@ test('GET /api/health reports single-court THE GRID configuration', async () => 
       mode: string;
       persistent: boolean;
       configured: boolean;
+      readable: boolean;
+      writable: boolean;
       accessible: boolean;
+      verified: boolean;
+      accessMode: string;
     };
   };
   assert.equal(body.ok, true);
   assert.equal(body.courtNumber, 1);
   assert.equal(body.venue, 'THE GRID - Main Futsal Court');
+  assert.equal(body.storage.mode, 'local_json');
   assert.equal(body.storage.configured, true);
+  assert.equal(body.storage.readable, true);
+  assert.equal(body.storage.writable, true);
   assert.equal(body.storage.accessible, true);
+  assert.equal(body.storage.verified, true);
+  assert.equal(body.storage.accessMode, 'local');
+
+  const authStatusRes = await fetch(`${baseUrl}/api/admin/auth-status`);
+  assert.equal(authStatusRes.status, 200);
+  const authStatus = (await authStatusRes.json()) as {
+    storageConfigured: boolean;
+    storageMessage: string | null;
+  };
+  assert.equal(authStatus.storageConfigured, true);
+  assert.equal(authStatus.storageMessage, null);
 });
 
 test('GET /api/slots validates dates and returns configured active single-court slots', async () => {
@@ -744,14 +762,31 @@ test('Vercel Blob multi-container JSON persistence, ETag concurrency protection,
     });
   };
 
-  // Spin up an in-memory HTTP emulator implementing Vercel Blob REST GET/PUT + x-if-match ETag CAS
-  const blobs = new Map<string, { body: string; etag: string; contentType: string }>();
+  // Spin up an in-memory HTTP emulator implementing Private Vercel Blob REST GET/PUT + x-if-match ETag CAS
+  const blobs = new Map<string, { body: string; etag: string; contentType: string; access: string }>();
+  const putAccessHeaders: string[] = [];
   let etagSeq = 1;
 
   const blobServer = http.createServer((req, res) => {
     const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
 
     if (req.method === 'PUT') {
+      const accessHeader = String(req.headers['x-vercel-blob-access'] || '');
+      putAccessHeaders.push(accessHeader);
+      if (accessHeader !== 'private') {
+        res.statusCode = 403;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            error: {
+              code: 'forbidden',
+              message: 'Cannot use public access on a private store.',
+            },
+          })
+        );
+        return;
+      }
+
       const chunks: Buffer[] = [];
       req.on('data', (c) => chunks.push(Buffer.from(c)));
       req.on('end', () => {
@@ -776,7 +811,7 @@ test('Vercel Blob multi-container JSON persistence, ETag concurrency protection,
         const bodyStr = Buffer.concat(chunks).toString('utf8');
         const nextEtag = `"etag-${etagSeq++}"`;
         const contentType = String(req.headers['content-type'] || 'application/json');
-        blobs.set(pathname, { body: bodyStr, etag: nextEtag, contentType });
+        blobs.set(pathname, { body: bodyStr, etag: nextEtag, contentType, access: accessHeader });
 
         const origin = `http://${req.headers.host}`;
         res.statusCode = 200;
@@ -864,11 +899,22 @@ test('Vercel Blob multi-container JSON persistence, ETag concurrency protection,
       await new Promise((r) => srv.once('listening', r));
       const url = 'http://127.0.0.1:' + srv.address().port;
 
-      // Health confirms Vercel Blob driver is active and persistent
+      // Health confirms Private Vercel Blob driver passes real read/write verification
       const healthRes = await fetch(url + '/api/health');
       const health = await healthRes.json();
       assert.equal(health.storage.mode, 'vercel_blob');
       assert.equal(health.storage.persistent, true);
+      assert.equal(health.storage.configured, true);
+      assert.equal(health.storage.readable, true);
+      assert.equal(health.storage.writable, true);
+      assert.equal(health.storage.accessible, true);
+      assert.equal(health.storage.verified, true);
+      assert.equal(health.storage.accessMode, 'private');
+
+      // Admin auth-status warning clears only after verified read/write check
+      const authStatus = await (await fetch(url + '/api/admin/auth-status')).json();
+      assert.equal(authStatus.storageConfigured, true);
+      assert.equal(authStatus.storageMessage, null);
 
       // Login on Container A
       const loginRes = await fetch(url + '/api/admin/login', {
@@ -983,7 +1029,10 @@ test('Vercel Blob multi-container JSON persistence, ETag concurrency protection,
 
     await runScriptAsync(containerBScript);
 
-    // Verify private JSON files exist in Blob storage
+    // Verify every PUT used private access and all private JSON files exist in Blob storage
+    assert.ok(putAccessHeaders.length > 0);
+    assert.ok(putAccessHeaders.every((hdr) => hdr === 'private'));
+    assert.ok(blobs.has('thegrid/system/health-probe.json'));
     assert.ok(blobs.has('thegrid/data/bookings.json'));
     assert.ok(blobs.has('thegrid/data/customers.json'));
     assert.ok(blobs.has('thegrid/data/products.json'));
@@ -1308,3 +1357,239 @@ test('Booking customerNotes, REJECTED release + history preservation, and admin 
     )
   );
 });
+
+test('Vercel Blob rejects public-store mismatch without downgrading access, never leaks tokens, and resolves custom-prefixed tokens', async () => {
+  const { spawn } = await import('node:child_process');
+
+  const runScriptAsync = (script: string): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        ['--import', 'tsx', '--input-type=module', '-e', script],
+        { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d.toString()));
+      child.stderr.on('data', (d) => (stderr += d.toString()));
+      child.on('close', (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`Child process failed (code ${code}):\n${stderr}\n${stdout}`));
+      });
+    });
+  };
+
+  // Emulator rejecting private access as a public store would
+  let mode: 'public_store_error' | 'private_ok' = 'public_store_error';
+  const blobs = new Map<string, { body: string; etag: string }>();
+  let seq = 1;
+
+  const blobServer = http.createServer((req, res) => {
+    const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
+    if (req.method === 'PUT') {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(Buffer.from(c)));
+      req.on('end', () => {
+        if (mode === 'public_store_error') {
+          res.statusCode = 400;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              error: {
+                code: 'bad_request',
+                message: 'Vercel Blob: Cannot use private access on a public store.',
+              },
+            })
+          );
+          return;
+        }
+        if (req.headers['x-vercel-blob-access'] !== 'private') {
+          res.statusCode = 403;
+          res.end('private required');
+          return;
+        }
+        const pathname = reqUrl.searchParams.get('pathname') || reqUrl.pathname.replace(/^\/+/, '');
+        const etag = `"e-${seq++}"`;
+        blobs.set(pathname, { body: Buffer.concat(chunks).toString('utf8'), etag });
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            url: `http://${req.headers.host}/${pathname}`,
+            downloadUrl: `http://${req.headers.host}/${pathname}?download=1`,
+            pathname,
+            contentType: 'application/json',
+            contentDisposition: 'inline',
+            etag,
+          })
+        );
+      });
+      return;
+    }
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      const pathname = reqUrl.pathname.replace(/^\/+/, '');
+      const item = blobs.get(pathname);
+      if (!item) {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ error: { code: 'not_found', message: 'Not found' } }));
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('ETag', item.etag);
+      res.end(req.method === 'HEAD' ? undefined : item.body);
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => blobServer.listen(0, '127.0.0.1', resolve));
+  const blobApiUrl = `http://127.0.0.1:${(blobServer.address() as { port: number }).port}`;
+  const secretToken = 'vercel_blob_rw_privstore9999_supersecretvalue';
+
+  try {
+    // 1. Public store rejecting private access must keep warning visible and never leak token
+    const errScript = `
+      import assert from 'node:assert/strict';
+      process.env.VERCEL = '1';
+      delete process.env.BLOB_READ_WRITE_TOKEN;
+      process.env.THEGRID_READ_WRITE_TOKEN = ${JSON.stringify(`"${secretToken}"`)};
+      process.env.VERCEL_BLOB_API_URL = ${JSON.stringify(blobApiUrl)};
+      delete process.env.JSON_DATA_DIR;
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+
+      const healthRes = await fetch(url + '/api/health');
+      assert.equal(healthRes.status, 503);
+      const health = await healthRes.json();
+      assert.equal(health.storage.mode, 'vercel_blob');
+      assert.equal(health.storage.writable, false);
+      assert.equal(health.storage.verified, false);
+      assert.equal(health.storage.accessMode, 'private');
+      assert.ok(health.storage.error);
+      assert.equal(JSON.stringify(health).includes('supersecretvalue'), false);
+      assert.equal(JSON.stringify(health).includes('vercel_blob_rw_'), false);
+
+      const authStatus = await (await fetch(url + '/api/admin/auth-status')).json();
+      assert.equal(authStatus.storageConfigured, false);
+      assert.ok(authStatus.storageMessage);
+      assert.equal(authStatus.storageMessage.includes('supersecretvalue'), false);
+      srv.closeAllConnections?.();
+      srv.close();
+    `;
+    await runScriptAsync(errScript);
+
+    // 2. Switching to valid Private store with custom-prefixed quoted token verifies read/write
+    mode = 'private_ok';
+    const okScript = `
+      import assert from 'node:assert/strict';
+      process.env.VERCEL = '1';
+      delete process.env.BLOB_READ_WRITE_TOKEN;
+      process.env.THEGRID_READ_WRITE_TOKEN = ${JSON.stringify(`"${secretToken}"`)};
+      process.env.VERCEL_BLOB_API_URL = ${JSON.stringify(blobApiUrl)};
+      delete process.env.JSON_DATA_DIR;
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+
+      const healthRes = await fetch(url + '/api/health');
+      assert.equal(healthRes.status, 200);
+      const health = await healthRes.json();
+      assert.equal(health.storage.verified, true);
+      assert.equal(health.storage.readable, true);
+      assert.equal(health.storage.writable, true);
+      assert.equal(health.storage.accessMode, 'private');
+
+      const authStatus = await (await fetch(url + '/api/admin/auth-status')).json();
+      assert.equal(authStatus.storageConfigured, true);
+      assert.equal(authStatus.storageMessage, null);
+      srv.closeAllConnections?.();
+      srv.close();
+    `;
+    await runScriptAsync(okScript);
+  } finally {
+    await new Promise<void>((resolve) => {
+      blobServer.closeAllConnections?.();
+      blobServer.close(() => resolve());
+    });
+  }
+});
+
+test('Concurrent drink sales cannot oversell remaining stock', async () => {
+  const loginRes = await fetch(`${baseUrl}/api/admin/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-Forwarded-For': '203.0.113.88',
+    },
+    body: JSON.stringify({
+      username: 'leadadmin@thegrid.pk',
+      password: 'RoversGrid2026!Strong',
+    }),
+  });
+  assert.equal(loginRes.status, 200);
+  const cookie = extractCookiePair(loginRes.headers.get('set-cookie'));
+
+  const createDrinkRes = await fetch(`${baseUrl}/api/admin/drinks`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookie,
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    body: JSON.stringify({
+      name: 'Electrolyte Race Drink',
+      category: 'hydration_drinks',
+      pricePkr: 250,
+      purchasePricePkr: 150,
+      openingStock: 1,
+    }),
+  });
+  assert.equal(createDrinkRes.status, 201);
+  const created = (await createDrinkRes.json()) as { drink: { id: number } };
+
+  const [saleA, saleB] = await Promise.all([
+    fetch(`${baseUrl}/api/admin/drinks/sales`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie,
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ drinkId: created.drink.id, quantity: 1 }),
+    }),
+    fetch(`${baseUrl}/api/admin/drinks/sales`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie,
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ drinkId: created.drink.id, quantity: 1 }),
+    }),
+  ]);
+
+  const statuses = [saleA.status, saleB.status].sort((a, b) => a - b);
+  assert.deepEqual(statuses, [201, 400]);
+
+  const drinksRes = await fetch(`${baseUrl}/api/admin/drinks`, {
+    headers: { Cookie: cookie },
+  });
+  const drinksJson = (await drinksRes.json()) as {
+    drinks: Array<{ id: number; current_stock: number }>;
+  };
+  assert.equal(
+    drinksJson.drinks.find((d) => d.id === created.drink.id)?.current_stock,
+    0
+  );
+});
+

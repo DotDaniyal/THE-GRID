@@ -1,7 +1,12 @@
 import crypto from 'node:crypto';
 import argon2 from 'argon2';
 import type { NextFunction, Request, Response } from 'express';
-import { getStorageStatus, readCollection, updateCollection } from '../storage/jsonStore.ts';
+import {
+  readCollection,
+  updateCollection,
+  verifyStorageHealth,
+} from '../storage/jsonStore.ts';
+import { sanitizeStorageError, StorageConfigurationError } from '../storage/drivers.ts';
 import type {
   AdminAuditAction,
   AdminSettingsCollection,
@@ -248,29 +253,32 @@ export async function getAdminAuthOverview(): Promise<{
   storageConfigured: boolean;
   storageMessage: string | null;
 }> {
-  const storage = getStorageStatus();
-  if (!storage.persistent) {
+  const health = await verifyStorageHealth();
+  const hasEnvPasscode = Boolean(getEnvAdminPasscode());
+
+  if (!health.verified) {
     return {
       setupRequired: false,
-      authMode: getEnvAdminPasscode() ? 'legacy_passcode_fallback' : 'setup_required',
+      authMode: hasEnvPasscode ? 'legacy_passcode_fallback' : 'setup_required',
       hasNamedAccounts: false,
       storageConfigured: false,
-      storageMessage:
-        'Persistent external JSON storage is not configured for Vercel production. Connect Vercel Blob (BLOB_READ_WRITE_TOKEN) or Upstash Redis in Vercel Environment Variables.',
+      storageMessage: health.error || new StorageConfigurationError().message,
     };
   }
 
   let hasNamedAccounts = false;
-  let storageMessage: string | null = null;
   try {
     const adminSettings = await readCollection('admin-settings');
     hasNamedAccounts = adminSettings.users.some((u) => u.is_active === 1);
   } catch (err) {
-    storageMessage =
-      err instanceof Error ? err.message : 'Unable to read administrator store.';
+    return {
+      setupRequired: false,
+      authMode: hasEnvPasscode ? 'legacy_passcode_fallback' : 'setup_required',
+      hasNamedAccounts: false,
+      storageConfigured: false,
+      storageMessage: sanitizeStorageError(err),
+    };
   }
-
-  const hasEnvPasscode = Boolean(getEnvAdminPasscode());
 
   if (hasNamedAccounts) {
     return {
@@ -278,7 +286,7 @@ export async function getAdminAuthOverview(): Promise<{
       authMode: 'named_accounts',
       hasNamedAccounts: true,
       storageConfigured: true,
-      storageMessage,
+      storageMessage: null,
     };
   }
 
@@ -288,7 +296,7 @@ export async function getAdminAuthOverview(): Promise<{
       authMode: 'legacy_passcode_fallback',
       hasNamedAccounts: false,
       storageConfigured: true,
-      storageMessage,
+      storageMessage: null,
     };
   }
 
@@ -297,7 +305,7 @@ export async function getAdminAuthOverview(): Promise<{
     authMode: 'setup_required',
     hasNamedAccounts: false,
     storageConfigured: true,
-    storageMessage,
+    storageMessage: null,
   };
 }
 

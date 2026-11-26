@@ -8,6 +8,8 @@ import {
 import {
   createConfiguredStorageDriver,
   resolveLocalDataDir,
+  sanitizeStorageError,
+  StorageConfigurationError,
   VersionConflictError,
   type JsonStorageDriver,
   type StorageDriverMode,
@@ -21,8 +23,24 @@ import {
 
 const MAX_CAS_ATTEMPTS = 8;
 
+const HEALTH_CACHE_TTL_MS = 30_000;
+
+export interface StorageHealthReport {
+  mode: StorageDriverMode;
+  persistent: boolean;
+  configured: boolean;
+  readable: boolean;
+  writable: boolean;
+  accessible: boolean;
+  verified: boolean;
+  accessMode: 'local' | 'private' | 'redis' | 'unconfigured';
+  checkedAt: string;
+  error: string | null;
+}
+
 let activeDriver: JsonStorageDriver | null = null;
 let initPromise: Promise<void> | null = null;
+let lastVerifiedHealth: { report: StorageHealthReport; expiresAt: number } | null = null;
 const collectionQueues = new Map<string, Promise<unknown>>();
 
 function getDriver(): JsonStorageDriver {
@@ -35,6 +53,7 @@ function getDriver(): JsonStorageDriver {
 export function resetJsonStoreForTests(): void {
   activeDriver = null;
   initPromise = null;
+  lastVerifiedHealth = null;
   collectionQueues.clear();
 }
 
@@ -49,6 +68,77 @@ export function getStorageStatus(): {
     persistent: driver.persistent,
     localDataDir: driver.mode === 'local_json' ? resolveLocalDataDir() : null,
   };
+}
+
+export async function verifyStorageHealth(options?: {
+  force?: boolean;
+}): Promise<StorageHealthReport> {
+  if (!options?.force && lastVerifiedHealth && Date.now() < lastVerifiedHealth.expiresAt) {
+    return lastVerifiedHealth.report;
+  }
+
+  const driver = getDriver();
+  const checkedAt = new Date().toISOString();
+  const configured = driver.persistent || driver.mode === 'local_json';
+
+  if (driver.mode === 'unconfigured_vercel' || !configured) {
+    lastVerifiedHealth = null;
+    return {
+      mode: driver.mode,
+      persistent: false,
+      configured: false,
+      readable: false,
+      writable: false,
+      accessible: false,
+      verified: false,
+      accessMode: 'unconfigured',
+      checkedAt,
+      error: new StorageConfigurationError().message,
+    };
+  }
+
+  try {
+    await ensureStoreInitialized();
+    const verification = await driver.verifyReadWrite();
+    const verified = verification.readable && verification.writable;
+    const report: StorageHealthReport = {
+      mode: driver.mode,
+      persistent: driver.persistent,
+      configured: true,
+      readable: verification.readable,
+      writable: verification.writable,
+      accessible: verified,
+      verified,
+      accessMode: verification.accessMode,
+      checkedAt,
+      error: verification.error,
+    };
+
+    if (verified) {
+      lastVerifiedHealth = {
+        report,
+        expiresAt: Date.now() + HEALTH_CACHE_TTL_MS,
+      };
+    } else {
+      lastVerifiedHealth = null;
+    }
+
+    return report;
+  } catch (err) {
+    lastVerifiedHealth = null;
+    return {
+      mode: driver.mode,
+      persistent: driver.persistent,
+      configured: false,
+      readable: false,
+      writable: false,
+      accessible: false,
+      verified: false,
+      accessMode: driver.mode === 'vercel_blob' ? 'private' : driver.mode === 'upstash_redis' ? 'redis' : 'local',
+      checkedAt,
+      error: sanitizeStorageError(err),
+    };
+  }
 }
 
 function runSerialized<T>(queueKey: string, task: () => Promise<T>): Promise<T> {
@@ -200,6 +290,7 @@ export async function updateCollection<K extends CollectionName, R = void>(
           await new Promise((resolve) => setTimeout(resolve, jitterMs));
           continue;
         }
+        lastVerifiedHealth = null;
         throw err;
       }
     }
@@ -210,13 +301,11 @@ export async function updateCollection<K extends CollectionName, R = void>(
   });
 }
 
-export async function withSlotLock<T>(
-  bookingDate: string,
-  startTime: string,
+export async function withNamedLock<T>(
+  lockKey: string,
   fn: () => Promise<T>
 ): Promise<T> {
-  const slotKey = `slot:${bookingDate}:${startTime}`;
-  return runSerialized(slotKey, async () => {
+  return runSerialized(lockKey, async () => {
     const driver = getDriver();
     if (!driver.acquireSlotLock || !driver.releaseSlotLock) {
       return fn();
@@ -224,19 +313,27 @@ export async function withSlotLock<T>(
 
     let lockToken: string | null = null;
     for (let attempt = 0; attempt < 10; attempt++) {
-      lockToken = await driver.acquireSlotLock(slotKey, 8000);
+      lockToken = await driver.acquireSlotLock(lockKey, 8000);
       if (lockToken) break;
       await new Promise((resolve) => setTimeout(resolve, 40 + attempt * 20));
     }
 
     if (!lockToken) {
-      throw new VersionConflictError('High concurrency on this slot. Please try again.');
+      throw new VersionConflictError('High concurrency on this operation. Please try again.');
     }
 
     try {
       return await fn();
     } finally {
-      await driver.releaseSlotLock(slotKey, lockToken).catch(() => undefined);
+      await driver.releaseSlotLock(lockKey, lockToken).catch(() => undefined);
     }
   });
+}
+
+export async function withSlotLock<T>(
+  bookingDate: string,
+  startTime: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  return withNamedLock(`slot:${bookingDate}:${startTime}`, fn);
 }
