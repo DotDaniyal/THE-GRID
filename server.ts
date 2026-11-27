@@ -9,26 +9,24 @@ import { releaseExpiredPendingBookings } from './src/server/services/bookingServ
 import { ensureStoreInitialized } from './src/server/storage/jsonStore.ts';
 
 async function startServer() {
-  await ensureStoreInitialized();
   const app = createApiApp();
 
-  // Proactively release expired 30-minute pending holds every 30 seconds
-  await releaseExpiredPendingBookings().catch((err) => {
-    console.error('Initial pending hold sweep error:', err);
-  });
-  const holdSweepTimer = setInterval(() => {
-    void releaseExpiredPendingBookings().catch((err) => {
-      console.error('Pending hold sweep error:', err);
-    });
-  }, 30_000);
-  holdSweepTimer.unref?.();
-
   if (!IS_PRODUCTION) {
-    const vite = await createViteServer({
+    const vitePromise = createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
-    app.use(vite.middlewares);
+    vitePromise.catch((err) => {
+      console.error('Fatal Vite server initialization error:', err);
+      process.exit(1);
+    });
+    app.use((req, res, next) => {
+      vitePromise
+        .then((vite) => {
+          vite.middlewares(req, res, next);
+        })
+        .catch(next);
+    });
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
@@ -42,8 +40,25 @@ async function startServer() {
     });
   }
 
+  const holdSweepTimer = setInterval(() => {
+    void releaseExpiredPendingBookings().catch((err) => {
+      console.error('Pending hold sweep error:', err);
+    });
+  }, 30_000);
+  holdSweepTimer.unref?.();
+
   app.listen(SERVER_PORT, '0.0.0.0', () => {
     console.log(`THE GRID server listening on http://0.0.0.0:${SERVER_PORT}`);
+
+    // Warm storage and sweep expired holds in the background so port 3000 binds immediately.
+    void ensureStoreInitialized()
+      .then(() => releaseExpiredPendingBookings())
+      .catch((err) => {
+        console.error(
+          '[startup] Storage initialization deferred; server running in diagnostic mode:',
+          err instanceof Error ? err.message : err
+        );
+      });
   });
 }
 

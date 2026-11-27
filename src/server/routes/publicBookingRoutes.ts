@@ -8,7 +8,7 @@ import {
   getSlotsForDate,
   ServiceError,
 } from '../services/bookingService.ts';
-import { StorageConfigurationError } from '../storage/drivers.ts';
+import { isVercelRuntime, StorageConfigurationError } from '../storage/drivers.ts';
 import { verifyStorageHealth } from '../storage/jsonStore.ts';
 import { getKarachiNow } from '../utils/time.ts';
 
@@ -35,6 +35,7 @@ publicBookingRouter.get('/health', async (_req, res) => {
     venue: VENUE_NAME,
     storage: {
       mode: storageHealth.mode,
+      backend: storageHealth.backend,
       persistent: storageHealth.persistent,
       configured: storageHealth.configured,
       readable: storageHealth.readable,
@@ -43,6 +44,7 @@ publicBookingRouter.get('/health', async (_req, res) => {
       verified: storageHealth.verified,
       accessMode: storageHealth.accessMode,
       checkedAt: storageHealth.checkedAt,
+      envDetection: storageHealth.envDetection,
       ...(storageHealth.error ? { error: storageHealth.error } : {}),
     },
   });
@@ -71,7 +73,7 @@ publicBookingRouter.get('/slots/stream', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
-  if (process.env.VERCEL === '1') {
+  if (isVercelRuntime()) {
     res.write('retry: 15000\n');
   }
 
@@ -94,7 +96,7 @@ publicBookingRouter.get('/slots/stream', (req, res) => {
   heartbeat.unref?.();
 
   let vercelCloseTimer: ReturnType<typeof setTimeout> | null = null;
-  if (process.env.VERCEL === '1') {
+  if (isVercelRuntime()) {
     vercelCloseTimer = setTimeout(() => {
       clearInterval(heartbeat);
       unsubscribe();

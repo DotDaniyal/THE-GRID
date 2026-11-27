@@ -216,7 +216,7 @@ export function AdminLoginCard({
             </div>
             <p>
               {storageMessage ||
-                'Persistent external JSON storage is not verified for Vercel production. Connect a Private Vercel Blob Store (BLOB_READ_WRITE_TOKEN) in Vercel Environment Variables and redeploy.'}
+                'Persistent external JSON storage is not verified for Vercel production. Connect a Private Vercel Blob Store (BLOB_READ_WRITE_TOKEN) or Upstash Redis (UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN, KV_REST_API_URL, or Upstash REDIS_URL) in Vercel Production Environment Variables and redeploy.'}
             </p>
           </div>
         )}

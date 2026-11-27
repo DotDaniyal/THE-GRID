@@ -12,6 +12,10 @@ import {
   XCircle,
 } from 'lucide-react';
 import type { AdminBookingRow, BookingStatus, SharedParticipant } from '@/src/types/booking';
+import {
+  readStoredAdminBookingFilter,
+  writeStoredAdminBookingFilter,
+} from '@/src/utils/clientStorage';
 
 interface AdminBookingsListProps {
   bookings: AdminBookingRow[];
@@ -82,7 +86,9 @@ export function AdminBookingsList({
   updatingId,
   onUpdateStatus,
 }: AdminBookingsListProps) {
-  const [statusFilter, setStatusFilter] = useState<'ALL' | BookingStatus>('ALL');
+  const [statusFilter, setStatusFilter] = useState<'ALL' | BookingStatus>(() =>
+    readStoredAdminBookingFilter()
+  );
   const [dateFilter, setDateFilter] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedBookingId, setSelectedBookingId] = useState<string | null>(null);
@@ -135,7 +141,10 @@ export function AdminBookingsList({
             <button
               key={st}
               type="button"
-              onClick={() => setStatusFilter(st)}
+              onClick={() => {
+                setStatusFilter(st);
+                writeStoredAdminBookingFilter(st);
+              }}
               className={`px-3.5 py-2 min-h-[38px] text-xs font-semibold rounded-md border cursor-pointer ${
                 statusFilter === st
                   ? 'bg-[#c4d835] text-[#0E1845] border-[#c4d835]'

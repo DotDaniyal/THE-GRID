@@ -62,7 +62,8 @@ export type AdminAuditAction =
   | 'BOOKING_CANCELLED'
   | 'BOOKING_PENDING_RESTORED'
   | 'BOOKING_EXPIRED'
-  | 'OPERATING_HOURS_UPDATED';
+  | 'OPERATING_HOURS_UPDATED'
+  | 'STORAGE_BACKUP_EXPORTED';
 
 export interface AdminAuditLogRecord {
   id: string;

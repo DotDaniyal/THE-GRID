@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import { Component, type ErrorInfo, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   parseRoute,
   syncDocumentRouteMeta,
@@ -6,25 +6,51 @@ import {
 } from '@/src/app/routes';
 import { Navbar } from '@/src/components/layout/Navbar';
 import { useBookingSelection } from '@/src/hooks/useBookingSelection';
+import { AdminPage } from '@/src/pages/AdminPage';
+import { BookingDetailsPage } from '@/src/pages/BookingDetailsPage';
+import { BookingSlotPage } from '@/src/pages/BookingSlotPage';
 import { HomePage } from '@/src/pages/HomePage';
 import { getKarachiTodayStr } from '@/src/utils/date';
 
-const BookingSlotPage = lazy(() =>
-  import('@/src/pages/BookingSlotPage').then((m) => ({ default: m.BookingSlotPage }))
-);
-const BookingDetailsPage = lazy(() =>
-  import('@/src/pages/BookingDetailsPage').then((m) => ({ default: m.BookingDetailsPage }))
-);
-const AdminPage = lazy(() =>
-  import('@/src/pages/AdminPage').then((m) => ({ default: m.AdminPage }))
-);
+interface ErrorBoundaryState {
+  hasError: boolean;
+}
 
-function RouteLoadingShell() {
-  return (
-    <div className="min-h-screen pt-28 bg-[#0C153B] flex items-center justify-center text-sm text-slate-300">
-      Loading...
-    </div>
-  );
+class RouteErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false };
+
+  static getDerivedStateFromError(): ErrorBoundaryState {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('Route render error:', error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen pt-28 pb-20 bg-[#0C153B] flex items-center justify-center px-4">
+          <div className="max-w-md w-full rounded-xl border border-white/15 bg-[#121D52] p-6 text-center space-y-4">
+            <h1 className="font-display text-2xl font-bold uppercase text-white">
+              Unable to Open Page
+            </h1>
+            <p className="text-xs text-slate-300">
+              A temporary loading error occurred. Reload the page to continue.
+            </p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="px-5 py-2.5 text-xs font-bold uppercase tracking-wide text-[#0E1845] bg-[#c4d835] hover:bg-[#d4e157] rounded-md cursor-pointer"
+            >
+              Reload Page
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 export default function App() {
@@ -76,45 +102,41 @@ export default function App() {
     <div className="min-h-screen bg-[#070A14] text-[#F4F6FA] overflow-x-clip">
       <Navbar currentPath={currentPath} onNavigate={navigate} onBookNow={handleBookNow} />
 
-      {currentPath === '/' && (
-        <HomePage
-          onBookNow={handleBookNow}
-          onNavigateAdmin={() => navigate('/admin')}
-        />
-      )}
+      <RouteErrorBoundary>
+        {currentPath === '/' && (
+          <HomePage
+            onBookNow={handleBookNow}
+            onNavigateAdmin={() => navigate('/admin')}
+          />
+        )}
 
-      {currentPath === '/booking' && (
-        <main>
-          <Suspense fallback={<RouteLoadingShell />}>
+        {currentPath === '/booking' && (
+          <main>
             <BookingSlotPage
               karachiToday={karachiToday}
               selection={bookingSelection}
               onSelectionChange={updateBookingSelection}
               onContinueToDetails={() => navigate('/booking/details')}
             />
-          </Suspense>
-        </main>
-      )}
+          </main>
+        )}
 
-      {currentPath === '/booking/details' && (
-        <main>
-          <Suspense fallback={<RouteLoadingShell />}>
+        {currentPath === '/booking/details' && (
+          <main>
             <BookingDetailsPage
               selection={bookingSelection}
               onBackToSlots={() => navigate('/booking')}
               onBookingSubmitted={() => updateBookingSelection(null)}
             />
-          </Suspense>
-        </main>
-      )}
+          </main>
+        )}
 
-      {currentPath === '/admin' && (
-        <main>
-          <Suspense fallback={<RouteLoadingShell />}>
+        {currentPath === '/admin' && (
+          <main>
             <AdminPage />
-          </Suspense>
-        </main>
-      )}
+          </main>
+        )}
+      </RouteErrorBoundary>
     </div>
   );
 }

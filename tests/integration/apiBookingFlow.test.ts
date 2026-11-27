@@ -1593,3 +1593,723 @@ test('Concurrent drink sales cannot oversell remaining stock', async () => {
   );
 });
 
+test('Admin storage status & backup export return sanitized JSON and reject unauthenticated requests', async () => {
+  assert.equal((await fetch(`${baseUrl}/api/admin/storage/status`)).status, 401);
+  assert.equal((await fetch(`${baseUrl}/api/admin/storage/backup`)).status, 401);
+
+  const loginRes = await fetch(`${baseUrl}/api/admin/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-Forwarded-For': '203.0.113.105',
+    },
+    body: JSON.stringify({
+      username: 'leadadmin@thegrid.pk',
+      password: 'RoversGrid2026!Strong',
+    }),
+  });
+  assert.equal(loginRes.status, 200);
+  const cookie = extractCookiePair(loginRes.headers.get('set-cookie'));
+
+  const statusRes = await fetch(`${baseUrl}/api/admin/storage/status`, {
+    headers: { Cookie: cookie },
+  });
+  assert.equal(statusRes.status, 200);
+  const statusJson = (await statusRes.json()) as {
+    health: { mode: string; verified: boolean };
+    counts: { bookings: number; products: number };
+  };
+  assert.equal(statusJson.health.mode, 'local_json');
+  assert.equal(statusJson.health.verified, true);
+  assert.ok(statusJson.counts.bookings >= 1);
+
+  const backupRes = await fetch(`${baseUrl}/api/admin/storage/backup`, {
+    headers: { Cookie: cookie },
+  });
+  assert.equal(backupRes.status, 200);
+  const backupText = await backupRes.text();
+  const backupJson = JSON.parse(backupText) as {
+    storageMode: string;
+    collections: {
+      bookings: { records: Array<Record<string, unknown>> };
+      adminSettings: {
+        users: Array<Record<string, unknown>>;
+        sessions?: unknown;
+        appMeta: Record<string, unknown>;
+      };
+    };
+  };
+  assert.equal(backupJson.storageMode, 'local_json');
+  assert.ok(backupJson.collections.bookings.records.length >= 1);
+  assert.equal('status_token' in backupJson.collections.bookings.records[0], false);
+  assert.ok(backupJson.collections.adminSettings.users.length >= 1);
+  assert.equal('password_hash' in backupJson.collections.adminSettings.users[0], false);
+  assert.equal('mfa_secret' in backupJson.collections.adminSettings.users[0], false);
+  assert.equal('sessions' in backupJson.collections.adminSettings, false);
+  assert.equal('session_secret' in backupJson.collections.adminSettings.appMeta, false);
+});
+
+test('Custom-prefixed Upstash KV env vars, Upstash REDIS_URL parsing, and ADMIN_USERNAME + ADMIN_PASSWORD work in Vercel production mode', async () => {
+  const { parseUpstashRedisConnectionUrl } = await import('../../src/server/storage/drivers.ts');
+  const parsed = parseUpstashRedisConnectionUrl(
+    'rediss://default:upstashSecretToken123@grid-redis-4412.upstash.io:6379'
+  );
+  assert.deepEqual(parsed, {
+    url: 'https://grid-redis-4412.upstash.io',
+    token: 'upstashSecretToken123',
+  });
+  assert.equal(
+    parseUpstashRedisConnectionUrl('redis://localhost:6379'),
+    null
+  );
+
+  const { spawn } = await import('node:child_process');
+  const runScriptAsync = (script: string): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        ['--import', 'tsx', '--input-type=module', '-e', script],
+        { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d.toString()));
+      child.stderr.on('data', (d) => (stderr += d.toString()));
+      child.on('close', (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`Child failed (${code}):\n${stderr}\n${stdout}`));
+      });
+    });
+  };
+
+  // In-process Upstash REST HTTP emulator supporting GET, SET, DEL, and revision-checking EVAL
+  const kvStore = new Map<string, string>();
+  const EXPECTED_TOKEN = 'the_grid_upstash_test_token_99';
+
+  const upstashServer = http.createServer((req, res) => {
+    if (req.headers.authorization !== `Bearer ${EXPECTED_TOKEN}`) {
+      res.statusCode = 401;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    req.on('data', (c) => chunks.push(Buffer.from(c)));
+    req.on('end', () => {
+      const args = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Array<string | number>;
+      const cmd = String(args[0] || '').toUpperCase();
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json');
+
+      if (cmd === 'GET') {
+        const key = String(args[1]);
+        res.end(JSON.stringify({ result: kvStore.get(key) ?? null }));
+        return;
+      }
+
+      if (cmd === 'SET') {
+        const key = String(args[1]);
+        const value = String(args[2]);
+        const hasNx = args.slice(3).some((x) => String(x).toUpperCase() === 'NX');
+        if (hasNx && kvStore.has(key)) {
+          res.end(JSON.stringify({ result: null }));
+          return;
+        }
+        kvStore.set(key, value);
+        res.end(JSON.stringify({ result: 'OK' }));
+        return;
+      }
+
+      if (cmd === 'EVAL') {
+        const lua = String(args[1] || '');
+        if (lua.includes('redis.call("DEL"')) {
+          const lockKey = String(args[3]);
+          const lockTok = String(args[4]);
+          if (kvStore.get(lockKey) === lockTok) {
+            kvStore.delete(lockKey);
+            res.end(JSON.stringify({ result: 1 }));
+          } else {
+            res.end(JSON.stringify({ result: 0 }));
+          }
+          return;
+        }
+
+        // Write collection Lua CAS
+        const primaryKey = String(args[3]);
+        const backupKey = String(args[4]);
+        const expected = String(args[5]);
+        const serialized = String(args[6]);
+        const saveBackup = String(args[7]) === '1';
+
+        const current = kvStore.get(primaryKey);
+        if (!current) {
+          if (expected !== '__NULL__') {
+            res.end(JSON.stringify({ result: 'CONFLICT' }));
+            return;
+          }
+        } else {
+          let curRev = '__INVALID__';
+          try {
+            const decoded = JSON.parse(current) as { revision?: number };
+            if (typeof decoded.revision === 'number') curRev = String(decoded.revision);
+          } catch {
+            curRev = '__INVALID__';
+          }
+          if (curRev !== expected) {
+            res.end(JSON.stringify({ result: 'CONFLICT' }));
+            return;
+          }
+          if (saveBackup) {
+            kvStore.set(backupKey, current);
+          }
+        }
+        kvStore.set(primaryKey, serialized);
+        res.end(JSON.stringify({ result: 'OK' }));
+        return;
+      }
+
+      res.statusCode = 400;
+      res.end(JSON.stringify({ error: `Unsupported command: ${cmd}` }));
+    });
+  });
+
+  await new Promise<void>((resolve) => upstashServer.listen(0, '127.0.0.1', resolve));
+  const upstashUrl = `http://127.0.0.1:${(upstashServer.address() as { port: number }).port}`;
+
+  try {
+    const script = `
+      import assert from 'node:assert/strict';
+      process.env.VERCEL_ENV = 'production';
+      delete process.env.VERCEL;
+      delete process.env.BLOB_READ_WRITE_TOKEN;
+      delete process.env.UPSTASH_REDIS_REST_URL;
+      delete process.env.UPSTASH_REDIS_REST_TOKEN;
+      delete process.env.KV_REST_API_URL;
+      delete process.env.KV_REST_API_TOKEN;
+      delete process.env.JSON_DATA_DIR;
+      process.env.THE_GRID_KV_REST_API_URL = ${JSON.stringify(upstashUrl)};
+      process.env.THE_GRID_KV_REST_API_TOKEN = ${JSON.stringify(EXPECTED_TOKEN)};
+      process.env.ADMIN_USERNAME = 'gridowner';
+      process.env.ADMIN_PASSWORD = 'GridOwnerPassword2026!';
+      process.env.SESSION_SECRET = 'super_long_session_secret_key_for_vercel_test';
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+
+      const healthRes = await fetch(url + '/api/health');
+      assert.equal(healthRes.status, 200);
+      const health = await healthRes.json();
+      assert.equal(health.storage.mode, 'upstash_redis');
+      assert.equal(health.storage.verified, true);
+      assert.equal(health.storage.accessMode, 'redis');
+      assert.equal(health.storage.envDetection.upstashRestDetected, true);
+      assert.deepEqual(health.storage.envDetection.matchedEnvKeys, [
+        'THE_GRID_KV_REST_API_URL',
+        'THE_GRID_KV_REST_API_TOKEN',
+      ]);
+
+      // Create booking on customer flow
+      const bookRes = await fetch(url + '/api/bookings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          customerName: 'Upstash Player',
+          customerEmail: 'upstash@thegrid.pk',
+          countryCode: '+92',
+          customerPhone: '03214445566',
+          bookingDate: '2027-11-15',
+          startTime: '22:00',
+          bookingType: 'individual',
+          additionalGuestsCount: 0,
+          policiesAccepted: true,
+        }),
+      });
+      assert.equal(bookRes.status, 201);
+      const bookingJson = await bookRes.json();
+
+      // Login using ADMIN_USERNAME + ADMIN_PASSWORD
+      const loginRes = await fetch(url + '/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+        body: JSON.stringify({ username: 'gridowner', password: 'GridOwnerPassword2026!' }),
+      });
+      assert.equal(loginRes.status, 200);
+      const cookie = loginRes.headers.get('set-cookie').split(';')[0];
+
+      // Confirm booking from admin panel
+      const patchRes = await fetch(url + '/api/admin/bookings/' + bookingJson.booking.id + '/status', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: cookie,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({ status: 'CONFIRMED' }),
+      });
+      assert.equal(patchRes.status, 200);
+      const patched = await patchRes.json();
+      assert.equal(patched.booking.status, 'CONFIRMED');
+      assert.equal(patched.booking.confirmed_by, 'gridowner');
+
+      srv.closeAllConnections?.();
+      srv.close();
+    `;
+    await runScriptAsync(script);
+    assert.ok(kvStore.has('thegrid:data:bookings.json'));
+    assert.ok(kvStore.has('thegrid:system:health-probe.json'));
+  } finally {
+    await new Promise<void>((resolve) => {
+      upstashServer.closeAllConnections?.();
+      upstashServer.close(() => resolve());
+    });
+  }
+});
+
+test('STORAGE_DRIVER (blob/redis/auto), VERCEL_BLOB_ACCESS=private, Bearer private blob reads, and backend init logs work cleanly', async () => {
+  const { spawn } = await import('node:child_process');
+
+  const runScriptWithLogs = (script: string): Promise<{ stdout: string; stderr: string }> => {
+    return new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        ['--import', 'tsx', '--input-type=module', '-e', script],
+        { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d.toString()));
+      child.stderr.on('data', (d) => (stderr += d.toString()));
+      child.on('close', (code) => {
+        if (code === 0) resolve({ stdout, stderr });
+        else reject(new Error(`Child failed (${code}):\n${stderr}\n${stdout}`));
+      });
+    });
+  };
+
+  // Start Private Blob emulator verifying Authorization: Bearer <token> + private access
+  const blobToken = 'vercel_blob_rw_Rpj7z76r1P1bbuac_testsecret';
+  const blobs = new Map<string, { body: string; etag: string }>();
+  const getAuthHeaders: string[] = [];
+  let blobSeq = 1;
+
+  const blobServer = http.createServer((req, res) => {
+    const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
+    if (req.method === 'PUT') {
+      if (req.headers['x-vercel-blob-access'] !== 'private') {
+        res.statusCode = 403;
+        res.end('private required');
+        return;
+      }
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(Buffer.from(c)));
+      req.on('end', () => {
+        const pathname = reqUrl.searchParams.get('pathname') || reqUrl.pathname.replace(/^\/+/, '');
+        const etag = `"etag-${blobSeq++}"`;
+        blobs.set(pathname, { body: Buffer.concat(chunks).toString('utf8'), etag });
+        const origin = `http://${req.headers.host}`;
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            url: `${origin}/${pathname}`,
+            downloadUrl: `${origin}/${pathname}?download=1`,
+            pathname,
+            contentType: 'application/json',
+            contentDisposition: 'inline',
+            etag,
+          })
+        );
+      });
+      return;
+    }
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      const auth = String(req.headers.authorization || '');
+      getAuthHeaders.push(auth);
+      if (auth !== `Bearer ${blobToken}`) {
+        res.statusCode = 401;
+        res.end('Unauthorized private blob read');
+        return;
+      }
+      const pathname = reqUrl.pathname.replace(/^\/+/, '');
+      const item = blobs.get(pathname);
+      if (!item) {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ error: { code: 'not_found', message: 'Not found' } }));
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('ETag', item.etag);
+      res.end(req.method === 'HEAD' ? undefined : item.body);
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+
+  // Start Upstash Redis emulator
+  const kvStore = new Map<string, string>();
+  const redisToken = 'upstash_routing_secret_123';
+  const upstashServer = http.createServer((req, res) => {
+    if (req.headers.authorization !== `Bearer ${redisToken}`) {
+      res.statusCode = 401;
+      res.end('Unauthorized');
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on('data', (c) => chunks.push(Buffer.from(c)));
+    req.on('end', () => {
+      const args = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Array<string | number>;
+      const cmd = String(args[0] || '').toUpperCase();
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json');
+      if (cmd === 'GET') {
+        res.end(JSON.stringify({ result: kvStore.get(String(args[1])) ?? null }));
+        return;
+      }
+      if (cmd === 'SET') {
+        kvStore.set(String(args[1]), String(args[2]));
+        res.end(JSON.stringify({ result: 'OK' }));
+        return;
+      }
+      if (cmd === 'EVAL') {
+        const key = String(args[3]);
+        const expected = String(args[5]);
+        const serialized = String(args[6]);
+        const current = kvStore.get(key);
+        if (!current && expected !== '__NULL__') {
+          res.end(JSON.stringify({ result: 'CONFLICT' }));
+          return;
+        }
+        if (current) {
+          const decoded = JSON.parse(current) as { revision?: number };
+          if (String(decoded.revision) !== expected) {
+            res.end(JSON.stringify({ result: 'CONFLICT' }));
+            return;
+          }
+        }
+        kvStore.set(key, serialized);
+        res.end(JSON.stringify({ result: 'OK' }));
+        return;
+      }
+      res.statusCode = 400;
+      res.end('{}');
+    });
+  });
+
+  await Promise.all([
+    new Promise<void>((r) => blobServer.listen(0, '127.0.0.1', r)),
+    new Promise<void>((r) => upstashServer.listen(0, '127.0.0.1', r)),
+  ]);
+
+  const blobApiUrl = `http://127.0.0.1:${(blobServer.address() as { port: number }).port}`;
+  const upstashUrl = `http://127.0.0.1:${(upstashServer.address() as { port: number }).port}`;
+
+  try {
+    // 1. STORAGE_DRIVER=redis overrides even when BLOB_READ_WRITE_TOKEN is also set
+    const redisOverrideOut = await runScriptWithLogs(`
+      import assert from 'node:assert/strict';
+      process.env.VERCEL = '1';
+      process.env.STORAGE_DRIVER = 'redis';
+      process.env.BLOB_READ_WRITE_TOKEN = ${JSON.stringify(blobToken)};
+      process.env.VERCEL_BLOB_ACCESS = 'private';
+      process.env.VERCEL_BLOB_API_URL = ${JSON.stringify(blobApiUrl)};
+      process.env.UPSTASH_REDIS_REST_URL = ${JSON.stringify(upstashUrl)};
+      process.env.UPSTASH_REDIS_REST_TOKEN = ${JSON.stringify(redisToken)};
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+
+      const health = await (await fetch(url + '/api/health')).json();
+      assert.equal(health.storage.mode, 'upstash_redis');
+      assert.equal(health.storage.backend, 'upstash-redis');
+      assert.equal(health.storage.verified, true);
+      assert.equal(health.storage.envDetection.configuredDriver, 'redis');
+      srv.closeAllConnections?.();
+      srv.close();
+    `);
+    assert.match(redisOverrideOut.stdout, /Initialized storage backend: upstash-redis/);
+    assert.equal(redisOverrideOut.stdout.includes(redisToken), false);
+
+    // 2. STORAGE_DRIVER=blob + VERCEL_BLOB_ACCESS=private uses private Blob with Bearer auth
+    const blobOverrideOut = await runScriptWithLogs(`
+      import assert from 'node:assert/strict';
+      process.env.VERCEL = '1';
+      process.env.STORAGE_DRIVER = 'blob';
+      process.env.BLOB_READ_WRITE_TOKEN = ${JSON.stringify(blobToken)};
+      process.env.VERCEL_BLOB_ACCESS = 'private';
+      process.env.VERCEL_BLOB_API_URL = ${JSON.stringify(blobApiUrl)};
+      process.env.UPSTASH_REDIS_REST_URL = ${JSON.stringify(upstashUrl)};
+      process.env.UPSTASH_REDIS_REST_TOKEN = ${JSON.stringify(redisToken)};
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+
+      const health = await (await fetch(url + '/api/health')).json();
+      assert.equal(health.storage.mode, 'vercel_blob');
+      assert.equal(health.storage.backend, 'vercel-blob-private');
+      assert.equal(health.storage.accessMode, 'private');
+      assert.equal(health.storage.verified, true);
+      assert.equal(health.storage.envDetection.configuredDriver, 'blob');
+      assert.equal(health.storage.envDetection.blobAccess, 'private');
+      srv.closeAllConnections?.();
+      srv.close();
+    `);
+    assert.match(blobOverrideOut.stdout, /Initialized storage backend: vercel-blob-private/);
+    assert.equal(blobOverrideOut.stdout.includes(blobToken), false);
+    assert.ok(getAuthHeaders.length > 0);
+    assert.ok(getAuthHeaders.every((hdr) => hdr === `Bearer ${blobToken}`));
+
+    // 3. STORAGE_DRIVER=auto with Redis present and BLOB_READ_WRITE_TOKEN missing uses Upstash Redis
+    const autoRedisOut = await runScriptWithLogs(`
+      import assert from 'node:assert/strict';
+      process.env.VERCEL = '1';
+      process.env.STORAGE_DRIVER = 'auto';
+      delete process.env.BLOB_READ_WRITE_TOKEN;
+      process.env.UPSTASH_REDIS_REST_URL = ${JSON.stringify(upstashUrl)};
+      process.env.UPSTASH_REDIS_REST_TOKEN = ${JSON.stringify(redisToken)};
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+
+      const health = await (await fetch(url + '/api/health')).json();
+      assert.equal(health.storage.mode, 'upstash_redis');
+      assert.equal(health.storage.backend, 'upstash-redis');
+      assert.equal(health.storage.verified, true);
+      assert.equal(health.storage.envDetection.configuredDriver, 'auto');
+      srv.closeAllConnections?.();
+      srv.close();
+    `);
+    assert.match(autoRedisOut.stdout, /Initialized storage backend: upstash-redis/);
+  } finally {
+    await Promise.all([
+      new Promise<void>((r) => {
+        blobServer.closeAllConnections?.();
+        blobServer.close(() => r());
+      }),
+      new Promise<void>((r) => {
+        upstashServer.closeAllConnections?.();
+        upstashServer.close(() => r());
+      }),
+    ]);
+  }
+});
+
+test('BLOB_READ_WRITE_TOKEN normalization, malformed-token fallback, and 403 Blob-to-Upstash failover work cleanly', async () => {
+  const { spawn } = await import('node:child_process');
+  const { isValidVercelBlobToken, resolveVercelBlobToken } = await import(
+    '../../src/server/storage/drivers.ts'
+  );
+
+  const origBlobToken = process.env.BLOB_READ_WRITE_TOKEN;
+  try {
+    process.env.BLOB_READ_WRITE_TOKEN =
+      '  "BLOB_READ_WRITE_TOKEN=Bearer vercel_blob_rw_Rpj7z76r1P1bbuac_cleanSecret99"  ';
+    assert.equal(
+      resolveVercelBlobToken(),
+      'vercel_blob_rw_Rpj7z76r1P1bbuac_cleanSecret99'
+    );
+    assert.equal(isValidVercelBlobToken(resolveVercelBlobToken()), true);
+
+    process.env.BLOB_READ_WRITE_TOKEN = 'store_Rpj7z76r1P1bbuac';
+    assert.equal(isValidVercelBlobToken('store_Rpj7z76r1P1bbuac'), false);
+    assert.equal(resolveVercelBlobToken(), '');
+  } finally {
+    if (origBlobToken === undefined) delete process.env.BLOB_READ_WRITE_TOKEN;
+    else process.env.BLOB_READ_WRITE_TOKEN = origBlobToken;
+  }
+
+  const runScript = (script: string): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        ['--import', 'tsx', '--input-type=module', '-e', script],
+        { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d.toString()));
+      child.stderr.on('data', (d) => (stderr += d.toString()));
+      child.on('close', (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`Child failed (${code}):\n${stderr}\n${stdout}`));
+      });
+    });
+  };
+
+  // Blob server that always rejects with 403 forbidden
+  const forbiddenBlobServer = http.createServer((_req, res) => {
+    res.statusCode = 403;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: { code: 'forbidden', message: 'Access denied' } }));
+  });
+
+  const kvStore = new Map<string, string>();
+  const redisToken = 'upstash_failover_secret_456';
+  const upstashServer = http.createServer((req, res) => {
+    if (req.headers.authorization !== `Bearer ${redisToken}`) {
+      res.statusCode = 401;
+      res.end('Unauthorized');
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on('data', (c) => chunks.push(Buffer.from(c)));
+    req.on('end', () => {
+      const args = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Array<string | number>;
+      const cmd = String(args[0] || '').toUpperCase();
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json');
+      if (cmd === 'GET') {
+        res.end(JSON.stringify({ result: kvStore.get(String(args[1])) ?? null }));
+        return;
+      }
+      if (cmd === 'SET') {
+        kvStore.set(String(args[1]), String(args[2]));
+        res.end(JSON.stringify({ result: 'OK' }));
+        return;
+      }
+      if (cmd === 'EVAL') {
+        const key = String(args[3]);
+        const expected = String(args[5]);
+        const serialized = String(args[6]);
+        const current = kvStore.get(key);
+        if (!current && expected !== '__NULL__') {
+          res.end(JSON.stringify({ result: 'CONFLICT' }));
+          return;
+        }
+        if (current) {
+          const decoded = JSON.parse(current) as { revision?: number };
+          if (String(decoded.revision) !== expected) {
+            res.end(JSON.stringify({ result: 'CONFLICT' }));
+            return;
+          }
+        }
+        kvStore.set(key, serialized);
+        res.end(JSON.stringify({ result: 'OK' }));
+        return;
+      }
+      res.statusCode = 400;
+      res.end('{}');
+    });
+  });
+
+  await Promise.all([
+    new Promise<void>((r) => forbiddenBlobServer.listen(0, '127.0.0.1', r)),
+    new Promise<void>((r) => upstashServer.listen(0, '127.0.0.1', r)),
+  ]);
+
+  const forbiddenBlobUrl = `http://127.0.0.1:${(forbiddenBlobServer.address() as { port: number }).port}`;
+  const upstashUrl = `http://127.0.0.1:${(upstashServer.address() as { port: number }).port}`;
+
+  try {
+    // 1. Malformed BLOB_READ_WRITE_TOKEN + STORAGE_DRIVER=blob + Upstash configured -> uses Upstash Redis cleanly
+    await runScript(`
+      import assert from 'node:assert/strict';
+      process.env.VERCEL = '1';
+      process.env.STORAGE_DRIVER = 'blob';
+      process.env.BLOB_READ_WRITE_TOKEN = 'store_Rpj7z76r1P1bbuac';
+      process.env.UPSTASH_REDIS_REST_URL = ${JSON.stringify(upstashUrl)};
+      process.env.UPSTASH_REDIS_REST_TOKEN = ${JSON.stringify(redisToken)};
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+
+      const healthRes = await fetch(url + '/api/health');
+      assert.equal(healthRes.status, 200);
+      const health = await healthRes.json();
+      assert.equal(health.ok, true);
+      assert.equal(health.storage.backend, 'upstash-redis');
+      assert.equal(health.storage.envDetection.blobTokenDetected, true);
+      assert.equal(health.storage.envDetection.blobTokenFormatValid, false);
+      srv.closeAllConnections?.();
+      srv.close();
+    `);
+
+    // 2. Format-valid BLOB_READ_WRITE_TOKEN that fails with 403 -> fails over to configured Upstash Redis
+    await runScript(`
+      import assert from 'node:assert/strict';
+      process.env.VERCEL = '1';
+      process.env.STORAGE_DRIVER = 'blob';
+      process.env.BLOB_READ_WRITE_TOKEN = 'vercel_blob_rw_Rpj7z76r1P1bbuac_revokedSecret';
+      process.env.VERCEL_BLOB_ACCESS = 'private';
+      process.env.VERCEL_BLOB_API_URL = ${JSON.stringify(forbiddenBlobUrl)};
+      process.env.UPSTASH_REDIS_REST_URL = ${JSON.stringify(upstashUrl)};
+      process.env.UPSTASH_REDIS_REST_TOKEN = ${JSON.stringify(redisToken)};
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+
+      const healthRes = await fetch(url + '/api/health');
+      assert.equal(healthRes.status, 200);
+      const health = await healthRes.json();
+      assert.equal(health.ok, true);
+      assert.equal(health.storage.backend, 'upstash-redis');
+      assert.equal(health.storage.verified, true);
+      srv.closeAllConnections?.();
+      srv.close();
+    `);
+
+    // 3. Malformed BLOB_READ_WRITE_TOKEN on Vercel with NO Upstash -> reports explicit format error (503) without token leak
+    await runScript(`
+      import assert from 'node:assert/strict';
+      process.env.VERCEL = '1';
+      process.env.STORAGE_DRIVER = 'blob';
+      process.env.BLOB_READ_WRITE_TOKEN = 'bad_secret_placeholder_123';
+      delete process.env.UPSTASH_REDIS_REST_URL;
+      delete process.env.UPSTASH_REDIS_REST_TOKEN;
+      delete process.env.KV_REST_API_URL;
+      delete process.env.KV_REST_API_TOKEN;
+      delete process.env.REDIS_URL;
+
+      const { createApiApp } = await import('./src/server/app.ts');
+      const app = createApiApp();
+      const srv = app.listen(0, '127.0.0.1');
+      await new Promise((r) => srv.once('listening', r));
+      const url = 'http://127.0.0.1:' + srv.address().port;
+
+      const healthRes = await fetch(url + '/api/health');
+      assert.equal(healthRes.status, 503);
+      const health = await healthRes.json();
+      assert.equal(health.ok, false);
+      assert.equal(health.storage.envDetection.blobTokenFormatValid, false);
+      assert.match(health.storage.error, /BLOB_READ_WRITE_TOKEN format is invalid/i);
+      assert.equal(JSON.stringify(health).includes('bad_secret_placeholder_123'), false);
+      srv.closeAllConnections?.();
+      srv.close();
+    `);
+  } finally {
+    await Promise.all([
+      new Promise<void>((r) => {
+        forbiddenBlobServer.closeAllConnections?.();
+        forbiddenBlobServer.close(() => r());
+      }),
+      new Promise<void>((r) => {
+        upstashServer.closeAllConnections?.();
+        upstashServer.close(() => r());
+      }),
+    ]);
+  }
+});
+
+
+

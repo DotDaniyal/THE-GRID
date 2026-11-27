@@ -549,3 +549,46 @@ export async function fetchAdminDrinksReports(
   const qs = buildQueryString(filters as Record<string, string | number | boolean | undefined>);
   return apiRequest<DrinksAnalyticsReport>(`/api/admin/drinks/reports${qs}`);
 }
+
+export interface AdminStorageOverview {
+  health: {
+    mode: 'local_json' | 'vercel_blob' | 'upstash_redis' | 'unconfigured_vercel';
+    backend?: 'local-json' | 'vercel-blob-private' | 'vercel-blob-public' | 'upstash-redis' | 'unconfigured-vercel';
+    persistent: boolean;
+    configured: boolean;
+    readable: boolean;
+    writable: boolean;
+    accessible: boolean;
+    verified: boolean;
+    accessMode: 'local' | 'private' | 'public' | 'redis' | 'unconfigured';
+    checkedAt: string;
+    envDetection?: {
+      vercelDetected: boolean;
+      configuredDriver?: 'auto' | 'blob' | 'redis';
+      blobAccess?: 'private' | 'public';
+      blobTokenDetected: boolean;
+      blobTokenFormatValid?: boolean;
+      blobApiUrlOverrideSet?: boolean;
+      upstashRestDetected: boolean;
+      upstashUrlDetected: boolean;
+      matchedEnvKeys: string[];
+    };
+    error: string | null;
+  };
+  counts: {
+    bookings: number;
+    customers: number;
+    products: number;
+    sales: number;
+    expenses: number;
+    adminUsers: number;
+  };
+}
+
+export async function fetchAdminStorageStatus(): Promise<AdminStorageOverview> {
+  return apiRequest<AdminStorageOverview>('/api/admin/storage/status');
+}
+
+export async function fetchAdminStorageBackup(): Promise<Record<string, unknown>> {
+  return apiRequest<Record<string, unknown>>('/api/admin/storage/backup');
+}

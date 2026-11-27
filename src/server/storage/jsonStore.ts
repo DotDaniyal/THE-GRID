@@ -7,12 +7,17 @@ import {
 } from '../db/migrateSqliteToJson.ts';
 import {
   createConfiguredStorageDriver,
+  createFallbackUpstashDriverIfConfigured,
+  inspectStorageEnvDetection,
   resolveLocalDataDir,
   sanitizeStorageError,
   StorageConfigurationError,
+  UnconfiguredVercelDriver,
   VersionConflictError,
   type JsonStorageDriver,
+  type StorageBackendId,
   type StorageDriverMode,
+  type StorageEnvDetection,
 } from './drivers.ts';
 import {
   ALL_COLLECTIONS,
@@ -27,14 +32,16 @@ const HEALTH_CACHE_TTL_MS = 30_000;
 
 export interface StorageHealthReport {
   mode: StorageDriverMode;
+  backend: StorageBackendId;
   persistent: boolean;
   configured: boolean;
   readable: boolean;
   writable: boolean;
   accessible: boolean;
   verified: boolean;
-  accessMode: 'local' | 'private' | 'redis' | 'unconfigured';
+  accessMode: 'local' | 'private' | 'public' | 'redis' | 'unconfigured';
   checkedAt: string;
+  envDetection: StorageEnvDetection;
   error: string | null;
 }
 
@@ -46,6 +53,11 @@ const collectionQueues = new Map<string, Promise<unknown>>();
 function getDriver(): JsonStorageDriver {
   if (!activeDriver) {
     activeDriver = createConfiguredStorageDriver();
+    console.info(`[storage] Initialized storage backend: ${activeDriver.backend}`, {
+      backend: activeDriver.backend,
+      mode: activeDriver.mode,
+      persistent: activeDriver.persistent,
+    });
   }
   return activeDriver;
 }
@@ -59,12 +71,14 @@ export function resetJsonStoreForTests(): void {
 
 export function getStorageStatus(): {
   mode: StorageDriverMode;
+  backend: StorageBackendId;
   persistent: boolean;
   localDataDir: string | null;
 } {
   const driver = getDriver();
   return {
     mode: driver.mode,
+    backend: driver.backend,
     persistent: driver.persistent,
     localDataDir: driver.mode === 'local_json' ? resolveLocalDataDir() : null,
   };
@@ -77,14 +91,24 @@ export async function verifyStorageHealth(options?: {
     return lastVerifiedHealth.report;
   }
 
-  const driver = getDriver();
+  let driver = getDriver();
   const checkedAt = new Date().toISOString();
   const configured = driver.persistent || driver.mode === 'local_json';
+  const envDetection = inspectStorageEnvDetection();
 
   if (driver.mode === 'unconfigured_vercel' || !configured) {
     lastVerifiedHealth = null;
+    const errorMsg =
+      driver instanceof UnconfiguredVercelDriver
+        ? driver.reason
+        : new StorageConfigurationError().message;
+    console.error('[storage] Vercel deployment missing persistent external storage credentials.', {
+      mode: driver.mode,
+      envDetection,
+    });
     return {
       mode: driver.mode,
+      backend: driver.backend,
       persistent: false,
       configured: false,
       readable: false,
@@ -93,16 +117,38 @@ export async function verifyStorageHealth(options?: {
       verified: false,
       accessMode: 'unconfigured',
       checkedAt,
-      error: new StorageConfigurationError().message,
+      envDetection,
+      error: errorMsg,
     };
   }
 
   try {
     await ensureStoreInitialized();
-    const verification = await driver.verifyReadWrite();
+    driver = getDriver();
+    let verification = await driver.verifyReadWrite();
+
+    if ((!verification.readable || !verification.writable) && driver.mode === 'vercel_blob') {
+      const fallbackUpstash = createFallbackUpstashDriverIfConfigured();
+      if (fallbackUpstash) {
+        const fallbackVerify = await fallbackUpstash.verifyReadWrite().catch(() => null);
+        if (fallbackVerify?.readable && fallbackVerify?.writable) {
+          console.warn(
+            '[storage] Vercel Blob health probe failed; switching active persistent backend to upstash-redis.',
+            { reason: verification.error }
+          );
+          activeDriver = fallbackUpstash;
+          initPromise = null;
+          await ensureStoreInitialized();
+          driver = getDriver();
+          verification = await driver.verifyReadWrite();
+        }
+      }
+    }
+
     const verified = verification.readable && verification.writable;
     const report: StorageHealthReport = {
       mode: driver.mode,
+      backend: driver.backend,
       persistent: driver.persistent,
       configured: true,
       readable: verification.readable,
@@ -111,6 +157,7 @@ export async function verifyStorageHealth(options?: {
       verified,
       accessMode: verification.accessMode,
       checkedAt,
+      envDetection,
       error: verification.error,
     };
 
@@ -121,22 +168,44 @@ export async function verifyStorageHealth(options?: {
       };
     } else {
       lastVerifiedHealth = null;
+      console.error('[storage] Storage verification probe failed:', {
+        backend: driver.backend,
+        mode: driver.mode,
+        readable: verification.readable,
+        writable: verification.writable,
+        error: verification.error,
+      });
     }
 
     return report;
   } catch (err) {
     lastVerifiedHealth = null;
+    const safeError = sanitizeStorageError(err);
+    console.error('[storage] Storage verification threw exception:', {
+      backend: driver.backend,
+      mode: driver.mode,
+      error: safeError,
+    });
     return {
       mode: driver.mode,
+      backend: driver.backend,
       persistent: driver.persistent,
       configured: false,
       readable: false,
       writable: false,
       accessible: false,
       verified: false,
-      accessMode: driver.mode === 'vercel_blob' ? 'private' : driver.mode === 'upstash_redis' ? 'redis' : 'local',
+      accessMode:
+        driver.mode === 'vercel_blob'
+          ? driver.backend === 'vercel-blob-public'
+            ? 'public'
+            : 'private'
+          : driver.mode === 'upstash_redis'
+            ? 'redis'
+            : 'local',
       checkedAt,
-      error: sanitizeStorageError(err),
+      envDetection,
+      error: safeError,
     };
   }
 }
@@ -189,7 +258,7 @@ export async function ensureStoreInitialized(): Promise<void> {
   if (initPromise) return initPromise;
 
   initPromise = (async () => {
-    const driver = getDriver();
+    let driver = getDriver();
 
     if (driver.mode === 'unconfigured_vercel') {
       return;
@@ -219,26 +288,51 @@ export async function ensureStoreInitialized(): Promise<void> {
 
     // External Vercel production store (Vercel Blob or Upstash Redis)
     // Only seed missing collections on first boot; never overwrite existing production records.
-    const [settingsRead, adminRead] = await Promise.all([
-      driver.readCollection('settings'),
-      driver.readCollection('admin-settings'),
-    ]);
-    if (!settingsRead.exists || !adminRead.exists) {
-      const seed = seedFromBundledLocalJsonOrSqlite();
-      for (const colName of ALL_COLLECTIONS) {
-        const current = await driver.readCollection(colName);
-        if (!current.exists) {
-          const initial = seed ? seed[colName] : createDefaultCollection(colName);
-          if (initial.revision < 1) {
-            initial.revision = 1;
-          }
-          try {
-            await driver.writeCollection(colName, initial, null, { skipBackup: true });
-          } catch (err) {
-            if (!(err instanceof VersionConflictError)) throw err;
+    const initializeExternalStore = async (targetDriver: JsonStorageDriver): Promise<void> => {
+      const [settingsRead, adminRead] = await Promise.all([
+        targetDriver.readCollection('settings'),
+        targetDriver.readCollection('admin-settings'),
+      ]);
+
+      if (!settingsRead.exists || !adminRead.exists) {
+        const seed = seedFromBundledLocalJsonOrSqlite();
+        for (const colName of ALL_COLLECTIONS) {
+          const current = await targetDriver.readCollection(colName);
+          if (!current.exists) {
+            const initial = seed ? seed[colName] : createDefaultCollection(colName);
+            if (initial.revision < 1) {
+              initial.revision = 1;
+            }
+            try {
+              await targetDriver.writeCollection(colName, initial, null, { skipBackup: true });
+            } catch (err) {
+              if (!(err instanceof VersionConflictError)) throw err;
+            }
           }
         }
       }
+    };
+
+    try {
+      await initializeExternalStore(driver);
+    } catch (err) {
+      if (driver.mode === 'vercel_blob' && err instanceof StorageConfigurationError) {
+        const fallbackUpstash = createFallbackUpstashDriverIfConfigured();
+        if (fallbackUpstash) {
+          const fallbackVerify = await fallbackUpstash.verifyReadWrite().catch(() => null);
+          if (fallbackVerify?.readable && fallbackVerify?.writable) {
+            console.warn(
+              '[storage] Vercel Blob verification failed; switching active persistent backend to upstash-redis.',
+              { reason: sanitizeStorageError(err) }
+            );
+            activeDriver = fallbackUpstash;
+            driver = fallbackUpstash;
+            await initializeExternalStore(fallbackUpstash);
+            return;
+          }
+        }
+      }
+      throw err;
     }
   })().catch((err) => {
     initPromise = null;
@@ -336,4 +430,85 @@ export async function withSlotLock<T>(
   fn: () => Promise<T>
 ): Promise<T> {
   return withNamedLock(`slot:${bookingDate}:${startTime}`, fn);
+}
+
+export async function getStorageOverviewStats(): Promise<{
+  health: StorageHealthReport;
+  counts: {
+    bookings: number;
+    customers: number;
+    products: number;
+    sales: number;
+    expenses: number;
+    adminUsers: number;
+  };
+}> {
+  const health = await verifyStorageHealth({ force: true });
+  const [bookings, customers, products, sales, expenses, adminSettings] = await Promise.all([
+    readCollection('bookings'),
+    readCollection('customers'),
+    readCollection('products'),
+    readCollection('sales'),
+    readCollection('expenses'),
+    readCollection('admin-settings'),
+  ]);
+
+  return {
+    health,
+    counts: {
+      bookings: bookings.records.length,
+      customers: customers.records.length,
+      products: products.records.length,
+      sales: sales.records.length,
+      expenses: expenses.records.length,
+      adminUsers: adminSettings.users.length,
+    },
+  };
+}
+
+export async function buildSanitizedCentralBackupSnapshot() {
+  await ensureStoreInitialized();
+  const driver = getDriver();
+  const [settings, bookings, customers, products, inventory, sales, expenses, adminSettings] =
+    await Promise.all([
+      readCollection('settings'),
+      readCollection('bookings'),
+      readCollection('customers'),
+      readCollection('products'),
+      readCollection('inventory'),
+      readCollection('sales'),
+      readCollection('expenses'),
+      readCollection('admin-settings'),
+    ]);
+
+  const { session_secret: _omittedSecret, ...safeAppMeta } = adminSettings.appMeta ?? {};
+
+  return {
+    exportedAt: new Date().toISOString(),
+    schemaVersion: 1,
+    storageMode: driver.mode,
+    collections: {
+      settings,
+      bookings: {
+        ...bookings,
+        records: bookings.records.map(({ status_token: _omitToken, ...safeRecord }) => safeRecord),
+      },
+      customers,
+      products,
+      inventory,
+      sales,
+      expenses,
+      adminSettings: {
+        schemaVersion: adminSettings.schemaVersion,
+        updatedAt: adminSettings.updatedAt,
+        revision: adminSettings.revision,
+        nextUserId: adminSettings.nextUserId,
+        appMeta: safeAppMeta,
+        users: adminSettings.users.map(
+          ({ password_hash: _omitHash, mfa_secret: _omitMfa, ...safeUser }) => safeUser
+        ),
+        auditLogs: adminSettings.auditLogs ?? [],
+      },
+    },
+  };
 }

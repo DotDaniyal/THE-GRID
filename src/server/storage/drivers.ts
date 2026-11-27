@@ -12,6 +12,8 @@ import {
   BlobStoreSuspendedError,
   del as blobDel,
   get as blobGet,
+  head as blobHead,
+  list as blobList,
   put as blobPut,
 } from '@vercel/blob';
 import {
@@ -27,6 +29,15 @@ export type StorageDriverMode =
   | 'upstash_redis'
   | 'unconfigured_vercel';
 
+export type StorageBackendId =
+  | 'local-json'
+  | 'vercel-blob-private'
+  | 'vercel-blob-public'
+  | 'upstash-redis'
+  | 'unconfigured-vercel';
+
+export type NormalizedStorageDriverPreference = 'auto' | 'blob' | 'redis';
+
 export class VersionConflictError extends Error {
   constructor(message = 'Concurrent update conflict detected; retry with latest data.') {
     super(message);
@@ -38,17 +49,29 @@ export class StorageConfigurationError extends Error {
   statusCode = 503;
 
   constructor(
-    message = 'Persistent external JSON storage is not configured for Vercel production. Connect a Private Vercel Blob Store (BLOB_READ_WRITE_TOKEN) in Vercel Environment Variables.'
+    message = 'Persistent external JSON storage is not configured for Vercel production. Connect a Private Vercel Blob Store (BLOB_READ_WRITE_TOKEN) or Upstash Redis (UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN, KV_REST_API_URL, or Upstash REDIS_URL) in Vercel Production Environment Variables and redeploy.'
   ) {
     super(message);
     this.name = 'StorageConfigurationError';
   }
 }
 
+export interface StorageEnvDetection {
+  vercelDetected: boolean;
+  configuredDriver: NormalizedStorageDriverPreference;
+  blobAccess: 'private' | 'public';
+  blobTokenDetected: boolean;
+  blobTokenFormatValid: boolean;
+  blobApiUrlOverrideSet: boolean;
+  upstashRestDetected: boolean;
+  upstashUrlDetected: boolean;
+  matchedEnvKeys: string[];
+}
+
 export interface StorageVerificationResult {
   readable: boolean;
   writable: boolean;
-  accessMode: 'local' | 'private' | 'redis' | 'unconfigured';
+  accessMode: 'local' | 'private' | 'public' | 'redis' | 'unconfigured';
   error: string | null;
 }
 
@@ -60,6 +83,7 @@ export interface ReadCollectionResult<K extends CollectionName> {
 
 export interface JsonStorageDriver {
   readonly mode: StorageDriverMode;
+  readonly backend: StorageBackendId;
   readonly persistent: boolean;
   readCollection<K extends CollectionName>(name: K): Promise<ReadCollectionResult<K>>;
   writeCollection<K extends CollectionName>(
@@ -84,23 +108,91 @@ function stripSurroundingQuotes(raw: string | undefined): string {
   return trimmed;
 }
 
-export function resolveVercelBlobToken(): string {
-  const direct = stripSurroundingQuotes(process.env.BLOB_READ_WRITE_TOKEN);
-  if (direct) return direct;
+function normalizeSecretEnvValue(raw: string | undefined, expectedKey?: string): string {
+  let val = stripSurroundingQuotes(raw);
+  if (!val) return '';
 
-  const prefixedDirect = stripSurroundingQuotes(process.env.VERCEL_BLOB_READ_WRITE_TOKEN);
-  if (prefixedDirect) return prefixedDirect;
+  // Handle accidental copy-paste of `KEY=value` or `Bearer value`
+  const keyMatch = val.match(/^([A-Z0-9_]+)\s*=\s*(.+)$/);
+  if (keyMatch && (!expectedKey || keyMatch[1] === expectedKey || keyMatch[1].endsWith('TOKEN') || keyMatch[1].endsWith('URL'))) {
+    val = stripSurroundingQuotes(keyMatch[2]);
+  }
+  if (/^Bearer\s+/i.test(val)) {
+    val = stripSurroundingQuotes(val.replace(/^Bearer\s+/i, ''));
+  }
+  return val.trim();
+}
 
-  // Vercel Storage allows custom env prefixes (e.g., MYSTORE_READ_WRITE_TOKEN)
-  for (const [envKey, envVal] of Object.entries(process.env)) {
-    if (!envKey.endsWith('_READ_WRITE_TOKEN')) continue;
-    const candidate = stripSurroundingQuotes(envVal);
-    if (candidate.startsWith('vercel_blob_rw_')) {
-      return candidate;
+export function isValidVercelBlobToken(token: string): boolean {
+  return /^vercel_blob_rw_[a-zA-Z0-9]+_[a-zA-Z0-9._-]+$/.test(token);
+}
+
+export function isVercelRuntime(): boolean {
+  return (
+    stripSurroundingQuotes(process.env.VERCEL) === '1' ||
+    Boolean(stripSurroundingQuotes(process.env.VERCEL_ENV))
+  );
+}
+
+function resolveBlobTokenMatch(): { token: string; key: string | null; valid: boolean } {
+  const directKeys = ['BLOB_READ_WRITE_TOKEN', 'VERCEL_BLOB_READ_WRITE_TOKEN'];
+  let firstInvalidMatch: { token: string; key: string } | null = null;
+
+  for (const key of directKeys) {
+    const candidate = normalizeSecretEnvValue(process.env[key], key);
+    if (!candidate) continue;
+    if (isValidVercelBlobToken(candidate)) {
+      return { token: candidate, key, valid: true };
+    }
+    if (!firstInvalidMatch) {
+      firstInvalidMatch = { token: candidate, key };
     }
   }
 
-  return '';
+  // Vercel Storage allows custom env prefixes (e.g., MYSTORE_READ_WRITE_TOKEN or THEGRID_BLOB_READ_WRITE_TOKEN)
+  for (const [envKey, envVal] of Object.entries(process.env)) {
+    const candidate = normalizeSecretEnvValue(envVal, envKey);
+    if (!candidate) continue;
+    if (isValidVercelBlobToken(candidate)) {
+      return { token: candidate, key: envKey, valid: true };
+    }
+    if (
+      !firstInvalidMatch &&
+      (envKey.endsWith('_READ_WRITE_TOKEN') || envKey.endsWith('_BLOB_TOKEN'))
+    ) {
+      firstInvalidMatch = { token: candidate, key: envKey };
+    }
+  }
+
+  if (firstInvalidMatch) {
+    return { token: firstInvalidMatch.token, key: firstInvalidMatch.key, valid: false };
+  }
+
+  return { token: '', key: null, valid: false };
+}
+
+export function resolveVercelBlobToken(): string {
+  const match = resolveBlobTokenMatch();
+  return match.valid ? match.token : '';
+}
+
+export function resolveVercelBlobAccess(): 'private' | 'public' {
+  const configured = stripSurroundingQuotes(process.env.VERCEL_BLOB_ACCESS).toLowerCase();
+  if (configured === 'public') {
+    return 'public';
+  }
+  return 'private';
+}
+
+export function resolveConfiguredStorageDriverPreference(): NormalizedStorageDriverPreference {
+  const raw = stripSurroundingQuotes(process.env.STORAGE_DRIVER).toLowerCase();
+  if (raw === 'redis' || raw === 'upstash_redis') {
+    return 'redis';
+  }
+  if (raw === 'blob' || raw === 'vercel_blob') {
+    return 'blob';
+  }
+  return 'auto';
 }
 
 export function sanitizeStorageError(err: unknown): string {
@@ -142,6 +234,7 @@ export function sanitizeStorageError(err: unknown): string {
   // Redact any accidental credential/token/URL material before returning to callers
   const scrubbed = rawMsg
     .replace(/vercel_blob_rw_[^\s"'`]+/gi, '[REDACTED_BLOB_TOKEN]')
+    .replace(/rediss?:\/\/[^\s"'`]+/gi, '[REDACTED_REDIS_URL]')
     .replace(/Bearer\s+[^\s"'`]+/gi, 'Bearer [REDACTED]')
     .replace(/https?:\/\/[^\s"'`]+/gi, (matched) => {
       try {
@@ -163,17 +256,135 @@ export function resolveLocalDataDir(): string {
   return path.resolve(process.cwd(), 'data');
 }
 
-function getUpstashConfig(): { url: string; token: string } | null {
-  const url =
-    stripSurroundingQuotes(process.env.UPSTASH_REDIS_REST_URL) ||
-    stripSurroundingQuotes(process.env.KV_REST_API_URL);
-  const token =
-    stripSurroundingQuotes(process.env.UPSTASH_REDIS_REST_TOKEN) ||
-    stripSurroundingQuotes(process.env.KV_REST_API_TOKEN);
-  if (url && token) {
-    return { url: url.replace(/\/+$/, ''), token };
+function isValidHttpUrl(raw: string): boolean {
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
   }
-  return null;
+}
+
+export function parseUpstashRedisConnectionUrl(
+  rawUrl: string
+): { url: string; token: string } | null {
+  const cleaned = stripSurroundingQuotes(rawUrl);
+  if (!cleaned) return null;
+  try {
+    const parsed = new URL(cleaned);
+    if (parsed.protocol !== 'rediss:' && parsed.protocol !== 'redis:') {
+      return null;
+    }
+    const hostname = parsed.hostname.trim().toLowerCase();
+    const token = decodeURIComponent(parsed.password || '').trim();
+    if (!hostname.endsWith('.upstash.io') || !token) {
+      return null;
+    }
+    return {
+      url: `https://${hostname}`,
+      token,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function resolveUpstashMatch(): {
+  config: { url: string; token: string } | null;
+  source: 'rest' | 'redis_url' | null;
+  matchedKeys: string[];
+} {
+  // 1. Standard Upstash / Vercel KV REST pairs
+  const directPairs: Array<[string, string]> = [
+    ['UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN'],
+    ['KV_REST_API_URL', 'KV_REST_API_TOKEN'],
+  ];
+  for (const [urlKey, tokenKey] of directPairs) {
+    const url = normalizeSecretEnvValue(process.env[urlKey], urlKey);
+    const token = normalizeSecretEnvValue(process.env[tokenKey], tokenKey);
+    if (url && token && isValidHttpUrl(url)) {
+      return {
+        config: { url: url.replace(/\/+$/, ''), token },
+        source: 'rest',
+        matchedKeys: [urlKey, tokenKey],
+      };
+    }
+  }
+
+  // 2. Custom-prefixed Vercel Storage / Upstash REST pairs (e.g., THE_GRID_KV_REST_API_URL)
+  const suffixPairs: Array<[string, string]> = [
+    ['_UPSTASH_REDIS_REST_URL', '_UPSTASH_REDIS_REST_TOKEN'],
+    ['_KV_REST_API_URL', '_KV_REST_API_TOKEN'],
+    ['_REST_API_URL', '_REST_API_TOKEN'],
+    ['_REST_URL', '_REST_TOKEN'],
+  ];
+  for (const [urlSuffix, tokenSuffix] of suffixPairs) {
+    for (const [envKey, envVal] of Object.entries(process.env)) {
+      if (!envKey.endsWith(urlSuffix)) continue;
+      const prefix = envKey.slice(0, -urlSuffix.length);
+      if (!prefix) continue;
+      const tokenKey = `${prefix}${tokenSuffix}`;
+      const url = normalizeSecretEnvValue(envVal, envKey);
+      const token = normalizeSecretEnvValue(process.env[tokenKey], tokenKey);
+      if (url && token && isValidHttpUrl(url)) {
+        return {
+          config: { url: url.replace(/\/+$/, ''), token },
+          source: 'rest',
+          matchedKeys: [envKey, tokenKey],
+        };
+      }
+    }
+  }
+
+  // 3. Upstash Redis TLS/TCP URL (REDIS_URL, KV_URL, UPSTASH_REDIS_URL, <PREFIX>_REDIS_URL, <PREFIX>_KV_URL)
+  const redisUrlCandidates: string[] = ['UPSTASH_REDIS_URL', 'REDIS_URL', 'KV_URL'];
+  for (const envKey of Object.keys(process.env)) {
+    if (
+      !redisUrlCandidates.includes(envKey) &&
+      (envKey.endsWith('_REDIS_URL') || envKey.endsWith('_KV_URL'))
+    ) {
+      redisUrlCandidates.push(envKey);
+    }
+  }
+
+  for (const key of redisUrlCandidates) {
+    const raw = process.env[key];
+    if (!raw) continue;
+    const derived = parseUpstashRedisConnectionUrl(raw);
+    if (derived) {
+      return {
+        config: derived,
+        source: 'redis_url',
+        matchedKeys: [key],
+      };
+    }
+  }
+
+  return { config: null, source: null, matchedKeys: [] };
+}
+
+function getUpstashConfig(): { url: string; token: string } | null {
+  return resolveUpstashMatch().config;
+}
+
+export function inspectStorageEnvDetection(): StorageEnvDetection {
+  const blobMatch = resolveBlobTokenMatch();
+  const upstashMatch = resolveUpstashMatch();
+  const matchedEnvKeys: string[] = [];
+  if (blobMatch.key) matchedEnvKeys.push(blobMatch.key);
+  matchedEnvKeys.push(...upstashMatch.matchedKeys);
+
+  return {
+    vercelDetected: isVercelRuntime(),
+    configuredDriver: resolveConfiguredStorageDriverPreference(),
+    blobAccess: resolveVercelBlobAccess(),
+    blobTokenDetected: Boolean(blobMatch.token),
+    blobTokenFormatValid: blobMatch.valid,
+    blobApiUrlOverrideSet: Boolean(stripSurroundingQuotes(process.env.VERCEL_BLOB_API_URL)),
+    upstashRestDetected: upstashMatch.source === 'rest',
+    upstashUrlDetected: upstashMatch.source === 'redis_url',
+    matchedEnvKeys,
+  };
 }
 
 async function acquireUpstashSlotLock(
@@ -218,6 +429,7 @@ async function releaseUpstashSlotLock(
  */
 export class LocalJsonFileDriver implements JsonStorageDriver {
   readonly mode = 'local_json' as const;
+  readonly backend = 'local-json' as const;
   readonly persistent = true;
   private readonly dataDir: string;
   private readonly backupsDir: string;
@@ -483,13 +695,16 @@ export class LocalJsonFileDriver implements JsonStorageDriver {
  */
 export class VercelBlobJsonDriver implements JsonStorageDriver {
   readonly mode = 'vercel_blob' as const;
+  readonly backend: 'vercel-blob-private' | 'vercel-blob-public';
   readonly persistent = true;
   private readonly token: string;
-  private readonly access = 'private' as const;
+  private readonly access: 'private' | 'public';
   private readonly upstash: { url: string; token: string } | null;
 
-  constructor(token: string) {
+  constructor(token: string, access: 'private' | 'public' = resolveVercelBlobAccess()) {
     this.token = token;
+    this.access = access;
+    this.backend = access === 'private' ? 'vercel-blob-private' : 'vercel-blob-public';
     this.upstash = getUpstashConfig();
   }
 
@@ -545,28 +760,132 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
     throw err;
   }
 
-  async readCollection<K extends CollectionName>(
-    name: K
-  ): Promise<ReadCollectionResult<K>> {
-    let primaryResult: Awaited<ReturnType<typeof blobGet>> = null;
+  /**
+   * Reads a JSON blob using `@vercel/blob` `get` with explicit `access` + Bearer auth header,
+   * and falls back to `head`/`list` + authenticated `fetch` if needed so private blobs
+   * never fail due to unauthenticated CDN URL assumptions.
+   */
+  private async readJsonBlob(
+    pathname: string
+  ): Promise<{ raw: string; etag: string | null; url: string } | null> {
+    const target = this.getTarget(pathname);
+    const authHeaders = {
+      Authorization: `Bearer ${this.token}`,
+    };
+
     try {
-      primaryResult = await blobGet(this.getTarget(this.pathname(name)), {
+      const result = await blobGet(target, {
         access: this.access,
         useCache: false,
         token: this.token,
       });
+      if (!result || result.statusCode !== 200 || !result.stream) {
+        return null;
+      }
+      const raw = await new Response(result.stream).text();
+      return {
+        raw,
+        etag: result.blob.etag || null,
+        url: result.blob.url || target,
+      };
     } catch (err: unknown) {
       if (err instanceof BlobNotFoundError) {
-        return {
-          data: createDefaultCollection(name),
-          version: null,
-          exists: false,
-        };
+        return null;
       }
-      this.wrapStorageFailure(err);
-    }
+      if (this.isConfigurationFailure(err)) {
+        this.wrapStorageFailure(err);
+      }
 
-    if (!primaryResult || primaryResult.statusCode !== 200 || !primaryResult.stream) {
+      // Secondary private read via `list` / `head` + direct Bearer fetch
+      try {
+        let blobUrl: string | null = null;
+        let blobEtag: string | null = null;
+        let lookupErr: unknown = null;
+
+        if (!process.env.VERCEL_BLOB_API_URL?.trim()) {
+          try {
+            const listed = await blobList({ prefix: pathname, limit: 10, token: this.token });
+            const matched = listed.blobs.find((b) => b.pathname === pathname);
+            if (!matched) {
+              return null;
+            }
+            blobUrl = matched.downloadUrl || matched.url;
+            blobEtag = matched.etag || null;
+          } catch (listErr) {
+            lookupErr = listErr;
+          }
+        }
+
+        if (!blobUrl) {
+          try {
+            const meta = await blobHead(target, { token: this.token });
+            blobUrl = meta.downloadUrl || meta.url;
+            blobEtag = meta.etag || null;
+          } catch (headErr) {
+            if (headErr instanceof BlobNotFoundError) {
+              return null;
+            }
+            lookupErr = lookupErr ?? headErr;
+          }
+        }
+
+        if (!blobUrl) {
+          const getMsg = sanitizeStorageError(err);
+          const lookupMsg = lookupErr ? sanitizeStorageError(lookupErr) : 'none';
+          const detail = new Error(
+            `Vercel Blob read failed (get: ${getMsg}; lookup: ${lookupMsg})`
+          );
+          if (this.isConfigurationFailure(lookupErr) || this.isConfigurationFailure(err)) {
+            throw new StorageConfigurationError(detail.message);
+          }
+          throw detail;
+        }
+
+        const res = await fetch(blobUrl, {
+          cache: 'no-store',
+          headers: authHeaders,
+        });
+        if (res.status === 404) {
+          return null;
+        }
+        if (!res.ok) {
+          throw new Error(`Private Vercel Blob fetch failed (${res.status}).`);
+        }
+        const raw = await res.text();
+        return {
+          raw,
+          etag: res.headers.get('etag') || blobEtag,
+          url: blobUrl,
+        };
+      } catch (fallbackErr) {
+        if (fallbackErr instanceof BlobNotFoundError) {
+          return null;
+        }
+        this.wrapStorageFailure(fallbackErr);
+      }
+    }
+  }
+
+  private async writeJsonBlob(
+    pathname: string,
+    serialized: string,
+    options?: { allowOverwrite?: boolean; ifMatch?: string }
+  ) {
+    return blobPut(pathname, serialized, {
+      access: this.access,
+      addRandomSuffix: false,
+      allowOverwrite: options?.allowOverwrite ?? true,
+      contentType: 'application/json',
+      token: this.token,
+      ...(options?.ifMatch ? { ifMatch: options.ifMatch } : {}),
+    });
+  }
+
+  async readCollection<K extends CollectionName>(
+    name: K
+  ): Promise<ReadCollectionResult<K>> {
+    const primary = await this.readJsonBlob(this.pathname(name));
+    if (!primary) {
       return {
         data: createDefaultCollection(name),
         version: null,
@@ -574,10 +893,9 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
       };
     }
 
-    const primaryEtag = primaryResult.blob.etag || null;
-    const raw = await new Response(primaryResult.stream).text();
+    const primaryEtag = primary.etag;
     try {
-      const parsed = JSON.parse(raw) as unknown;
+      const parsed = JSON.parse(primary.raw) as unknown;
       if (validateCollectionDocument(name, parsed)) {
         return {
           data: parsed,
@@ -591,14 +909,9 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
 
     // Only attempt backup recovery when primary blob contents failed validation/parsing
     try {
-      const backup = await blobGet(this.getTarget(this.backupPathname(name)), {
-        access: this.access,
-        useCache: false,
-        token: this.token,
-      });
-      if (backup && backup.statusCode === 200 && backup.stream) {
-        const backupRaw = await new Response(backup.stream).text();
-        const backupParsed = JSON.parse(backupRaw) as unknown;
+      const backup = await this.readJsonBlob(this.backupPathname(name));
+      if (backup) {
+        const backupParsed = JSON.parse(backup.raw) as unknown;
         if (validateCollectionDocument(name, backupParsed)) {
           return {
             data: backupParsed,
@@ -628,23 +941,17 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
     JSON.parse(serialized);
 
     try {
-      const putResult = await blobPut(this.pathname(name), serialized, {
-        access: this.access,
-        addRandomSuffix: false,
-        contentType: 'application/json',
-        token: this.token,
-        ...(expectedVersion
+      const putResult = await this.writeJsonBlob(
+        this.pathname(name),
+        serialized,
+        expectedVersion
           ? { allowOverwrite: true, ifMatch: expectedVersion }
-          : { allowOverwrite: false }),
-      });
+          : { allowOverwrite: false }
+      );
 
       if (!options?.skipBackup && data.revision > 0) {
-        await blobPut(this.backupPathname(name), serialized, {
-          access: this.access,
-          addRandomSuffix: false,
+        await this.writeJsonBlob(this.backupPathname(name), serialized, {
           allowOverwrite: true,
-          contentType: 'application/json',
-          token: this.token,
         }).catch(() => undefined);
       }
 
@@ -675,23 +982,12 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
       let currentEtag: string | null = null;
       let previousCheckedAt: string | null = null;
 
-      try {
-        const existing = await blobGet(this.getTarget(probePath), {
-          access: this.access,
-          useCache: false,
-          token: this.token,
-        });
-        if (existing && existing.statusCode === 200 && existing.stream) {
-          currentEtag = existing.blob.etag || null;
-          const prevRaw = await new Response(existing.stream).text().catch(() => '');
-          if (prevRaw) {
-            const parsedPrev = JSON.parse(prevRaw) as { checkedAt?: string };
-            previousCheckedAt = typeof parsedPrev.checkedAt === 'string' ? parsedPrev.checkedAt : null;
-          }
-        }
-      } catch (err) {
-        if (!(err instanceof BlobNotFoundError)) {
-          throw err;
+      const existing = await this.readJsonBlob(probePath);
+      if (existing) {
+        currentEtag = existing.etag;
+        if (existing.raw) {
+          const parsedPrev = JSON.parse(existing.raw) as { checkedAt?: string };
+          previousCheckedAt = typeof parsedPrev.checkedAt === 'string' ? parsedPrev.checkedAt : null;
         }
       }
 
@@ -711,15 +1007,13 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
       );
 
       try {
-        await blobPut(probePath, probePayload, {
-          access: this.access,
-          addRandomSuffix: false,
-          contentType: 'application/json',
-          token: this.token,
-          ...(currentEtag
+        await this.writeJsonBlob(
+          probePath,
+          probePayload,
+          currentEtag
             ? { allowOverwrite: true, ifMatch: currentEtag }
-            : { allowOverwrite: false }),
-        });
+            : { allowOverwrite: false }
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message.toLowerCase() : '';
         const isRace =
@@ -731,35 +1025,24 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
         if (!isRace) throw err;
 
         // Retry overwrite on concurrent health check without polluting domain ETag integrity
-        await blobPut(probePath, probePayload, {
-          access: this.access,
-          addRandomSuffix: false,
-          allowOverwrite: true,
-          contentType: 'application/json',
-          token: this.token,
-        });
+        await this.writeJsonBlob(probePath, probePayload, { allowOverwrite: true });
       }
 
-      const verifyReadBack = await blobGet(this.getTarget(probePath), {
-        access: this.access,
-        useCache: false,
-        token: this.token,
-      });
-      if (!verifyReadBack || verifyReadBack.statusCode !== 200 || !verifyReadBack.stream) {
+      const verifyReadBack = await this.readJsonBlob(probePath);
+      if (!verifyReadBack) {
         return {
           readable,
           writable: false,
-          accessMode: 'private',
+          accessMode: this.access,
           error: 'Private Vercel Blob probe write could not be read back.',
         };
       }
-      const roundTripRaw = await new Response(verifyReadBack.stream).text();
-      const roundTrip = JSON.parse(roundTripRaw) as { nonce?: string; access?: string };
-      if (roundTrip.nonce !== nonce || roundTrip.access !== 'private') {
+      const roundTrip = JSON.parse(verifyReadBack.raw) as { nonce?: string; access?: string };
+      if (roundTrip.nonce !== nonce || roundTrip.access !== this.access) {
         return {
           readable,
           writable: false,
-          accessMode: 'private',
+          accessMode: this.access,
           error: 'Private Vercel Blob probe verification payload mismatch.',
         };
       }
@@ -768,14 +1051,14 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
       return {
         readable,
         writable,
-        accessMode: 'private',
+        accessMode: this.access,
         error: null,
       };
     } catch (err) {
       return {
         readable,
         writable,
-        accessMode: 'private',
+        accessMode: this.access,
         error: sanitizeStorageError(err),
       };
     }
@@ -795,13 +1078,7 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
     });
 
     try {
-      await blobPut(lockPath, payload, {
-        access: this.access,
-        addRandomSuffix: false,
-        allowOverwrite: false,
-        contentType: 'application/json',
-        token: this.token,
-      });
+      await this.writeJsonBlob(lockPath, payload, { allowOverwrite: false });
       return lockToken;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message.toLowerCase() : '';
@@ -817,25 +1094,17 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
 
       // Check if an existing lock has expired (e.g. crashed Lambda container)
       try {
-        const existing = await blobGet(this.getTarget(lockPath), {
-          access: this.access,
-          useCache: false,
-          token: this.token,
-        });
-        if (!existing || existing.statusCode !== 200 || !existing.stream) {
+        const existing = await this.readJsonBlob(lockPath);
+        if (!existing) {
           return null;
         }
-        const existingBody = JSON.parse(await new Response(existing.stream).text()) as {
+        const existingBody = JSON.parse(existing.raw) as {
           expiresAt?: number;
         };
         if (typeof existingBody.expiresAt === 'number' && Date.now() > existingBody.expiresAt) {
-          await blobPut(lockPath, payload, {
-            access: this.access,
-            addRandomSuffix: false,
+          await this.writeJsonBlob(lockPath, payload, {
             allowOverwrite: true,
-            ifMatch: existing.blob.etag,
-            contentType: 'application/json',
-            token: this.token,
+            ...(existing.etag ? { ifMatch: existing.etag } : {}),
           });
           return lockToken;
         }
@@ -854,21 +1123,17 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
 
     const lockPath = this.lockPathname(slotKey);
     try {
-      const existing = await blobGet(this.getTarget(lockPath), {
-        access: this.access,
-        useCache: false,
-        token: this.token,
-      });
-      if (!existing || existing.statusCode !== 200 || !existing.stream) {
+      const existing = await this.readJsonBlob(lockPath);
+      if (!existing) {
         return;
       }
-      const existingBody = JSON.parse(await new Response(existing.stream).text()) as {
+      const existingBody = JSON.parse(existing.raw) as {
         token?: string;
       };
       if (existingBody.token === lockToken) {
         const deleteTarget =
           process.env.VERCEL_BLOB_API_URL?.trim()
-            ? existing.blob.url || this.getTarget(lockPath)
+            ? existing.url || this.getTarget(lockPath)
             : lockPath;
         await blobDel(deleteTarget, { token: this.token }).catch(() => undefined);
       }
@@ -885,6 +1150,7 @@ export class VercelBlobJsonDriver implements JsonStorageDriver {
  */
 export class UpstashRedisJsonDriver implements JsonStorageDriver {
   readonly mode = 'upstash_redis' as const;
+  readonly backend = 'upstash-redis' as const;
   readonly persistent = true;
   private readonly config: { url: string; token: string };
 
@@ -1068,7 +1334,13 @@ export class UpstashRedisJsonDriver implements JsonStorageDriver {
  */
 export class UnconfiguredVercelDriver implements JsonStorageDriver {
   readonly mode = 'unconfigured_vercel' as const;
+  readonly backend = 'unconfigured-vercel' as const;
   readonly persistent = false;
+  readonly reason: string;
+
+  constructor(reason = new StorageConfigurationError().message) {
+    this.reason = reason;
+  }
 
   async readCollection<K extends CollectionName>(
     name: K
@@ -1081,7 +1353,7 @@ export class UnconfiguredVercelDriver implements JsonStorageDriver {
   }
 
   async writeCollection(): Promise<{ version: string }> {
-    throw new StorageConfigurationError();
+    throw new StorageConfigurationError(this.reason);
   }
 
   async verifyReadWrite(): Promise<StorageVerificationResult> {
@@ -1089,39 +1361,67 @@ export class UnconfiguredVercelDriver implements JsonStorageDriver {
       readable: false,
       writable: false,
       accessMode: 'unconfigured',
-      error: new StorageConfigurationError().message,
+      error: this.reason,
     };
   }
 }
 
-export function createConfiguredStorageDriver(): JsonStorageDriver {
-  const blobToken = resolveVercelBlobToken();
+export function createFallbackUpstashDriverIfConfigured(): UpstashRedisJsonDriver | null {
   const upstash = getUpstashConfig();
-  const preferredDriver = stripSurroundingQuotes(process.env.STORAGE_DRIVER).toLowerCase();
+  return upstash ? new UpstashRedisJsonDriver(upstash) : null;
+}
 
-  if (preferredDriver === 'upstash_redis' && upstash) {
-    return new UpstashRedisJsonDriver(upstash);
-  }
-  if (preferredDriver === 'vercel_blob' && blobToken) {
-    return new VercelBlobJsonDriver(blobToken);
+export function createConfiguredStorageDriver(): JsonStorageDriver {
+  const blobMatch = resolveBlobTokenMatch();
+  const validBlobToken = blobMatch.valid ? blobMatch.token : '';
+  const blobAccess = resolveVercelBlobAccess();
+  const upstash = getUpstashConfig();
+  const preferredDriver = resolveConfiguredStorageDriverPreference();
+  const onVercel = isVercelRuntime();
+  const invalidBlobReason =
+    blobMatch.token && !blobMatch.valid
+      ? 'BLOB_READ_WRITE_TOKEN format is invalid. Copy the full vercel_blob_rw_... token from your Private Vercel Blob Store in Vercel and redeploy.'
+      : undefined;
+
+  if (preferredDriver === 'redis') {
+    if (upstash) {
+      return new UpstashRedisJsonDriver(upstash);
+    }
+    if (validBlobToken) {
+      return new VercelBlobJsonDriver(validBlobToken, blobAccess);
+    }
+    if (onVercel) {
+      return new UnconfiguredVercelDriver(invalidBlobReason);
+    }
   }
 
-  if (process.env.VERCEL === '1') {
-    if (blobToken) {
-      return new VercelBlobJsonDriver(blobToken);
+  if (preferredDriver === 'blob') {
+    if (validBlobToken) {
+      return new VercelBlobJsonDriver(validBlobToken, blobAccess);
+    }
+    if (upstash) {
+      console.warn(
+        '[storage] BLOB_READ_WRITE_TOKEN is missing or invalid; routing persistent storage to Upstash Redis.'
+      );
+      return new UpstashRedisJsonDriver(upstash);
+    }
+    if (onVercel) {
+      return new UnconfiguredVercelDriver(invalidBlobReason);
+    }
+    console.warn(
+      '[storage] BLOB_READ_WRITE_TOKEN is missing or invalid outside Vercel; falling back to local JSON storage.'
+    );
+    return new LocalJsonFileDriver(resolveLocalDataDir());
+  }
+
+  if (onVercel) {
+    if (validBlobToken) {
+      return new VercelBlobJsonDriver(validBlobToken, blobAccess);
     }
     if (upstash) {
       return new UpstashRedisJsonDriver(upstash);
     }
-    return new UnconfiguredVercelDriver();
-  }
-
-  // Local development (or explicit JSON_DATA_DIR tests): persistent local JSON files under ./data/
-  if (blobToken && preferredDriver === 'vercel_blob') {
-    return new VercelBlobJsonDriver(blobToken);
-  }
-  if (upstash && preferredDriver === 'upstash_redis') {
-    return new UpstashRedisJsonDriver(upstash);
+    return new UnconfiguredVercelDriver(invalidBlobReason);
   }
 
   return new LocalJsonFileDriver(resolveLocalDataDir());

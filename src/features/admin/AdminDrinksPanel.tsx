@@ -50,6 +50,10 @@ import {
   type ProductAnalyticsItem,
 } from '@/src/services/api/adminApi';
 import { ApiRequestError } from '@/src/services/api/client';
+import {
+  readStoredAdminDrinksSubTab,
+  writeStoredAdminDrinksSubTab,
+} from '@/src/utils/clientStorage';
 import { addDaysToIsoDate, getKarachiTodayStr } from '@/src/utils/date';
 
 type SubTab = 'dashboard' | 'products' | 'sales' | 'expenses' | 'reports';
@@ -175,7 +179,11 @@ interface AdminDrinksPanelProps {
 }
 
 export function AdminDrinksPanel({ onSessionExpired }: AdminDrinksPanelProps) {
-  const [subTab, setSubTab] = useState<SubTab>('dashboard');
+  const [subTab, setSubTabState] = useState<SubTab>(() => readStoredAdminDrinksSubTab());
+  const setSubTab = useCallback((nextTab: SubTab) => {
+    setSubTabState(nextTab);
+    writeStoredAdminDrinksSubTab(nextTab);
+  }, []);
 
   // Shared filter state for analytics, sales, expenses, reports
   const [datePreset, setDatePreset] = useState<DatePreset>('all');

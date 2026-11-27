@@ -1,11 +1,14 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { KeyRound, ShieldCheck, UserPlus } from 'lucide-react';
+import { Database, Download, KeyRound, RefreshCw, ShieldCheck, UserPlus } from 'lucide-react';
 import {
   createAdminAccount,
   disableAdminMfa,
   enrollAdminMfa,
   fetchAdminAccounts,
+  fetchAdminStorageBackup,
+  fetchAdminStorageStatus,
   verifyAdminMfa,
+  type AdminStorageOverview,
 } from '@/src/services/api/adminApi';
 import { ApiRequestError } from '@/src/services/api/client';
 import type { AdminAccountSummary } from '@/src/types/booking';
@@ -45,6 +48,58 @@ export function AdminSecurityPanel({
   const [mfaFeedback, setMfaFeedback] = useState<string | null>(null);
   const [mfaBusy, setMfaBusy] = useState(false);
 
+  // Storage health & JSON backup state
+  const [storageOverview, setStorageOverview] = useState<AdminStorageOverview | null>(null);
+  const [loadingStorage, setLoadingStorage] = useState(true);
+  const [exportingBackup, setExportingBackup] = useState(false);
+  const [storageFeedback, setStorageFeedback] = useState<string | null>(null);
+
+  const loadStorageOverview = async () => {
+    setLoadingStorage(true);
+    setStorageFeedback(null);
+    try {
+      const overview = await fetchAdminStorageStatus();
+      setStorageOverview(overview);
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        onSessionExpired?.();
+        return;
+      }
+      setStorageFeedback(err instanceof Error ? err.message : 'Unable to verify storage status.');
+    } finally {
+      setLoadingStorage(false);
+    }
+  };
+
+  const handleExportBackup = async () => {
+    if (exportingBackup) return;
+    setExportingBackup(true);
+    setStorageFeedback(null);
+    try {
+      const snapshot = await fetchAdminStorageBackup();
+      const blob = new Blob([JSON.stringify(snapshot, null, 2)], {
+        type: 'application/json;charset=utf-8',
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `thegrid-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setStorageFeedback('Central JSON backup exported successfully.');
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 401) {
+        onSessionExpired?.();
+        return;
+      }
+      setStorageFeedback(err instanceof Error ? err.message : 'Failed to export JSON backup.');
+    } finally {
+      setExportingBackup(false);
+    }
+  };
+
   const loadAccounts = async () => {
     setLoadingAccounts(true);
     setAccountsError(null);
@@ -64,6 +119,7 @@ export function AdminSecurityPanel({
 
   useEffect(() => {
     void loadAccounts();
+    void loadStorageOverview();
   }, []);
 
   const handleCreateAccount = async (e: FormEvent) => {
@@ -426,6 +482,97 @@ export function AdminSecurityPanel({
           </div>
         </section>
       </div>
+
+      {/* Central JSON Storage Verification & Backup Export */}
+      <section className="rounded-xl border border-white/12 bg-[#121D52]/85 p-6 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-white/10">
+          <div className="flex items-center gap-2.5">
+            <Database className="w-5 h-5 text-[#c4d835]" aria-hidden="true" />
+            <div>
+              <h2 className="font-display text-xl font-bold uppercase text-white">
+                Storage Diagnostics &amp; Central JSON Backup
+              </h2>
+              <p className="text-xs text-slate-300">
+                Live server read/write verification and sanitized central JSON snapshot export.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={loadingStorage}
+              onClick={() => void loadStorageOverview()}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 min-h-[38px] text-xs font-semibold text-white bg-[#0B1338] hover:border-[#c4d835] border border-white/15 rounded-md cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingStorage ? 'animate-spin' : ''}`} />
+              <span>Re-verify Storage</span>
+            </button>
+            <button
+              type="button"
+              disabled={exportingBackup || !storageOverview?.health.verified}
+              onClick={() => void handleExportBackup()}
+              className="inline-flex items-center gap-1.5 px-4 py-2 min-h-[38px] text-xs font-bold uppercase tracking-wide text-[#0E1845] bg-[#c4d835] hover:bg-[#d4e157] rounded-md cursor-pointer disabled:opacity-50"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>{exportingBackup ? 'Exporting...' : 'Export JSON Backup'}</span>
+            </button>
+          </div>
+        </div>
+
+        {loadingStorage && !storageOverview ? (
+          <p className="text-xs text-slate-400">Verifying server storage read/write health...</p>
+        ) : storageOverview ? (
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 text-xs">
+            <div className="rounded-lg border border-white/10 bg-[#0B1338]/85 p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-400">Driver Mode</div>
+              <div className="mt-1 font-mono-tabular font-bold text-[#c4d835]">
+                {storageOverview.health.mode}
+              </div>
+            </div>
+            <div className="rounded-lg border border-white/10 bg-[#0B1338]/85 p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-400">Read / Write</div>
+              <div
+                className={`mt-1 font-semibold ${
+                  storageOverview.health.verified ? 'text-[#c4d835]' : 'text-amber-300'
+                }`}
+              >
+                {storageOverview.health.verified ? 'Verified OK' : 'Verification Failed'}
+              </div>
+            </div>
+            <div className="rounded-lg border border-white/10 bg-[#0B1338]/85 p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-400">Bookings</div>
+              <div className="mt-1 font-mono-tabular font-bold text-white">
+                {storageOverview.counts.bookings}
+              </div>
+            </div>
+            <div className="rounded-lg border border-white/10 bg-[#0B1338]/85 p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-400">Customers</div>
+              <div className="mt-1 font-mono-tabular font-bold text-white">
+                {storageOverview.counts.customers}
+              </div>
+            </div>
+            <div className="rounded-lg border border-white/10 bg-[#0B1338]/85 p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-400">Products</div>
+              <div className="mt-1 font-mono-tabular font-bold text-white">
+                {storageOverview.counts.products}
+              </div>
+            </div>
+            <div className="rounded-lg border border-white/10 bg-[#0B1338]/85 p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-400">Drink Sales</div>
+              <div className="mt-1 font-mono-tabular font-bold text-white">
+                {storageOverview.counts.sales}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {storageFeedback && (
+          <p role="status" className="text-xs text-[#c4d835]">
+            {storageFeedback}
+          </p>
+        )}
+      </section>
     </div>
   );
 }

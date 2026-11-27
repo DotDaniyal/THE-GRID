@@ -53,7 +53,12 @@ import {
   updateDrinkSale,
 } from '../services/drinkService.ts';
 import { StorageConfigurationError } from '../storage/drivers.ts';
-import { readCollection, updateCollection } from '../storage/jsonStore.ts';
+import {
+  buildSanitizedCentralBackupSnapshot,
+  getStorageOverviewStats,
+  readCollection,
+  updateCollection,
+} from '../storage/jsonStore.ts';
 import { buildOtpAuthUri, generateTotpSecret, verifyTotpCode } from '../utils/totp.ts';
 
 export const adminRouter = Router();
@@ -1011,3 +1016,42 @@ adminRouter.delete(
     }
   }
 );
+
+adminRouter.get('/storage/status', requireAdminAuth, async (_req, res) => {
+  try {
+    const overview = await getStorageOverviewStats();
+    res.json(overview);
+  } catch (err: unknown) {
+    if (err instanceof StorageConfigurationError) {
+      res.status(err.statusCode).json({ error: err.message });
+      return;
+    }
+    console.error('Admin storage status error:', err);
+    res.status(500).json({ error: 'Failed to verify storage status.' });
+  }
+});
+
+adminRouter.get('/storage/backup', requireAdminAuth, async (req, res) => {
+  try {
+    const snapshot = await buildSanitizedCentralBackupSnapshot();
+    const actor = req.adminSession?.username ?? 'admin';
+    await recordAdminSecurityAudit({
+      action: 'STORAGE_BACKUP_EXPORTED',
+      actor,
+      summary: `Exported sanitized central JSON backup (${snapshot.storageMode}).`,
+    });
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="thegrid-backup-${dateStamp}.json"`
+    );
+    res.json(snapshot);
+  } catch (err: unknown) {
+    if (err instanceof StorageConfigurationError) {
+      res.status(err.statusCode).json({ error: err.message });
+      return;
+    }
+    console.error('Admin storage backup export error:', err);
+    res.status(500).json({ error: 'Failed to export JSON backup.' });
+  }
+});

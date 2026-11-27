@@ -29,6 +29,7 @@ import {
   updateBookingStatus,
 } from '@/src/services/api/adminApi';
 import { ApiRequestError, clearInMemoryAdminSessionToken } from '@/src/services/api/client';
+import { readStoredAdminTab, writeStoredAdminTab } from '@/src/utils/clientStorage';
 import type {
   AdminAccountSummary,
   AdminActivityItem,
@@ -78,9 +79,14 @@ export function AdminPage() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [authStatusMessage, setAuthStatusMessage] = useState<string | null>(null);
 
-  const [activeTab, setActiveTab] = useState<AdminTab>(() =>
-    typeof window !== 'undefined' ? parseAdminTabFromPath(window.location.pathname) : 'bookings'
-  );
+  const [activeTab, setActiveTab] = useState<AdminTab>(() => {
+    if (typeof window === 'undefined') return 'bookings';
+    const cleanPath = window.location.pathname.replace(/\/+$/, '') || '/';
+    if (cleanPath === '/admin' || cleanPath === '/admin/login') {
+      return readStoredAdminTab() ?? 'bookings';
+    }
+    return parseAdminTabFromPath(cleanPath);
+  });
   const [bookings, setBookings] = useState<AdminBookingRow[]>([]);
   const [stats, setStats] = useState<AdminDashboardStats>(EMPTY_STATS);
   const [recentActivity, setRecentActivity] = useState<AdminActivityItem[]>([]);
@@ -97,6 +103,7 @@ export function AdminPage() {
 
   const handleSelectTab = useCallback((nextTab: AdminTab) => {
     setActiveTab(nextTab);
+    writeStoredAdminTab(nextTab);
     if (typeof window !== 'undefined') {
       const targetPath = getAdminPathForTab(nextTab);
       if (window.location.pathname !== targetPath) {
@@ -156,9 +163,10 @@ export function AdminPage() {
             window.history.replaceState({}, '', '/admin/login');
           }
         } else if (cleanPath === '/admin' || cleanPath === '/admin/login') {
-          const targetPath = getAdminPathForTab('bookings');
+          const restoredTab = readStoredAdminTab() ?? 'bookings';
+          const targetPath = getAdminPathForTab(restoredTab);
           window.history.replaceState({}, '', targetPath);
-          setActiveTab('bookings');
+          setActiveTab(restoredTab);
         }
       }
     } catch {

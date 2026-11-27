@@ -6,7 +6,11 @@ import {
   updateCollection,
   verifyStorageHealth,
 } from '../storage/jsonStore.ts';
-import { sanitizeStorageError, StorageConfigurationError } from '../storage/drivers.ts';
+import {
+  isVercelRuntime,
+  sanitizeStorageError,
+  StorageConfigurationError,
+} from '../storage/drivers.ts';
 import type {
   AdminAuditAction,
   AdminSettingsCollection,
@@ -606,7 +610,7 @@ export async function verifyAdminSessionToken(
 
   // Fallback for multi-container serverless setups if storage is not yet populated or partitioned
   if (
-    process.env.VERCEL === '1' &&
+    isVercelRuntime() &&
     typeof parsed.uid === 'number' &&
     typeof parsed.usr === 'string' &&
     typeof parsed.dsp === 'string' &&
